@@ -354,6 +354,55 @@ async fn handle_client_event(
                 }
             }
         }
+        ClientToServer::Search { target, query } => {
+            let (_, user_id) = match get_peer_identity(peers, id) {
+                Some(info) => info,
+                None => {
+                    send_to_peer(
+                        peers,
+                        id,
+                        ServerToClient::AuthError {
+                            message: "Please log in first.".to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+            let trimmed = query.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            match target {
+                HistoryTarget::Lobby => {
+                    if let Ok(messages) = search_lobby(db, trimmed, 50).await {
+                        send_to_peer(
+                            peers,
+                            id,
+                            ServerToClient::SearchResults {
+                                target: HistoryTarget::Lobby,
+                                query: trimmed.to_string(),
+                                messages,
+                            },
+                        );
+                    }
+                }
+                HistoryTarget::Direct { username } => {
+                    if let Ok(Some(target_id)) = get_user_id_by_name(db, &username).await {
+                        if let Ok(messages) = search_dm(db, user_id, target_id, trimmed, 50).await {
+                            send_to_peer(
+                                peers,
+                                id,
+                                ServerToClient::SearchResults {
+                                    target: HistoryTarget::Direct { username },
+                                    query: trimmed.to_string(),
+                                    messages,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
         ClientToServer::Block { username } => {
             if let Some((_, user_id)) = get_peer_identity(peers, id) {
                 if let Ok(Some(target_id)) = get_user_id_by_name(db, &username).await {
@@ -693,6 +742,13 @@ async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS messages_body_fts\
+         ON messages USING GIN (to_tsvector('english', body))",
+    )
+    .execute(db)
+    .await?;
+
     Ok(())
 }
 
@@ -804,6 +860,77 @@ async fn fetch_recent_threads(
         .into_iter()
         .map(|row| row.get::<String, _>("username"))
         .collect())
+}
+
+async fn search_lobby(
+    db: &PgPool,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<MessageRecord>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT u.username, m.body, m.created_at\
+         FROM messages m\
+         JOIN users u ON u.id = m.sender_id\
+         WHERE m.recipient_id IS NULL\
+           AND to_tsvector('english', m.body) @@ plainto_tsquery('english', $1)\
+         ORDER BY m.created_at DESC\
+         LIMIT $2",
+    )
+    .bind(query)
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+
+    let mut messages = rows
+        .into_iter()
+        .map(|row| MessageRecord {
+            from: row.get::<String, _>("username"),
+            body: row.get::<String, _>("body"),
+            at: row
+                .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                .to_rfc3339(),
+        })
+        .collect::<Vec<_>>();
+    messages.reverse();
+    Ok(messages)
+}
+
+async fn search_dm(
+    db: &PgPool,
+    user_id: i64,
+    peer_id: i64,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<MessageRecord>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT u.username, m.body, m.created_at\
+         FROM messages m\
+         JOIN users u ON u.id = m.sender_id\
+         WHERE ((m.sender_id = $1 AND m.recipient_id = $2)\
+            OR (m.sender_id = $2 AND m.recipient_id = $1))\
+           AND to_tsvector('english', m.body) @@ plainto_tsquery('english', $3)\
+         ORDER BY m.created_at DESC\
+         LIMIT $4",
+    )
+    .bind(user_id)
+    .bind(peer_id)
+    .bind(query)
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+
+    let mut messages = rows
+        .into_iter()
+        .map(|row| MessageRecord {
+            from: row.get::<String, _>("username"),
+            body: row.get::<String, _>("body"),
+            at: row
+                .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                .to_rfc3339(),
+        })
+        .collect::<Vec<_>>();
+    messages.reverse();
+    Ok(messages)
 }
 
 async fn create_user(db: &PgPool, username: &str, password: &str) -> Result<i64, String> {

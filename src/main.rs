@@ -49,6 +49,7 @@ enum UiToNet {
     SendDirect { to: String, body: String },
     FetchHistory { target: ChatTarget },
     FetchThreads,
+    Search { target: ChatTarget, query: String },
     SetAway { away: Option<String> },
     Block { username: String },
     Unblock { username: String },
@@ -66,6 +67,11 @@ enum NetToUi {
     DirectMessage { from: String, body: String },
     Threads(Vec<String>),
     History { target: ChatTarget, messages: Vec<ChatMessage> },
+    SearchResults {
+        target: ChatTarget,
+        query: String,
+        messages: Vec<ChatMessage>,
+    },
     AuthOk { username: String },
     AuthError(String),
     System(String),
@@ -103,9 +109,16 @@ struct AolApp {
     selected_target: ChatTarget,
     report_reason: String,
     search_query: String,
+    search_in_progress: bool,
+    search_results: HashMap<ChatTarget, SearchResult>,
     buddies: Vec<UserStatus>,
     recent_threads: Vec<String>,
     messages: std::collections::HashMap<ChatTarget, Vec<ChatMessage>>,
+}
+
+struct SearchResult {
+    query: String,
+    messages: Vec<ChatMessage>,
 }
 
 impl AolApp {
@@ -145,6 +158,8 @@ impl AolApp {
             selected_target: ChatTarget::Lobby,
             report_reason: String::new(),
             search_query: String::new(),
+            search_in_progress: false,
+            search_results: HashMap::new(),
             buddies: Vec::new(),
             recent_threads: Vec::new(),
             messages: HashMap::new(),
@@ -221,6 +236,20 @@ impl AolApp {
                 }
                 NetToUi::History { target, messages } => {
                     self.messages.insert(target, messages);
+                }
+                NetToUi::SearchResults {
+                    target,
+                    query,
+                    messages,
+                } => {
+                    self.search_results.insert(
+                        target,
+                        SearchResult {
+                            query,
+                            messages,
+                        },
+                    );
+                    self.search_in_progress = false;
                 }
                 NetToUi::AuthOk { username } => {
                     self.logged_in_user = Some(username);
@@ -318,6 +347,8 @@ impl AolApp {
         }
         self.selected_target = target.clone();
         self.search_query.clear();
+        self.search_in_progress = false;
+        self.search_results.remove(&target);
         let _ = self.network.tx.send(UiToNet::FetchHistory { target });
     }
 
@@ -562,29 +593,55 @@ impl eframe::App for AolApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Search:");
-                        ui.add(
+                        let search_response = ui.add(
                             egui::TextEdit::singleline(&mut self.search_query)
                                 .hint_text("Find messages")
                                 .desired_width(200.0),
                         );
+                        let search_clicked = ui.button("Search Server").clicked();
+                        let search_enter = search_response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if search_clicked || search_enter {
+                            let query = self.search_query.trim();
+                            if !query.is_empty() {
+                                self.search_in_progress = true;
+                                let _ = self.network.tx.send(UiToNet::Search {
+                                    target: self.selected_target.clone(),
+                                    query: query.to_string(),
+                                });
+                            }
+                        }
                         if ui.button("Clear").clicked() {
                             self.search_query.clear();
+                            self.search_in_progress = false;
+                            self.search_results.remove(&self.selected_target);
+                        }
+                        if self.search_in_progress {
+                            ui.label("Searching...");
                         }
                     });
                     egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                        let messages = self
-                            .messages
-                            .get(&self.selected_target)
-                            .cloned()
-                            .unwrap_or_default();
-                        let query = self.search_query.trim().to_lowercase();
-                        for message in messages {
-                            if !query.is_empty() {
-                                let haystack = format!("{} {}", message.from, message.body).to_lowercase();
-                                if !haystack.contains(&query) {
-                                    continue;
+                        let query = self.search_query.trim();
+                        let mut using_search = false;
+                        let messages = if !query.is_empty() {
+                            if let Some(result) = self.search_results.get(&self.selected_target) {
+                                if result.query == query {
+                                    using_search = true;
+                                    result.messages.clone()
+                                } else {
+                                    Vec::new()
                                 }
+                            } else {
+                                Vec::new()
                             }
+                        } else {
+                            self.messages
+                                .get(&self.selected_target)
+                                .cloned()
+                                .unwrap_or_default()
+                        };
+
+                        for message in messages {
                             let relative = format_relative_time(&message.at);
                             if relative.is_empty() {
                                 ui.label(format!("{}: {}", message.from, message.body));
@@ -593,10 +650,19 @@ impl eframe::App for AolApp {
                             }
                         }
                         if self
+                            .search_results
+                            .get(&self.selected_target)
+                            .map(|result| result.messages.is_empty())
+                            .unwrap_or(true)
+                            && using_search
+                        {
+                            ui.label("No search results yet.");
+                        } else if self
                             .messages
                             .get(&self.selected_target)
                             .map(|list| list.is_empty())
                             .unwrap_or(true)
+                            && !using_search
                         {
                             ui.label("Say hi to start a conversation.");
                         }
@@ -786,6 +852,25 @@ async fn run_connection(
                                         messages: mapped_messages,
                                     });
                                 }
+                                ServerToClient::SearchResults { target, query, messages } => {
+                                    let mapped_target = match target {
+                                        HistoryTarget::Lobby => ChatTarget::Lobby,
+                                        HistoryTarget::Direct { username } => ChatTarget::Direct(username),
+                                    };
+                                    let mapped_messages = messages
+                                        .into_iter()
+                                        .map(|record| ChatMessage {
+                                            from: record.from,
+                                            body: record.body,
+                                            at: record.at,
+                                        })
+                                        .collect::<Vec<_>>();
+                                    let _ = net_tx.send(NetToUi::SearchResults {
+                                        target: mapped_target,
+                                        query,
+                                        messages: mapped_messages,
+                                    });
+                                }
                                 ServerToClient::System { message } => {
                                     let _ = net_tx.send(NetToUi::System(message));
                                 }
@@ -815,6 +900,13 @@ async fn run_connection(
                     }
                     UiToNet::FetchThreads => {
                         send_json(&mut ws_tx, ClientToServer::FetchThreads).await?;
+                    }
+                    UiToNet::Search { target, query } => {
+                        let target = match target {
+                            ChatTarget::Lobby => HistoryTarget::Lobby,
+                            ChatTarget::Direct(username) => HistoryTarget::Direct { username },
+                        };
+                        send_json(&mut ws_tx, ClientToServer::Search { target, query }).await?;
                     }
                     UiToNet::SetAway { away } => {
                         send_json(&mut ws_tx, ClientToServer::SetAway { away }).await?;

@@ -30,6 +30,7 @@ pub enum ClientToServer {
     DirectMessage { to: String, body: String },
     FetchThreads,
     FetchHistory { target: HistoryTarget },
+    Search { target: HistoryTarget, query: String },
     Block { username: String },
     Unblock { username: String },
     Mute { username: String },
@@ -48,6 +49,11 @@ pub enum ServerToClient {
     DirectMessage { from: String, body: String },
     Threads { users: Vec<String> },
     History { target: HistoryTarget, messages: Vec<MessageRecord> },
+    SearchResults {
+        target: HistoryTarget,
+        query: String,
+        messages: Vec<MessageRecord>,
+    },
     System { message: String },
 }
 
