@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
+use std::time::Instant;
 use std::thread;
 
 use chrono::Utc;
@@ -20,6 +21,17 @@ struct ChatMessage {
     at: String,
 }
 
+struct Toast {
+    text: String,
+    kind: ToastKind,
+    ttl: f32,
+}
+
+enum ToastKind {
+    Info,
+    Success,
+    Error,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     SignIn,
@@ -82,6 +94,7 @@ enum NetToUi {
 enum Theme {
     Light,
     Dark,
+    MidnightAmber,
 }
 
 struct NetworkHandle {
@@ -103,17 +116,22 @@ struct AolApp {
     username: String,
     password: String,
     confirm_password: String,
+    show_password: bool,
+    show_confirm_password: bool,
     away_text: String,
     chat_input: String,
     dm_target: String,
     selected_target: ChatTarget,
     report_reason: String,
+    logging_in: bool,
+    login_started_at: Option<Instant>,
     search_query: String,
     search_in_progress: bool,
     search_results: HashMap<ChatTarget, SearchResult>,
     buddies: Vec<UserStatus>,
     recent_threads: Vec<String>,
     messages: std::collections::HashMap<ChatTarget, Vec<ChatMessage>>,
+    toast: Option<Toast>,
 }
 
 struct SearchResult {
@@ -136,33 +154,38 @@ impl AolApp {
             .text_styles
             .insert(egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Monospace));
         cc.egui_ctx.set_style(style);
-        apply_theme(&cc.egui_ctx, Theme::Light);
+        apply_theme(&cc.egui_ctx, Theme::MidnightAmber);
 
         Self {
             screen: Screen::SignIn,
             network: spawn_network(),
             connected: false,
             status: "Offline".to_string(),
-            theme: Theme::Light,
+            theme: Theme::MidnightAmber,
             startup_repaint_left: 120,
             show_background: false,
             auth_mode: AuthMode::Login,
             logged_in_user: None,
-            server_url: "ws://127.0.0.1:9001".to_string(),
+            server_url: "wss://blast-from-the-past-messenger.fly.dev".to_string(),
             username: "RetroUser".to_string(),
             password: String::new(),
             confirm_password: String::new(),
+            show_password: false,
+            show_confirm_password: false,
             away_text: String::new(),
             chat_input: String::new(),
             dm_target: String::new(),
             selected_target: ChatTarget::Lobby,
             report_reason: String::new(),
+            logging_in: false,
+            login_started_at: None,
             search_query: String::new(),
             search_in_progress: false,
             search_results: HashMap::new(),
             buddies: Vec::new(),
             recent_threads: Vec::new(),
             messages: HashMap::new(),
+            toast: None,
         }
     }
 
@@ -185,6 +208,11 @@ impl AolApp {
                     (22.0 + 6.0 * t) as u8,
                     (24.0 + 6.0 * t) as u8,
                     (28.0 + 10.0 * t) as u8,
+                ),
+                Theme::MidnightAmber => (
+                    (24.0 + 8.0 * t) as u8,
+                    (22.0 + 6.0 * t) as u8,
+                    (18.0 + 4.0 * t) as u8,
                 ),
             };
             let color = egui::Color32::from_rgb(r, g, b);
@@ -210,6 +238,8 @@ impl AolApp {
                     self.status = "Disconnected".to_string();
                     self.screen = Screen::SignIn;
                     self.logged_in_user = None;
+                    self.logging_in = false;
+                    self.login_started_at = None;
                 }
                 NetToUi::Presence(users) => {
                     self.buddies = users;
@@ -253,8 +283,17 @@ impl AolApp {
                 }
                 NetToUi::AuthOk { username } => {
                     self.logged_in_user = Some(username);
-                    self.status = "Online".to_string();
+                    self.status = match self.auth_mode {
+                        AuthMode::Register => "Account created. Logged in.".to_string(),
+                        AuthMode::Login => "Logged in.".to_string(),
+                    };
+                    self.show_toast(self.status.clone(), ToastKind::Success);
                     self.screen = Screen::Chat;
+                    self.auth_mode = AuthMode::Login;
+                    self.confirm_password.clear();
+                    self.password.clear();
+                    self.logging_in = false;
+                    self.login_started_at = None;
                     let _ = self
                         .network
                         .tx
@@ -265,6 +304,9 @@ impl AolApp {
                 }
                 NetToUi::AuthError(message) => {
                     self.status = message;
+                    self.show_toast(self.status.clone(), ToastKind::Error);
+                    self.logging_in = false;
+                    self.login_started_at = None;
                 }
                 NetToUi::System(message) => {
                     let entry = self.messages.entry(ChatTarget::Lobby).or_default();
@@ -273,9 +315,13 @@ impl AolApp {
                         body: message,
                         at: Utc::now().to_rfc3339(),
                     });
+                    self.show_toast("System message received".to_string(), ToastKind::Info);
                 }
                 NetToUi::Error(message) => {
                     self.status = format!("Error: {message}");
+                    self.show_toast(self.status.clone(), ToastKind::Error);
+                    self.logging_in = false;
+                    self.login_started_at = None;
                 }
             }
         }
@@ -284,10 +330,23 @@ impl AolApp {
     fn send_connect(&mut self) {
         if self.auth_mode == AuthMode::Register && self.password != self.confirm_password {
             self.status = "Passwords do not match".to_string();
+            self.show_toast(self.status.clone(), ToastKind::Error);
             return;
         }
+        self.logging_in = true;
+        self.login_started_at = Some(Instant::now());
+        self.status = format!("Logging in as {}...", self.username.trim());
+        let mut url = self.server_url.trim().to_string();
+        if let Some(stripped) = url.strip_prefix("https://") {
+            url = format!("wss://{stripped}");
+        } else if let Some(stripped) = url.strip_prefix("http://") {
+            url = format!("ws://{stripped}");
+        } else if !url.starts_with("ws://") && !url.starts_with("wss://") {
+            url = format!("wss://{url}");
+        }
+        self.server_url = url.clone();
         let _ = self.network.tx.send(UiToNet::Connect {
-            url: self.server_url.trim().to_string(),
+            url,
             username: self.username.trim().to_string(),
             password: self.password.clone(),
             mode: self.auth_mode,
@@ -355,9 +414,57 @@ impl AolApp {
     fn toggle_theme(&mut self, ctx: &egui::Context) {
         self.theme = match self.theme {
             Theme::Light => Theme::Dark,
-            Theme::Dark => Theme::Light,
+            Theme::Dark => Theme::MidnightAmber,
+            Theme::MidnightAmber => Theme::Light,
         };
         apply_theme(ctx, self.theme);
+    }
+
+    fn show_toast(&mut self, text: String, kind: ToastKind) {
+        self.toast = Some(Toast {
+            text,
+            kind,
+            ttl: 3.0,
+        });
+    }
+
+    fn draw_toast(&mut self, ctx: &egui::Context) {
+        let Some(toast) = &mut self.toast else {
+            return;
+        };
+        let dt = ctx.input(|i| i.stable_dt);
+        toast.ttl -= dt as f32;
+        if toast.ttl <= 0.0 {
+            self.toast = None;
+            return;
+        }
+
+        let (fill, stroke) = match toast.kind {
+            ToastKind::Info => (
+                egui::Color32::from_rgb(50, 50, 55),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(95, 95, 105)),
+            ),
+            ToastKind::Success => (
+                egui::Color32::from_rgb(35, 85, 55),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 140, 95)),
+            ),
+            ToastKind::Error => (
+                egui::Color32::from_rgb(110, 45, 45),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(170, 70, 70)),
+            ),
+        };
+
+        egui::TopBottomPanel::top("toast_bar")
+            .exact_height(32.0)
+            .show(ctx, |ui| {
+                let frame = egui::Frame::none()
+                    .fill(fill)
+                    .stroke(stroke)
+                    .inner_margin(egui::Margin::symmetric(10.0, 6.0));
+                frame.show(ui, |ui| {
+                    ui.label(toast.text.clone());
+                });
+            });
     }
 }
 
@@ -372,6 +479,7 @@ impl eframe::App for AolApp {
         if self.show_background {
             self.draw_background(ctx);
         }
+        self.draw_toast(ctx);
 
         match self.screen {
             Screen::SignIn => {
@@ -386,6 +494,11 @@ impl eframe::App for AolApp {
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 85, 80)),
                         egui::Color32::from_rgb(235, 225, 210),
                     ),
+                    Theme::MidnightAmber => (
+                        egui::Color32::from_rgb(36, 33, 28),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(92, 70, 48)),
+                        egui::Color32::from_rgb(231, 220, 198),
+                    ),
                 };
                 egui::TopBottomPanel::top("signin_top").show(ctx, |ui| {
                     ui.horizontal(|ui| {
@@ -397,7 +510,8 @@ impl eframe::App for AolApp {
                         }
                         let label = match self.theme {
                             Theme::Light => "Dark Mode",
-                            Theme::Dark => "Light Mode",
+                            Theme::Dark => "Midnight Amber",
+                            Theme::MidnightAmber => "Light Mode",
                         };
                         if ui.button("Refresh UI").clicked() {
                             ctx.request_repaint();
@@ -436,13 +550,23 @@ impl eframe::App for AolApp {
                                 });
                                 ui.add_space(10.0);
                                 ui.add(egui::TextEdit::singleline(&mut self.username).hint_text("Screen name"));
-                                ui.add(egui::TextEdit::singleline(&mut self.password).password(true).hint_text("Password"));
-                                if self.auth_mode == AuthMode::Register {
+                                ui.horizontal(|ui| {
                                     ui.add(
-                                        egui::TextEdit::singleline(&mut self.confirm_password)
-                                            .password(true)
-                                            .hint_text("Confirm password"),
+                                        egui::TextEdit::singleline(&mut self.password)
+                                            .password(!self.show_password)
+                                            .hint_text("Password"),
                                     );
+                                    ui.checkbox(&mut self.show_password, "Show");
+                                });
+                                if self.auth_mode == AuthMode::Register {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.confirm_password)
+                                                .password(!self.show_confirm_password)
+                                                .hint_text("Confirm password"),
+                                        );
+                                        ui.checkbox(&mut self.show_confirm_password, "Show");
+                                    });
                                 }
                                 ui.add(egui::TextEdit::singleline(&mut self.server_url).hint_text("Server URL"));
                                 ui.add_space(12.0);
@@ -454,6 +578,19 @@ impl eframe::App for AolApp {
                                     self.send_connect();
                                 }
                                 ui.add_space(10.0);
+                                if self.logging_in {
+                                    let frames = ["[LOCKED]", "[LOCK--]", "[LOCK> ]", "[UNLOCK]"];
+                                    let frame = if let Some(start) = self.login_started_at {
+                                        let idx = ((start.elapsed().as_millis() / 200) % frames.len() as u128) as usize;
+                                        frames[idx]
+                                    } else {
+                                        frames[0]
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::Spinner::new());
+                                        ui.label(format!("{frame} Logging in as {}...", self.username.trim()));
+                                    });
+                                }
                                 ui.colored_label(text_color, format!("Status: {}", self.status));
                             });
                     });
@@ -474,7 +611,8 @@ impl eframe::App for AolApp {
                         }
                         let label = match self.theme {
                             Theme::Light => "Dark Mode",
-                            Theme::Dark => "Light Mode",
+                            Theme::Dark => "Midnight Amber",
+                            Theme::MidnightAmber => "Light Mode",
                         };
                         if ui.button("Refresh UI").clicked() {
                             ctx.request_repaint();
@@ -512,10 +650,11 @@ impl eframe::App for AolApp {
                         }
                         ui.add_space(8.0);
                         ui.label("Recent DMs");
-                        for name in &self.recent_threads {
+                        let recent_threads = self.recent_threads.clone();
+                        for name in recent_threads {
                             let target = ChatTarget::Direct(name.clone());
-                            if ui.selectable_label(self.selected_target == target, name).clicked() {
-                                self.select_target(ChatTarget::Direct(name.clone()));
+                            if ui.selectable_label(self.selected_target == target, &name).clicked() {
+                                self.select_target(ChatTarget::Direct(name));
                             }
                         }
                         if self.recent_threads.is_empty() {
@@ -537,7 +676,8 @@ impl eframe::App for AolApp {
                             }
                         });
                         ui.add_space(8.0);
-                        for buddy in &self.buddies {
+                        let buddies = self.buddies.clone();
+                        for buddy in buddies {
                             let status = buddy
                                 .away
                                 .as_ref()
@@ -562,7 +702,11 @@ impl eframe::App for AolApp {
                     ui.heading(heading);
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if let ChatTarget::Direct(name) = &self.selected_target {
+                        let direct_name = match &self.selected_target {
+                            ChatTarget::Direct(name) => Some(name.clone()),
+                            _ => None,
+                        };
+                        if let Some(name) = direct_name {
                             if ui.button("Block").clicked() {
                                 self.send_moderation(UiToNet::Block { username: name.clone() });
                             }
@@ -709,6 +853,17 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
             visuals.widgets.active.bg_fill = egui::Color32::from_rgb(86, 74, 52);
             visuals.selection.bg_fill = egui::Color32::from_rgb(198, 154, 69);
             visuals.override_text_color = Some(egui::Color32::from_rgb(235, 225, 210));
+            visuals
+        }
+        Theme::MidnightAmber => {
+            let mut visuals = egui::Visuals::dark();
+            visuals.panel_fill = egui::Color32::from_rgb(30, 28, 26);
+            visuals.window_fill = egui::Color32::from_rgb(35, 32, 28);
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(42, 39, 34);
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(48, 44, 38);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(108, 72, 30);
+            visuals.selection.bg_fill = egui::Color32::from_rgb(240, 168, 58);
+            visuals.override_text_color = Some(egui::Color32::from_rgb(231, 220, 198));
             visuals
         }
     };

@@ -35,7 +35,7 @@ struct RateState {
 
 #[tokio::main]
 async fn main() {
-    let addr = "127.0.0.1:9001";
+    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
     let database_url = std::env::var("DATABASE_URL")
         .or_else(|_| std::env::var("SUPABASE_DB_URL"))
         .or_else(|_| std::env::var("SUPABASE_URL"))
@@ -45,7 +45,7 @@ async fn main() {
         .expect("failed to connect to database");
     init_db(&db).await.expect("failed to init database");
 
-    let listener = TcpListener::bind(addr)
+    let listener = TcpListener::bind(&addr)
         .await
         .expect("failed to bind address");
 
@@ -743,8 +743,8 @@ async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
     .await?;
 
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS messages_body_fts\
-         ON messages USING GIN (to_tsvector('english', body))",
+           "CREATE INDEX IF NOT EXISTS messages_body_fts \
+            ON messages USING GIN (to_tsvector('english', body))",
     )
     .execute(db)
     .await?;
@@ -940,7 +940,7 @@ async fn create_user(db: &PgPool, username: &str, password: &str) -> Result<i64,
         .map_err(|_| "failed to hash password")?
         .to_string();
 
-    let row = sqlx::query("INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id")
+    let row = sqlx::query("INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id::bigint AS id")
         .bind(username)
         .bind(hash)
         .fetch_one(db)
@@ -956,7 +956,7 @@ async fn create_user(db: &PgPool, username: &str, password: &str) -> Result<i64,
 }
 
 async fn verify_user(db: &PgPool, username: &str, password: &str) -> Result<i64, String> {
-    let row = sqlx::query("SELECT id, password_hash FROM users WHERE username = $1")
+    let row = sqlx::query("SELECT id::bigint AS id, password_hash FROM users WHERE username = $1")
         .bind(username)
         .fetch_optional(db)
         .await
@@ -977,7 +977,7 @@ async fn verify_user(db: &PgPool, username: &str, password: &str) -> Result<i64,
 }
 
 async fn get_user_id_by_name(db: &PgPool, username: &str) -> Result<Option<i64>, sqlx::Error> {
-    let row = sqlx::query("SELECT id FROM users WHERE username = $1")
+    let row = sqlx::query("SELECT id::bigint AS id FROM users WHERE username = $1")
         .bind(username)
         .fetch_optional(db)
         .await?;
