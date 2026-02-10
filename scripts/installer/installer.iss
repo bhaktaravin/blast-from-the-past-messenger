@@ -1,7 +1,7 @@
 #define AppName "Blast From The Past Messenger"
 #define AppVersion "0.1.0"
 #define AppExe "chatmessagediscordclone.exe"
-#define RootDir "..\.."
+#define RootDir SourcePath + "\\..\\.."
 
 [Setup]
 AppId={{E3E0F0C5-7C1E-4B4F-9F7C-9B6B5B9E5D01}
