@@ -179,3 +179,66 @@ jobs:
             dmg-dist/BlastFromThePast-*.dmg
           generate_release_notes: false
 
+  update-homebrew-tap:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG=${{ github.ref }}
+          VERSION=${TAG#refs/tags/}
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Download DMG artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: aol-style-messenger-macos
+          path: ./dmg-download
+
+      - name: Calculate SHA256
+        id: sha256
+        run: |
+          SHA256=$(sha256sum dmg-download/BlastFromThePast-*.dmg | awk '{print $1}')
+          echo "sha256=${SHA256}" >> $GITHUB_OUTPUT
+
+      - name: Checkout homebrew tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: bhaktaravin/homebrew-blast-from-the-past
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update cask formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.sha256.outputs.sha256 }}
+        run: |
+          cat > homebrew-tap/Casks/blast-from-the-past.rb << 'EOF'
+          cask "blast-from-the-past" do
+            version "VERSION_PLACEHOLDER"
+            sha256 "SHA256_PLACEHOLDER"
+
+            url "https://github.com/ravinathannur/chatmessagediscordclone/releases/download/v#{version}/BlastFromThePast-#{version}.dmg"
+            name "Blast From The Past"
+            desc "Retro AOL-style messenger"
+            homepage "https://github.com/ravinathannur/chatmessagediscordclone"
+
+            app "BlastFromThePast.app"
+
+            uninstall quit: "com.ravinathannur.blastfromthepast"
+          end
+          EOF
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" homebrew-tap/Casks/blast-from-the-past.rb
+          sed -i "s/SHA256_PLACEHOLDER/${SHA256}/g" homebrew-tap/Casks/blast-from-the-past.rb
+
+      - name: Commit and push to homebrew tap
+        run: |
+          cd homebrew-tap
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add Casks/blast-from-the-past.rb
+          git commit -m "Update BlastFromThePast to ${{ steps.version.outputs.version }}"
+          git push
+
