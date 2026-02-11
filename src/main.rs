@@ -13,13 +13,9 @@ use tokio_tungstenite::tungstenite::Message;
 use chatmessagediscordclone::protocol::{
     ClientToServer, HistoryTarget, ServerToClient, UserStatus,
 };
-
-#[derive(Debug, Clone)]
-struct ChatMessage {
-    from: String,
-    body: String,
-    at: String,
-}
+use chatmessagediscordclone::db::LocalDb;
+use chatmessagediscordclone::update;
+use chatmessagediscordclone::{ChatMessage, ChatTarget};
 
 struct Toast {
     text: String,
@@ -32,6 +28,7 @@ enum ToastKind {
     Success,
     Error,
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     SignIn,
@@ -42,12 +39,6 @@ enum Screen {
 enum AuthMode {
     Login,
     Register,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ChatTarget {
-    Lobby,
-    Direct(String),
 }
 
 enum UiToNet {
@@ -132,6 +123,10 @@ struct AolApp {
     recent_threads: Vec<String>,
     messages: std::collections::HashMap<ChatTarget, Vec<ChatMessage>>,
     toast: Option<Toast>,
+    db: Option<LocalDb>,
+    offline_queue_size: usize,
+    update_available: Option<String>,
+    checked_updates: bool,
 }
 
 struct SearchResult {
@@ -155,6 +150,8 @@ impl AolApp {
             .insert(egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Monospace));
         cc.egui_ctx.set_style(style);
         apply_theme(&cc.egui_ctx, Theme::MidnightAmber);
+
+        let db = LocalDb::new().ok();
 
         Self {
             screen: Screen::SignIn,
@@ -186,6 +183,10 @@ impl AolApp {
             recent_threads: Vec::new(),
             messages: HashMap::new(),
             toast: None,
+            db,
+            offline_queue_size: 0,
+            update_available: None,
+            checked_updates: false,
         }
     }
 
@@ -232,6 +233,7 @@ impl AolApp {
                 NetToUi::Connected => {
                     self.connected = true;
                     self.status = "Online".to_string();
+                    self.sync_queued_messages();
                 }
                 NetToUi::Disconnected => {
                     self.connected = false;
@@ -245,21 +247,29 @@ impl AolApp {
                     self.buddies = users;
                 }
                 NetToUi::Chat { from, body } => {
+                    let timestamp = Utc::now().to_rfc3339();
                     let entry = self.messages.entry(ChatTarget::Lobby).or_default();
                     entry.push(ChatMessage {
-                        from,
-                        body,
-                        at: Utc::now().to_rfc3339(),
+                        from: from.clone(),
+                        body: body.clone(),
+                        at: timestamp.clone(),
                     });
+                    if let Some(db) = &self.db {
+                        let _ = db.save_message(&ChatTarget::Lobby, from, body, timestamp);
+                    }
                 }
                 NetToUi::DirectMessage { from, body } => {
                     let target = ChatTarget::Direct(from.clone());
-                    let entry = self.messages.entry(target).or_default();
+                    let timestamp = Utc::now().to_rfc3339();
+                    let entry = self.messages.entry(target.clone()).or_default();
                     entry.push(ChatMessage {
-                        from,
-                        body,
-                        at: Utc::now().to_rfc3339(),
+                        from: from.clone(),
+                        body: body.clone(),
+                        at: timestamp.clone(),
                     });
+                    if let Some(db) = &self.db {
+                        let _ = db.save_message(&target, from, body, timestamp);
+                    }
                 }
                 NetToUi::Threads(users) => {
                     self.recent_threads = users;
@@ -301,6 +311,13 @@ impl AolApp {
                             target: ChatTarget::Lobby,
                         });
                     let _ = self.network.tx.send(UiToNet::FetchThreads);
+                    self.update_offline_queue_size();
+                    if self.offline_queue_size > 0 {
+                        self.show_toast(
+                            format!("{} messages ready to sync", self.offline_queue_size),
+                            ToastKind::Info,
+                        );
+                    }
                 }
                 NetToUi::AuthError(message) => {
                     self.status = message;
@@ -360,28 +377,48 @@ impl AolApp {
         }
         match &self.selected_target {
             ChatTarget::Lobby => {
-                let _ = self
-                    .network
-                    .tx
-                    .send(UiToNet::SendChat { body: body.to_string() });
+                if self.connected {
+                    let _ = self
+                        .network
+                        .tx
+                        .send(UiToNet::SendChat { body: body.to_string() });
+                } else {
+                    // Queue message for offline delivery
+                    if let Some(db) = &self.db {
+                        let _ = db.queue_message(&ChatTarget::Lobby, body.to_string());
+                        self.update_offline_queue_size();
+                        self.show_toast("Message queued (offline)".to_string(), ToastKind::Info);
+                    }
+                }
             }
             ChatTarget::Direct(target) => {
-                let _ = self.network.tx.send(UiToNet::SendDirect {
-                    to: target.clone(),
-                    body: body.to_string(),
-                });
-                let entry = self
-                    .messages
-                    .entry(ChatTarget::Direct(target.clone()))
-                    .or_default();
-                entry.push(ChatMessage {
+                let msg = ChatMessage {
                     from: self
                         .logged_in_user
                         .clone()
                         .unwrap_or_else(|| "Me".to_string()),
                     body: body.to_string(),
                     at: Utc::now().to_rfc3339(),
-                });
+                };
+                let entry = self
+                    .messages
+                    .entry(ChatTarget::Direct(target.clone()))
+                    .or_default();
+                entry.push(msg);
+
+                if self.connected {
+                    let _ = self.network.tx.send(UiToNet::SendDirect {
+                        to: target.clone(),
+                        body: body.to_string(),
+                    });
+                } else {
+                    // Queue message for offline delivery
+                    if let Some(db) = &self.db {
+                        let _ = db.queue_message(&ChatTarget::Direct(target.clone()), body.to_string());
+                        self.update_offline_queue_size();
+                        self.show_toast("Message queued (offline)".to_string(), ToastKind::Info);
+                    }
+                }
             }
         }
         self.chat_input.clear();
@@ -396,6 +433,45 @@ impl AolApp {
         let _ = self.network.tx.send(UiToNet::SetAway { away });
     }
 
+    fn sync_queued_messages(&mut self) {
+        if let Some(db) = &self.db {
+            if let Ok(queued) = db.get_queued_messages() {
+                let queued_count = queued.len();
+                for (msg_id, target, body, _) in queued {
+                    match &target {
+                        ChatTarget::Lobby => {
+                            let _ = self.network.tx.send(UiToNet::SendChat {
+                                body: body.clone(),
+                            });
+                        }
+                        ChatTarget::Direct(to) => {
+                            let _ = self.network.tx.send(UiToNet::SendDirect {
+                                to: to.clone(),
+                                body: body.clone(),
+                            });
+                        }
+                    }
+                    let _ = db.mark_queued_sent(msg_id);
+                }
+                self.update_offline_queue_size();
+                if queued_count > 0 {
+                    self.show_toast(
+                        format!("Synced {} offline messages", queued_count),
+                        ToastKind::Info,
+                    );
+                }
+            }
+        }
+    }
+
+    fn update_offline_queue_size(&mut self) {
+        if let Some(db) = &self.db {
+            if let Ok(queued) = db.get_queued_messages() {
+                self.offline_queue_size = queued.len();
+            }
+        }
+    }
+
     fn send_moderation(&mut self, action: UiToNet) {
         let _ = self.network.tx.send(action);
     }
@@ -408,6 +484,16 @@ impl AolApp {
         self.search_query.clear();
         self.search_in_progress = false;
         self.search_results.remove(&target);
+        
+        // Try to load from local cache first
+        if let Some(db) = &self.db {
+            if let Ok(cached_messages) = db.get_messages(&target) {
+                if !cached_messages.is_empty() {
+                    self.messages.insert(target.clone(), cached_messages);
+                }
+            }
+        }
+        
         let _ = self.network.tx.send(UiToNet::FetchHistory { target });
     }
 
@@ -474,6 +560,14 @@ impl eframe::App for AolApp {
         if self.startup_repaint_left > 0 {
             self.startup_repaint_left = self.startup_repaint_left.saturating_sub(1);
             ctx.request_repaint();
+        } else if !self.checked_updates {
+            // Check for updates on first completed frame
+            self.checked_updates = true;
+            tokio::spawn(async move {
+                if let Ok(Some(version)) = update::check_for_updates().await {
+                    eprintln!("Update available: {}", version);
+                }
+            });
         }
         self.process_net_events();
         if self.show_background {
@@ -602,6 +696,18 @@ impl eframe::App for AolApp {
                         ui.heading("AOL Messenger");
                         ui.separator();
                         ui.label(format!("Status: {}", self.status));
+                        if self.offline_queue_size > 0 {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                format!("⚠ {} queued", self.offline_queue_size),
+                            );
+                        }
+                        if let Some(version) = &self.update_available {
+                            ui.colored_label(
+                                egui::Color32::LIGHT_BLUE,
+                                format!("📦 Update: v{}", version),
+                            );
+                        }
                         if let Some(name) = &self.logged_in_user {
                             ui.label(format!("User: {name}"));
                         }
@@ -632,6 +738,9 @@ impl eframe::App for AolApp {
                         ui.add(egui::TextEdit::singleline(&mut self.away_text).hint_text("Be right back..."));
                         if ui.button("Update").clicked() {
                             self.send_away();
+                        }
+                        if self.offline_queue_size > 0 && ui.button("⬆ Sync Now").clicked() {
+                            self.sync_queued_messages();
                         }
                     });
                 });
