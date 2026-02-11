@@ -1,3 +1,163 @@
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Validate tag is on main
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor $GITHUB_SHA origin/main
+      - name: Extract version from tag
+        id: version
+        run: |
+          # Try to get version from tag first
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG=${{ github.ref }}
+            VERSION=${TAG#refs/tags/}
+          else
+            # Fall back to Cargo.toml for manual runs
+            VERSION=$(grep '^version' Cargo.toml | head -n1 | cut -d'"' -f2)
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+      - name: Build release binaries (Intel)
+        run: cargo build --release --target x86_64-apple-darwin --bins
+
+      - name: Build release binaries (Apple Silicon)
+        run: cargo build --release --target aarch64-apple-darwin --bins
+
+      - name: Create universal binary for client
+        run: |
+          mkdir -p target/release-macos
+          lipo -create target/x86_64-apple-darwin/release/chatmessagediscordclone target/aarch64-apple-darwin/release/chatmessagediscordclone -output target/release-macos/chatmessagediscordclone
+      - name: Create universal binary for server
+        run: |
+          lipo -create target/x86_64-apple-darwin/release/server target/aarch64-apple-darwin/release/server -output target/release-macos/server
+      - name: Create app bundle
+        run: |
+          mkdir -p "dist/BlastFromThePast.app/Contents/MacOS"
+          mkdir -p "dist/BlastFromThePast.app/Contents/Resources"
+          cp target/release-macos/chatmessagediscordclone "dist/BlastFromThePast.app/Contents/MacOS/BlastFromThePast"
+          chmod +x "dist/BlastFromThePast.app/Contents/MacOS/BlastFromThePast"
+      - name: Create Info.plist
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cat > "dist/BlastFromThePast.app/Contents/Info.plist" << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>BlastFromThePast</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.ravinathannur.blastfromthepast</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>Blast From The Past</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>NSRequiresIPhoneOS</key>
+              <false/>
+          </dict>
+          </plist>
+          EOF
+      - name: Create DMG
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cd dist
+          hdiutil create -volname "Blast From The Past" -srcfolder "BlastFromThePast.app" -ov -format UDZO "BlastFromThePast-${VERSION}.dmg"
+          cd ..
+          mkdir -p dmg-dist
+          cp "dist/BlastFromThePast-${VERSION}.dmg" dmg-dist/
+      - name: Upload artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aol-style-messenger-macos
+          path: dmg-dist/BlastFromThePast-*.dmg
+
+      - name: Upload DMG to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dmg-dist/BlastFromThePast-*.dmg
+          generate_release_notes: false
+
+  update-homebrew-tap:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG=${{ github.ref }}
+          VERSION=${TAG#refs/tags/}
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+      - name: Download DMG artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: aol-style-messenger-macos
+          path: ./dmg-download
+
+      - name: Calculate SHA256
+        id: sha256
+        run: |
+          SHA256=$(sha256sum dmg-download/BlastFromThePast-*.dmg | awk '{print $1}')
+          echo "sha256=${SHA256}" >> $GITHUB_OUTPUT
+      - name: Checkout homebrew tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: bhaktaravin/homebrew-blast-from-the-past
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update cask formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.sha256.outputs.sha256 }}
+        run: |
+          cat > homebrew-tap/Casks/blast-from-the-past.rb << 'EOF'
+          cask "blast-from-the-past" do
+            version "VERSION_PLACEHOLDER"
+            sha256 "SHA256_PLACEHOLDER"
+            url "https://github.com/ravinathannur/chatmessagediscordclone/releases/download/v#{version}/BlastFromThePast-#{version}.dmg"
+            name "Blast From The Past"
+            desc "Retro AOL-style messenger"
+            homepage "https://github.com/ravinathannur/chatmessagediscordclone"
+            app "BlastFromThePast.app"
+            uninstall quit: "com.ravinathannur.blastfromthepast"
+          end
+          EOF
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" homebrew-tap/Casks/blast-from-the-past.rb
+          sed -i "s/SHA256_PLACEHOLDER/${SHA256}/g" homebrew-tap/Casks/blast-from-the-past.rb
+      - name: Commit and push to homebrew tap
+        run: |
+          cd homebrew-tap
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add Casks/blast-from-the-past.rb
+          git commit -m "Update BlastFromThePast to ${{ steps.version.outputs.version }}"
+          git push
 name: Windows Release
 
 on:
@@ -67,3 +227,7 @@ jobs:
             dist/aol-style-messenger-windows.zip
             dist/blast-from-the-past-messenger-setup.exe
           generate_release_notes: true
+
+
+  
+  
