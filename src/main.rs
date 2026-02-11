@@ -814,164 +814,203 @@ impl eframe::App for AolApp {
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Away message:");
-                        ui.add(egui::TextEdit::singleline(&mut self.away_text).hint_text("Be right back..."));
-                        if ui.button("Update").clicked() {
+                        ui.label("💬");
+                        ui.add(egui::TextEdit::singleline(&mut self.away_text).hint_text("Away...").desired_width(150.0));
+                        if ui.small_button("Update").clicked() {
                             self.send_away();
                         }
-                        if self.offline_queue_size > 0 && ui.button("⬆ Sync Now").clicked() {
+                        ui.separator();
+                        if self.offline_queue_size > 0 && ui.small_button(format!("⬆ Sync ({0})", self.offline_queue_size)).clicked() {
                             self.sync_queued_messages();
+                        }
+                        if let Some(version) = &self.update_available {
+                            if ui.small_button(format!("⬇ Update to {}", version)).clicked() {
+                                if let Err(e) = download_and_install_update(version) {
+                                    self.toast = Some(Toast::new(format!("Update failed: {}", e)));
+                                }
+                            }
                         }
                     });
                 });
 
                 egui::SidePanel::left("buddy_list")
                     .resizable(false)
-                    .min_width(200.0)
+                    .min_width(250.0)
                     .show(ctx, |ui| {
                         ui.heading("Buddy List");
                         ui.separator();
-                        if ui
-                            .selectable_label(self.selected_target == ChatTarget::Lobby, "Lobby")
-                            .clicked()
-                        {
+                        
+                        // Lobby button
+                        if ui.selectable_label(self.selected_target == ChatTarget::Lobby, "📍 Lobby").clicked() {
                             self.select_target(ChatTarget::Lobby);
                         }
-                        ui.add_space(8.0);
-                        ui.label("Recent DMs");
-                        let recent_threads = self.recent_threads.clone();
-                        for name in recent_threads {
-                            let target = ChatTarget::Direct(name.clone());
-                            if ui.selectable_label(self.selected_target == target, &name).clicked() {
-                                self.select_target(ChatTarget::Direct(name));
-                            }
-                        }
-                        if self.recent_threads.is_empty() {
-                            ui.label("No recent threads.");
-                        }
-                        ui.add_space(8.0);
-                        ui.label("Direct messages");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.dm_target)
-                                    .hint_text("Screen name"),
-                            );
-                            if ui.button("Open").clicked() {
-                                let target = self.dm_target.trim();
-                                if !target.is_empty() {
-                                    self.select_target(ChatTarget::Direct(target.to_string()));
-                                    self.dm_target.clear();
-                                }
-                            }
-                        });
-                        ui.add_space(8.0);
-                        ui.label("Add Friend");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.add_friend_username)
-                                    .hint_text("Username"),
-                            );
-                            if ui.button("Add").clicked() {
-                                let username = self.add_friend_username.trim();
-                                if !username.is_empty() {
-                                    let nickname = if self.add_friend_nickname.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(self.add_friend_nickname.trim().to_string())
-                                    };
-                                    let _ = self.network.tx.send(UiToNet::AddFriend {
-                                        username: username.to_string(),
-                                        nickname: nickname.clone(),
-                                    });
-                                    if let Some(db) = &self.db {
-                                        let _ = db.add_friend(username.to_string(), nickname.clone());
+                        
+                        // Recent DMs section
+                        ui.separator();
+                        egui::CollapsingHeader("📝 Recent DMs")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if self.recent_threads.is_empty() {
+                                    ui.label("  (none)");
+                                } else {
+                                    for name in self.recent_threads.clone() {
+                                        let target = ChatTarget::Direct(name.clone());
+                                        if ui.selectable_label(self.selected_target == target, format!("  {0}", name)).clicked() {
+                                            self.select_target(ChatTarget::Direct(name));
+                                        }
                                     }
-                                    self.friends.push((username.to_string(), nickname));
-                                    self.add_friend_username.clear();
-                                    self.add_friend_nickname.clear();
-                                }
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.add_friend_nickname)
-                                    .hint_text("Nickname (optional)"),
-                            );
-                        });
-                        ui.add_space(8.0);
-                        ui.label("Friends");
-                        let friends = self.friends.clone();
-                        for (friend, nickname) in friends {
-                            let display_name = nickname.as_ref().unwrap_or(&friend);
-                            ui.label(format!("👤 {}", display_name));
-                        }
-                        if self.friends.is_empty() {
-                            ui.label("No friends added.");
-                        }
-                        ui.add_space(8.0);
-                        ui.label("Friend Requests");
-                        let current_user = self.logged_in_user.clone().unwrap_or_default();
-                        let mut to_accept = None;
-                        let mut to_decline = None;
-                        let pending_requests = self.pending_friend_requests.clone();
-                        for (idx, requester) in pending_requests.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("📨 {} wants to add you", requester));
-                                if ui.button("Accept").clicked() {
-                                    to_accept = Some(idx);
-                                }
-                                if ui.button("Decline").clicked() {
-                                    to_decline = Some(idx);
                                 }
                             });
+                        
+                        // Open Direct Message
+                        ui.separator();
+                        egui::CollapsingHeader("✉️ Open Message")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.dm_target)
+                                            .hint_text("Screen name")
+                                            .desired_width(150.0),
+                                    );
+                                    if ui.small_button("Go").clicked() {
+                                        let target = self.dm_target.trim();
+                                        if !target.is_empty() {
+                                            self.select_target(ChatTarget::Direct(target.to_string()));
+                                            self.dm_target.clear();
+                                        }
+                                    }
+                                });
+                            });
+                        
+                        // Add Friend section
+                        ui.separator();
+                        egui::CollapsingHeader("➕ Add Friend")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.add_friend_username)
+                                        .hint_text("Username")
+                                        .desired_width(200.0),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.add_friend_nickname)
+                                        .hint_text("Nickname (optional)")
+                                        .desired_width(200.0),
+                                );
+                                if ui.button("Add Friend").clicked() {
+                                    let username = self.add_friend_username.trim();
+                                    if !username.is_empty() {
+                                        let nickname = if self.add_friend_nickname.trim().is_empty() {
+                                            None
+                                        } else {
+                                            Some(self.add_friend_nickname.trim().to_string())
+                                        };
+                                        let _ = self.network.tx.send(UiToNet::AddFriend {
+                                            username: username.to_string(),
+                                            nickname: nickname.clone(),
+                                        });
+                                        if let Some(db) = &self.db {
+                                            let _ = db.add_friend(username.to_string(), nickname.clone());
+                                        }
+                                        self.friends.push((username.to_string(), nickname));
+                                        self.add_friend_username.clear();
+                                        self.add_friend_nickname.clear();
+                                        self.toast = Some(Toast::new(format!("Added {0}", username)));
+                                    }
+                                }
+                            });
+                        
+                        // Friends list
+                        ui.separator();
+                        egui::CollapsingHeader(format!("👥 Friends ({})", self.friends.len()))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if self.friends.is_empty() {
+                                    ui.label("  (none)");
+                                } else {
+                                    for (friend, nickname) in self.friends.clone() {
+                                        let display_name = nickname.as_ref().unwrap_or(&friend);
+                                        ui.label(format!("  👤 {0}", display_name));
+                                    }
+                                }
+                            });
+                        
+                        // Friend Requests section
+                        ui.separator();
+                        if !self.pending_friend_requests.is_empty() {
+                            egui::CollapsingHeader(format!("🔔 Requests ({})", self.pending_friend_requests.len()))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    let current_user = self.logged_in_user.clone().unwrap_or_default();
+                                    let mut to_accept = None;
+                                    let mut to_decline = None;
+                                    let pending_requests = self.pending_friend_requests.clone();
+                                    for (idx, requester) in pending_requests.iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("  from {0}", requester));
+                                            if ui.small_button("✓").clicked() {
+                                                to_accept = Some(idx);
+                                            }
+                                            if ui.small_button("✗").clicked() {
+                                                to_decline = Some(idx);
+                                            }
+                                        });
+                                    }
+                                    
+                                    // Process accept/decline after loop
+                                    if let Some(idx) = to_accept {
+                                        let requester = &self.pending_friend_requests[idx];
+                                        let _ = self.network.tx.send(UiToNet::RespondToFriendRequest {
+                                            from: requester.clone(),
+                                            accepted: true,
+                                        });
+                                        if let Some(db) = &self.db {
+                                            let _ = db.respond_to_friend_request(requester, &current_user, true);
+                                        }
+                                        self.friends.push((requester.clone(), None));
+                                        self.pending_friend_requests.remove(idx);
+                                    }
+                                    if let Some(idx) = to_decline {
+                                        let requester = &self.pending_friend_requests[idx];
+                                        let _ = self.network.tx.send(UiToNet::RespondToFriendRequest {
+                                            from: requester.clone(),
+                                            accepted: false,
+                                        });
+                                        if let Some(db) = &self.db {
+                                            let _ = db.respond_to_friend_request(requester, &current_user, false);
+                                        }
+                                        self.pending_friend_requests.remove(idx);
+                                    }
+                                });
                         }
                         
-                        // Process accept/decline after loop
-                        if let Some(idx) = to_accept {
-                            let requester = &self.pending_friend_requests[idx];
-                            let _ = self.network.tx.send(UiToNet::RespondToFriendRequest {
-                                from: requester.clone(),
-                                accepted: true,
+                        // Buddies Online section
+                        ui.separator();
+                        egui::CollapsingHeader(format!("🟢 Online ({})", self.buddies.len()))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if self.buddies.is_empty() {
+                                    ui.label("  (none)");
+                                } else {
+                                    for buddy in self.buddies.clone() {
+                                        let status = buddy
+                                            .away
+                                            .as_ref()
+                                            .map(|msg| format!("(Away)"))
+                                            .unwrap_or_else(|| "".to_string());
+                                        let label = if status.is_empty() {
+                                            format!("  {0}", buddy.username)
+                                        } else {
+                                            format!("  {} {}", buddy.username, status)
+                                        };
+                                        let target = ChatTarget::Direct(buddy.username.clone());
+                                        if ui.selectable_label(self.selected_target == target, label).clicked() {
+                                            self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                        }
+                                    }
+                                }
                             });
-                            if let Some(db) = &self.db {
-                                let _ = db.respond_to_friend_request(requester, &current_user, true);
-                            }
-                            self.friends.push((requester.clone(), None));
-                            self.pending_friend_requests.remove(idx);
-                        }
-                        if let Some(idx) = to_decline {
-                            let requester = &self.pending_friend_requests[idx];
-                            let _ = self.network.tx.send(UiToNet::RespondToFriendRequest {
-                                from: requester.clone(),
-                                accepted: false,
-                            });
-                            if let Some(db) = &self.db {
-                                let _ = db.respond_to_friend_request(requester, &current_user, false);
-                            }
-                            self.pending_friend_requests.remove(idx);
-                        }
-                        
-                        if self.pending_friend_requests.is_empty() {
-                            ui.label("No pending requests.");
-                        }
-                        ui.add_space(8.0);
-                        ui.label("Buddies Online");
-                        let buddies = self.buddies.clone();
-                        for buddy in buddies {
-                            let status = buddy
-                                .away
-                                .as_ref()
-                                .map(|msg| format!("Away: {msg}"))
-                                .unwrap_or_else(|| "Available".to_string());
-                            let label = format!("{} - {}", buddy.username, status);
-                            let target = ChatTarget::Direct(buddy.username.clone());
-                            if ui.selectable_label(self.selected_target == target, label).clicked() {
-                                self.select_target(ChatTarget::Direct(buddy.username.clone()));
-                            }
-                        }
-                        if self.buddies.is_empty() {
-                            ui.label("No buddies online.");
-                        }
                     });
 
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -1016,74 +1055,73 @@ impl eframe::App for AolApp {
                         });
                     } else {
                         let heading = match &self.selected_target {
-                            ChatTarget::Lobby => "Chat Log - Lobby".to_string(),
-                            ChatTarget::Direct(name) => format!("Chat Log - {name}"),
+                            ChatTarget::Lobby => "Lobby".to_string(),
+                            ChatTarget::Direct(name) => name.clone(),
                         };
                         ui.heading(heading);
                         ui.separator();
-                    ui.horizontal(|ui| {
-                        let direct_name = match &self.selected_target {
-                            ChatTarget::Direct(name) => Some(name.clone()),
-                            _ => None,
-                        };
-                        if let Some(name) = direct_name {
-                            if ui.button("Block").clicked() {
-                                self.send_moderation(UiToNet::Block { username: name.clone() });
-                            }
-                            if ui.button("Unblock").clicked() {
-                                self.send_moderation(UiToNet::Unblock { username: name.clone() });
-                            }
-                            if ui.button("Mute").clicked() {
-                                self.send_moderation(UiToNet::Mute { username: name.clone() });
-                            }
-                            if ui.button("Unmute").clicked() {
-                                self.send_moderation(UiToNet::Unmute { username: name.clone() });
-                            }
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.report_reason)
-                                    .hint_text("Report reason")
-                                    .desired_width(160.0),
+                        
+                        // Compact toolbar
+                        ui.horizontal(|ui| {
+                            ui.label("Search:");
+                            let search_response = ui.add(
+                                egui::TextEdit::singleline(&mut self.search_query)
+                                    .hint_text("Find messages")
+                                    .desired_width(200.0),
                             );
-                            if ui.button("Report").clicked() {
-                                if !self.report_reason.trim().is_empty() {
-                                    self.send_moderation(UiToNet::Report {
-                                        username: name.clone(),
-                                        reason: self.report_reason.trim().to_string(),
+                            if ui.small_button("🔍").clicked() 
+                                || (search_response.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                let query = self.search_query.trim();
+                                if !query.is_empty() {
+                                    self.search_in_progress = true;
+                                    let _ = self.network.tx.send(UiToNet::Search {
+                                        target: self.selected_target.clone(),
+                                        query: query.to_string(),
                                     });
-                                    self.report_reason.clear();
                                 }
                             }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Search:");
-                        let search_response = ui.add(
-                            egui::TextEdit::singleline(&mut self.search_query)
-                                .hint_text("Find messages")
-                                .desired_width(200.0),
-                        );
-                        let search_clicked = ui.button("Search Server").clicked();
-                        let search_enter = search_response.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if search_clicked || search_enter {
-                            let query = self.search_query.trim();
-                            if !query.is_empty() {
-                                self.search_in_progress = true;
-                                let _ = self.network.tx.send(UiToNet::Search {
-                                    target: self.selected_target.clone(),
-                                    query: query.to_string(),
-                                });
+                            if ui.small_button("Clear").clicked() {
+                                self.search_query.clear();
+                                self.search_in_progress = false;
+                                self.search_results.remove(&self.selected_target);
                             }
-                        }
-                        if ui.button("Clear").clicked() {
-                            self.search_query.clear();
-                            self.search_in_progress = false;
-                            self.search_results.remove(&self.selected_target);
-                        }
-                        if self.search_in_progress {
-                            ui.label("Searching...");
-                        }
-                    });
+                            
+                            let direct_name = match &self.selected_target {
+                                ChatTarget::Direct(name) => Some(name.clone()),
+                                _ => None,
+                            };
+                            if let Some(name) = direct_name {
+                                ui.separator();
+                                if ui.small_button("🚫 Block").clicked() {
+                                    self.send_moderation(UiToNet::Block { username: name.clone() });
+                                }
+                                if ui.small_button("Unblock").clicked() {
+                                    self.send_moderation(UiToNet::Unblock { username: name.clone() });
+                                }
+                                if ui.small_button("🔇 Mute").clicked() {
+                                    self.send_moderation(UiToNet::Mute { username: name.clone() });
+                                }
+                                if ui.small_button("🔊 Unmute").clicked() {
+                                    self.send_moderation(UiToNet::Unmute { username: name.clone() });
+                                }
+                                ui.separator();
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.report_reason)
+                                        .hint_text("Report reason")
+                                        .desired_width(120.0),
+                                );
+                                if ui.small_button("⚠️ Report").clicked() {
+                                    if !self.report_reason.trim().is_empty() {
+                                        self.send_moderation(UiToNet::Report {
+                                            username: name.clone(),
+                                            reason: self.report_reason.trim().to_string(),
+                                        });
+                                        self.report_reason.clear();
+                                    }
+                                }
+                            }
+                        });
                     egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                         let query = self.search_query.trim();
                         let mut using_search = false;
