@@ -59,6 +59,7 @@ enum UiToNet {
     Mute { username: String },
     Unmute { username: String },
     Report { username: String, reason: String },
+    AddFriend { username: String, nickname: Option<String> },
     Disconnect,
 }
 
@@ -79,6 +80,7 @@ enum NetToUi {
     AuthError(String),
     System(String),
     Error(String),
+    FriendAdded { username: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +129,9 @@ struct AolApp {
     offline_queue_size: usize,
     update_available: Option<String>,
     checked_updates: bool,
+    friends: Vec<(String, Option<String>)>,
+    add_friend_username: String,
+    add_friend_nickname: String,
 }
 
 struct SearchResult {
@@ -187,6 +192,9 @@ impl AolApp {
             offline_queue_size: 0,
             update_available: None,
             checked_updates: false,
+            friends: Vec::new(),
+            add_friend_username: String::new(),
+            add_friend_nickname: String::new(),
         }
     }
 
@@ -318,6 +326,12 @@ impl AolApp {
                             ToastKind::Info,
                         );
                     }
+                    // Load friends from database
+                    if let Some(db) = &self.db {
+                        if let Ok(friends) = db.get_friends() {
+                            self.friends = friends;
+                        }
+                    }
                 }
                 NetToUi::AuthError(message) => {
                     self.status = message;
@@ -339,6 +353,9 @@ impl AolApp {
                     self.show_toast(self.status.clone(), ToastKind::Error);
                     self.logging_in = false;
                     self.login_started_at = None;
+                }
+                NetToUi::FriendAdded { username } => {
+                    self.show_toast(format!("Added {} as friend!", username), ToastKind::Success);
                 }
             }
         }
@@ -785,6 +802,51 @@ impl eframe::App for AolApp {
                             }
                         });
                         ui.add_space(8.0);
+                        ui.label("Add Friend");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.add_friend_username)
+                                    .hint_text("Username"),
+                            );
+                            if ui.button("Add").clicked() {
+                                let username = self.add_friend_username.trim();
+                                if !username.is_empty() {
+                                    let nickname = if self.add_friend_nickname.trim().is_empty() {
+                                        None
+                                    } else {
+                                        Some(self.add_friend_nickname.trim().to_string())
+                                    };
+                                    let _ = self.network.tx.send(UiToNet::AddFriend {
+                                        username: username.to_string(),
+                                        nickname: nickname.clone(),
+                                    });
+                                    if let Some(db) = &self.db {
+                                        let _ = db.add_friend(username.to_string(), nickname.clone());
+                                    }
+                                    self.friends.push((username.to_string(), nickname));
+                                    self.add_friend_username.clear();
+                                    self.add_friend_nickname.clear();
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.add_friend_nickname)
+                                    .hint_text("Nickname (optional)"),
+                            );
+                        });
+                        ui.add_space(8.0);
+                        ui.label("Friends");
+                        let friends = self.friends.clone();
+                        for (friend, nickname) in friends {
+                            let display_name = nickname.as_ref().unwrap_or(&friend);
+                            ui.label(format!("👤 {}", display_name));
+                        }
+                        if self.friends.is_empty() {
+                            ui.label("No friends added.");
+                        }
+                        ui.add_space(8.0);
+                        ui.label("Buddies Online");
                         let buddies = self.buddies.clone();
                         for buddy in buddies {
                             let status = buddy
@@ -1138,6 +1200,9 @@ async fn run_connection(
                                 ServerToClient::System { message } => {
                                     let _ = net_tx.send(NetToUi::System(message));
                                 }
+                                ServerToClient::FriendAdded { username } => {
+                                    let _ = net_tx.send(NetToUi::FriendAdded { username });
+                                }
                             }
                         }
                     }
@@ -1189,6 +1254,9 @@ async fn run_connection(
                     }
                     UiToNet::Report { username, reason } => {
                         send_json(&mut ws_tx, ClientToServer::Report { username, reason }).await?;
+                    }
+                    UiToNet::AddFriend { username, nickname } => {
+                        send_json(&mut ws_tx, ClientToServer::AddFriend { username, nickname }).await?;
                     }
                     UiToNet::Disconnect => {
                         let _ = ws_tx.send(Message::Close(None)).await;

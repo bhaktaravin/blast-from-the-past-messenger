@@ -44,6 +44,12 @@ impl LocalDb {
                 body TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 sent BOOLEAN DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS friends (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                nickname TEXT,
+                added_at TEXT NOT NULL
             );",
         )?;
         Ok(())
@@ -145,6 +151,38 @@ impl LocalDb {
             "DELETE FROM messages 
              WHERE timestamp < datetime('now', ? || ' days')",
             params![format!("-{}", days)],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_friend(&self, username: String, nickname: Option<String>) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO friends (username, nickname, added_at)
+             VALUES (?, ?, datetime('now'))",
+            params![&username, &nickname],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_friends(&self) -> SqliteResult<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT username, nickname FROM friends ORDER BY added_at DESC",
+        )?;
+        let friends = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+
+        let mut result = Vec::new();
+        for friend in friends {
+            result.push(friend?);
+        }
+        Ok(result)
+    }
+
+    pub fn remove_friend(&self, username: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "DELETE FROM friends WHERE username = ?",
+            params![username],
         )?;
         Ok(())
     }

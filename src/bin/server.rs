@@ -473,6 +473,13 @@ async fn handle_client_event(
                 }
             }
         }
+        ClientToServer::AddFriend { username, nickname: _ } => {
+            send_to_peer(
+                peers,
+                id,
+                ServerToClient::FriendAdded { username },
+            );
+        }
     }
 }
 
