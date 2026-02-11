@@ -2,8 +2,9 @@
 #define AppVersion "0.1.0"
 #define AppExe "chatmessagediscordclone.exe"
 
-#ifdef ROOTDIR
-	#define RootDir ROOTDIR
+#define EnvRoot GetEnv("GITHUB_WORKSPACE")
+#if EnvRoot != ""
+	#define RootDir EnvRoot + "\\"
 #else
 	#define RootDir SourcePath + "..\\..\\"
 #endif
