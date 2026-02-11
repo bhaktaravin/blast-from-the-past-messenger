@@ -101,6 +101,7 @@ enum Theme {
 struct NetworkHandle {
     tx: mpsc::UnboundedSender<UiToNet>,
     rx: std_mpsc::Receiver<NetToUi>,
+    update_rx: std_mpsc::Receiver<String>,
 }
 
 struct AolApp {
@@ -137,6 +138,7 @@ struct AolApp {
     offline_queue_size: usize,
     update_available: Option<String>,
     checked_updates: bool,
+    updating: bool,
     friends: Vec<(String, Option<String>)>,
     add_friend_username: String,
     add_friend_nickname: String,
@@ -204,6 +206,7 @@ impl AolApp {
             offline_queue_size: 0,
             update_available: None,
             checked_updates: false,
+            updating: false,
             friends: Vec::new(),
             add_friend_username: String::new(),
             add_friend_nickname: String::new(),
@@ -619,17 +622,15 @@ impl eframe::App for AolApp {
             self.startup_repaint_left = self.startup_repaint_left.saturating_sub(1);
             ctx.request_repaint();
         } else if !self.checked_updates {
-            // Check for updates on first completed frame
             self.checked_updates = true;
-            thread::spawn(|| {
-                let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
-                let _ = runtime.block_on(async {
-                    if let Ok(Some(version)) = update::check_for_updates().await {
-                        eprintln!("Update available: {}", version);
-                    }
-                });
-            });
         }
+        
+        // Check for update availability
+        if let Ok(version) = self.network.update_rx.try_recv() {
+            self.update_available = Some(version);
+            self.show_toast("Update available! Click Update Now to download and install.".to_string(), ToastKind::Info);
+        }
+        
         self.process_net_events();
         if self.show_background {
             self.draw_background(ctx);
@@ -797,6 +798,19 @@ impl eframe::App for AolApp {
                         }
                         if ui.button("👥 User List").clicked() {
                             let _ = self.network.tx.send(UiToNet::GetUsers);
+                        }
+                        if let Some(version) = &self.update_available {
+                            if !self.updating {
+                                if ui.button(format!("⬇ Update to {}", version)).clicked() {
+                                    self.updating = true;
+                                    let version = version.clone();
+                                    thread::spawn(move || {
+                                        let _ = download_and_install_update(&version);
+                                    });
+                                }
+                            } else {
+                                ui.label("Downloading update...");
+                            }
                         }
                     });
                     ui.horizontal(|ui| {
@@ -1211,6 +1225,7 @@ fn format_relative_time(at: &str) -> String {
 fn spawn_network() -> NetworkHandle {
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiToNet>();
     let (net_tx, net_rx) = std_mpsc::channel::<NetToUi>();
+    let (update_tx, update_rx) = std_mpsc::channel::<String>();
 
     thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
@@ -1219,7 +1234,17 @@ fn spawn_network() -> NetworkHandle {
         });
     });
 
-    NetworkHandle { tx: ui_tx, rx: net_rx }
+    // Spawn update checker thread
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
+        let _ = runtime.block_on(async {
+            if let Ok(Some(version)) = update::check_for_updates().await {
+                let _ = update_tx.send(version);
+            }
+        });
+    });
+
+    NetworkHandle { tx: ui_tx, rx: net_rx, update_rx }
 }
 
 async fn network_task(
@@ -1427,6 +1452,55 @@ async fn run_connection(
     }
 
     let _ = net_tx.send(NetToUi::Disconnected);
+    Ok(())
+}
+
+fn download_and_install_update(version: &str) -> Result<(), String> {
+    // Get the current executable path
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to get current exe: {}", e))?;
+    let _exe_dir = current_exe.parent()
+        .ok_or("Failed to get exe directory")?;
+    
+    // Download the installer to a temporary location
+    let temp_dir = std::env::temp_dir();
+    let installer_path = temp_dir.join(format!("blast-from-the-past-messenger-update-{}.exe", version));
+    
+    let download_url = format!(
+        "https://github.com/ravinathannur/chatmessagediscordclone/releases/download/{}/blast-from-the-past-messenger-setup.exe",
+        version
+    );
+    
+    // Download the installer
+    eprintln!("Downloading update from: {}", download_url);
+    let response = reqwest::blocking::Client::new()
+        .get(&download_url)
+        .send()
+        .map_err(|e| format!("Failed to download: {}", e))?;
+    
+    let mut file = std::fs::File::create(&installer_path)
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    
+    std::io::copy(&mut response.bytes().map_err(|e| format!("Failed to read response: {}", e))?.as_ref(), &mut file)
+        .map_err(|e| format!("Failed to write installer: {}", e))?;
+    
+    // Launch the installer
+    eprintln!("Launching installer from: {:?}", installer_path);
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(&["/C", installer_path.to_str().unwrap_or("")])
+            .spawn()
+            .map_err(|e| format!("Failed to launch installer: {}", e))?;
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new(installer_path.to_str().unwrap_or(""))
+            .spawn()
+            .map_err(|e| format!("Failed to launch installer: {}", e))?;
+    }
+    
     Ok(())
 }
 
