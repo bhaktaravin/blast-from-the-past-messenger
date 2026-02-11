@@ -156,8 +156,8 @@ async fn handle_client_event(
     rate_limits: &Arc<Mutex<HashMap<i64, RateState>>>,
 ) {
     match event {
-        ClientToServer::Register { username, password } => {
-            match create_user(db, &username, &password).await {
+        ClientToServer::Register { username, password, first_name, last_name } => {
+            match create_user(db, &username, &password, &first_name, &last_name).await {
                 Ok(user_id) => {
                     set_peer_auth(peers, id, user_id, username.clone());
                     send_to_peer(peers, id, ServerToClient::AuthOk { username });
@@ -481,17 +481,48 @@ async fn handle_client_event(
             );
         }
         ClientToServer::FriendRequest { to } => {
-            // Send friend request to the recipient
-            send_to_username(peers, to.clone(), ServerToClient::FriendRequest {
-                from: peer.username.clone(),
-            });
+            // Get the current peer's username
+            let from_username = {
+                if let Ok(guard) = peers.lock() {
+                    guard.get(&id).map(|p| p.username.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(from) = from_username {
+                send_to_username(peers, to.clone(), ServerToClient::FriendRequest {
+                    from,
+                });
+            }
         }
         ClientToServer::RespondToFriendRequest { from, accepted } => {
-            // Send response back to the requester
-            send_to_username(peers, from.clone(), ServerToClient::FriendRequestResponse {
-                from: peer.username.clone(),
-                accepted,
-            });
+            // Get the current peer's username
+            let responder = {
+                if let Ok(guard) = peers.lock() {
+                    guard.get(&id).map(|p| p.username.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(responder_name) = responder {
+                send_to_username(peers, from.clone(), ServerToClient::FriendRequestResponse {
+                    from: responder_name,
+                    accepted,
+                });
+            }
+        }
+        ClientToServer::GetUsers => {
+            // Fetch all users from database and send to client
+            match get_all_users(db).await {
+                Ok(users) => {
+                    send_to_peer(peers, id, ServerToClient::Users { users });
+                }
+                Err(_) => {
+                    send_to_peer(peers, id, ServerToClient::System {
+                        message: "Failed to fetch users".to_string(),
+                    });
+                }
+            }
         }
     }
 }
@@ -724,11 +755,21 @@ async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
             id SERIAL PRIMARY KEY,\
             username TEXT NOT NULL UNIQUE,\
             password_hash TEXT NOT NULL,\
+            first_name TEXT,\
+            last_name TEXT,\
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\
         )",
     )
     .execute(db)
     .await?;
+
+    // Add columns if they don't exist (for existing databases)
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT")
+        .execute(db)
+        .await;
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT")
+        .execute(db)
+        .await;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS blocks (\
@@ -967,16 +1008,18 @@ async fn search_dm(
     Ok(messages)
 }
 
-async fn create_user(db: &PgPool, username: &str, password: &str) -> Result<i64, String> {
+async fn create_user(db: &PgPool, username: &str, password: &str, first_name: &str, last_name: &str) -> Result<i64, String> {
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|_| "failed to hash password")?
         .to_string();
 
-    let row = sqlx::query("INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id::bigint AS id")
+    let row = sqlx::query("INSERT INTO users (username, password_hash, first_name, last_name) VALUES ($1, $2, $3, $4) RETURNING id::bigint AS id")
         .bind(username)
         .bind(hash)
+        .bind(first_name)
+        .bind(last_name)
         .fetch_one(db)
         .await
         .map_err(|err| {
@@ -1016,6 +1059,24 @@ async fn get_user_id_by_name(db: &PgPool, username: &str) -> Result<Option<i64>,
         .fetch_optional(db)
         .await?;
     Ok(row.map(|row| row.get::<i64, _>("id")))
+}
+
+async fn get_all_users(db: &PgPool) -> Result<Vec<chatmessagediscordclone::protocol::UserInfo>, sqlx::Error> {
+    use chatmessagediscordclone::protocol::UserInfo;
+    let rows = sqlx::query("SELECT username, first_name, last_name, created_at FROM users ORDER BY created_at DESC")
+        .fetch_all(db)
+        .await?;
+    
+    let users = rows.into_iter().map(|row| {
+        UserInfo {
+            username: row.get("username"),
+            first_name: row.get("first_name"),
+            last_name: row.get("last_name"),
+            created_at: row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+        }
+    }).collect();
+    
+    Ok(users)
 }
 
 async fn block_user(db: &PgPool, user_id: i64, target_id: i64) -> Result<(), sqlx::Error> {

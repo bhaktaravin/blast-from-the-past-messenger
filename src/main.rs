@@ -11,7 +11,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use chatmessagediscordclone::protocol::{
-    ClientToServer, HistoryTarget, ServerToClient, UserStatus,
+    ClientToServer, HistoryTarget, ServerToClient, UserStatus, UserInfo,
 };
 use chatmessagediscordclone::db::LocalDb;
 use chatmessagediscordclone::update;
@@ -46,6 +46,8 @@ enum UiToNet {
         url: String,
         username: String,
         password: String,
+        first_name: String,
+        last_name: String,
         mode: AuthMode,
     },
     SendChat { body: String },
@@ -62,6 +64,7 @@ enum UiToNet {
     AddFriend { username: String, nickname: Option<String> },
     FriendRequest { to: String },
     RespondToFriendRequest { from: String, accepted: bool },
+    GetUsers,
     Disconnect,
 }
 
@@ -85,6 +88,7 @@ enum NetToUi {
     FriendAdded { username: String },
     FriendRequest { from: String },
     FriendRequestResponse { from: String, accepted: bool },
+    Users { users: Vec<UserInfo> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +141,9 @@ struct AolApp {
     add_friend_username: String,
     add_friend_nickname: String,
     pending_friend_requests: Vec<String>,
+    first_name: String,
+    last_name: String,
+    registered_users: Vec<UserInfo>,
 }
 
 struct SearchResult {
@@ -201,6 +208,9 @@ impl AolApp {
             add_friend_username: String::new(),
             add_friend_nickname: String::new(),
             pending_friend_requests: Vec::new(),
+            first_name: String::new(),
+            last_name: String::new(),
+            registered_users: Vec::new(),
         }
     }
 
@@ -376,6 +386,9 @@ impl AolApp {
                         self.show_toast(format!("{} declined your friend request.", from), ToastKind::Info);
                     }
                 }
+                NetToUi::Users { users } => {
+                    self.registered_users = users;
+                }
             }
         }
     }
@@ -385,6 +398,13 @@ impl AolApp {
             self.status = "Passwords do not match".to_string();
             self.show_toast(self.status.clone(), ToastKind::Error);
             return;
+        }
+        if self.auth_mode == AuthMode::Register {
+            if self.first_name.trim().is_empty() || self.last_name.trim().is_empty() {
+                self.status = "First name and last name are required".to_string();
+                self.show_toast(self.status.clone(), ToastKind::Error);
+                return;
+            }
         }
         self.logging_in = true;
         self.login_started_at = Some(Instant::now());
@@ -402,6 +422,8 @@ impl AolApp {
             url,
             username: self.username.trim().to_string(),
             password: self.password.clone(),
+            first_name: self.first_name.trim().to_string(),
+            last_name: self.last_name.trim().to_string(),
             mode: self.auth_mode,
         });
     }
@@ -700,6 +722,8 @@ impl eframe::App for AolApp {
                                         );
                                         ui.checkbox(&mut self.show_confirm_password, "Show");
                                     });
+                                    ui.add(egui::TextEdit::singleline(&mut self.first_name).hint_text("First name"));
+                                    ui.add(egui::TextEdit::singleline(&mut self.last_name).hint_text("Last name"));
                                 }
                                 ui.add(egui::TextEdit::singleline(&mut self.server_url).hint_text("Server URL"));
                                 ui.add_space(12.0);
@@ -770,6 +794,9 @@ impl eframe::App for AolApp {
                             self.screen = Screen::SignIn;
                             self.logged_in_user = None;
                             self.selected_target = ChatTarget::Lobby;
+                        }
+                        if ui.button("👥 User List").clicked() {
+                            let _ = self.network.tx.send(UiToNet::GetUsers);
                         }
                     });
                     ui.horizontal(|ui| {
@@ -934,12 +961,52 @@ impl eframe::App for AolApp {
                     });
 
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let heading = match &self.selected_target {
-                        ChatTarget::Lobby => "Chat Log - Lobby".to_string(),
-                        ChatTarget::Direct(name) => format!("Chat Log - {name}"),
-                    };
-                    ui.heading(heading);
-                    ui.separator();
+                    if !self.registered_users.is_empty() {
+                        // Show admin dashboard with users
+                        ui.heading("👥 Registered Users");
+                        ui.horizontal(|ui| {
+                            if ui.button("Close").clicked() {
+                                self.registered_users.clear();
+                            }
+                        });
+                        ui.separator();
+                        
+                        // Create table headers
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new("Username").strong().color(egui::Color32::WHITE));
+                                ui.separator();
+                                ui.label(egui::RichText::new("Name").strong().color(egui::Color32::WHITE));
+                                ui.separator();
+                                ui.label(egui::RichText::new("Registered").strong().color(egui::Color32::WHITE));
+                            });
+                        });
+                        ui.separator();
+                        
+                        // Display users in scrollable area
+                        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                            for user in &self.registered_users {
+                                let name = if let (Some(first), Some(last)) = (&user.first_name, &user.last_name) {
+                                    format!("{} {}", first, last)
+                                } else {
+                                    "Unknown".to_string()
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(&user.username);
+                                    ui.separator();
+                                    ui.label(name);
+                                    ui.separator();
+                                    ui.label(&user.created_at);
+                                });
+                            }
+                        });
+                    } else {
+                        let heading = match &self.selected_target {
+                            ChatTarget::Lobby => "Chat Log - Lobby".to_string(),
+                            ChatTarget::Direct(name) => format!("Chat Log - {name}"),
+                        };
+                        ui.heading(heading);
+                        ui.separator();
                     ui.horizontal(|ui| {
                         let direct_name = match &self.selected_target {
                             ChatTarget::Direct(name) => Some(name.clone()),
@@ -1064,6 +1131,7 @@ impl eframe::App for AolApp {
                             self.send_chat();
                         }
                     });
+                    }
                 });
             }
         }
@@ -1164,9 +1232,11 @@ async fn network_task(
                 url,
                 username,
                 password,
+                first_name,
+                last_name,
                 mode,
             } => {
-                let result = run_connection(url, username, password, mode, &mut ui_rx, &net_tx).await;
+                let result = run_connection(url, username, password, first_name, last_name, mode, &mut ui_rx, &net_tx).await;
                 if let Err(message) = result {
                     let _ = net_tx.send(NetToUi::Error(message));
                 }
@@ -1183,6 +1253,8 @@ async fn run_connection(
     url: String,
     username: String,
     password: String,
+    first_name: String,
+    last_name: String,
     mode: AuthMode,
     ui_rx: &mut mpsc::UnboundedReceiver<UiToNet>,
     net_tx: &std_mpsc::Sender<NetToUi>,
@@ -1195,7 +1267,7 @@ async fn run_connection(
             send_json(&mut ws_tx, ClientToServer::Login { username, password }).await?;
         }
         AuthMode::Register => {
-            send_json(&mut ws_tx, ClientToServer::Register { username, password }).await?;
+            send_json(&mut ws_tx, ClientToServer::Register { username, password, first_name, last_name }).await?;
         }
     }
     let _ = net_tx.send(NetToUi::Connected);
@@ -1271,6 +1343,15 @@ async fn run_connection(
                                 ServerToClient::FriendAdded { username } => {
                                     let _ = net_tx.send(NetToUi::FriendAdded { username });
                                 }
+                                ServerToClient::FriendRequest { from } => {
+                                    let _ = net_tx.send(NetToUi::FriendRequest { from });
+                                }
+                                ServerToClient::FriendRequestResponse { from, accepted } => {
+                                    let _ = net_tx.send(NetToUi::FriendRequestResponse { from, accepted });
+                                }
+                                ServerToClient::Users { users } => {
+                                    let _ = net_tx.send(NetToUi::Users { users });
+                                }
                             }
                         }
                     }
@@ -1331,6 +1412,9 @@ async fn run_connection(
                     }
                     UiToNet::RespondToFriendRequest { from, accepted } => {
                         send_json(&mut ws_tx, ClientToServer::RespondToFriendRequest { from, accepted }).await?;
+                    }
+                    UiToNet::GetUsers => {
+                        send_json(&mut ws_tx, ClientToServer::GetUsers).await?;
                     }
                     UiToNet::Disconnect => {
                         let _ = ws_tx.send(Message::Close(None)).await;

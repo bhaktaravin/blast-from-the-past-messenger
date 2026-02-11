@@ -21,9 +21,17 @@ pub struct UserStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub username: String,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientToServer {
-    Register { username: String, password: String },
+    Register { username: String, password: String, first_name: String, last_name: String },
     Login { username: String, password: String },
     SetAway { away: Option<String> },
     Chat { body: String },
@@ -39,6 +47,7 @@ pub enum ClientToServer {
     AddFriend { username: String, nickname: Option<String> },
     FriendRequest { to: String },
     RespondToFriendRequest { from: String, accepted: bool },
+    GetUsers,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +70,7 @@ pub enum ServerToClient {
     FriendAdded { username: String },
     FriendRequest { from: String },
     FriendRequestResponse { from: String, accepted: bool },
+    Users { users: Vec<UserInfo> },
 }
 
 
