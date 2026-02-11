@@ -36,6 +36,7 @@ pub enum ClientToServer {
     Mute { username: String },
     Unmute { username: String },
     Report { username: String, reason: String },
+    AddFriend { username: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +56,7 @@ pub enum ServerToClient {
         messages: Vec<MessageRecord>,
     },
     System { message: String },
+    AddFriendResult { username: String, success: bool, message: String },
 }
 
 

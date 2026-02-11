@@ -69,6 +69,7 @@ enum UiToNet {
     Unmute { username: String },
     Report { username: String, reason: String },
     Disconnect,
+    AddFriend { username: String },
 }
 
 enum NetToUi {
@@ -88,6 +89,7 @@ enum NetToUi {
     AuthError(String),
     System(String),
     Error(String),
+    AddFriendResult { username: String, success: bool, message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +134,9 @@ struct AolApp {
     recent_threads: Vec<String>,
     messages: std::collections::HashMap<ChatTarget, Vec<ChatMessage>>,
     toast: Option<Toast>,
+    // Add Friend modal state
+    show_add_friend_modal: bool,
+    add_friend_name: String,
 }
 
 struct SearchResult {
@@ -140,6 +145,15 @@ struct SearchResult {
 }
 
 impl AolApp {
+    fn send_add_friend(&mut self) {
+        let name = self.add_friend_name.trim();
+        if !name.is_empty() {
+            let _ = self.network.tx.send(UiToNet::AddFriend { username: name.to_string() });
+            self.add_friend_name.clear();
+        } else {
+            self.show_toast("Please enter a screen name.".to_string(), ToastKind::Error);
+        }
+    }
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut style = (*cc.egui_ctx.style()).clone();
         let mono = egui::FontId::new(16.0, egui::FontFamily::Monospace);
@@ -186,6 +200,8 @@ impl AolApp {
             recent_threads: Vec::new(),
             messages: HashMap::new(),
             toast: None,
+            show_add_friend_modal: false,
+            add_friend_name: String::new(),
         }
     }
 
@@ -280,6 +296,10 @@ impl AolApp {
                         },
                     );
                     self.search_in_progress = false;
+                }
+                NetToUi::AddFriendResult { username, success, message } => {
+                    let kind = if success { ToastKind::Success } else { ToastKind::Error };
+                    self.show_toast(message, kind);
                 }
                 NetToUi::AuthOk { username } => {
                     self.logged_in_user = Some(username);
@@ -605,20 +625,8 @@ impl eframe::App for AolApp {
                         if let Some(name) = &self.logged_in_user {
                             ui.label(format!("User: {name}"));
                         }
-                        let bg_label = if self.show_background { "BG: On" } else { "BG: Off" };
-                        if ui.button(bg_label).clicked() {
-                            self.show_background = !self.show_background;
-                        }
-                        let label = match self.theme {
-                            Theme::Light => "Dark Mode",
-                            Theme::Dark => "Midnight Amber",
-                            Theme::MidnightAmber => "Light Mode",
-                        };
-                        if ui.button("Refresh UI").clicked() {
-                            ctx.request_repaint();
-                        }
-                        if ui.button(label).clicked() {
-                            self.toggle_theme(ctx);
+                        if ui.button("Add Friend").clicked() {
+                            self.show_add_friend_modal = true;
                         }
                         if ui.button("Disconnect").clicked() {
                             let _ = self.network.tx.send(UiToNet::Disconnect);
@@ -627,6 +635,26 @@ impl eframe::App for AolApp {
                             self.selected_target = ChatTarget::Lobby;
                         }
                     });
+                    // Modal for Add Friend
+                    if self.show_add_friend_modal {
+                        egui::Window::new("Add Friend")
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                ui.label("Enter friend's screen name:");
+                                ui.add(egui::TextEdit::singleline(&mut self.add_friend_name).hint_text("Screen name"));
+                                ui.horizontal(|ui| {
+                                    if ui.button("Add").clicked() {
+                                        self.send_add_friend();
+                                        self.show_add_friend_modal = false;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.show_add_friend_modal = false;
+                                    }
+                                });
+                            });
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Away message:");
                         ui.add(egui::TextEdit::singleline(&mut self.away_text).hint_text("Be right back..."));
@@ -935,6 +963,11 @@ async fn network_task(
             UiToNet::Disconnect => {
                 let _ = net_tx.send(NetToUi::Disconnected);
             }
+            UiToNet::AddFriend { username } => {
+                // Send AddFriend in a temporary connection (or extend run_connection to handle it if needed)
+                // For now, send via a new connection if needed, or handle in run_connection if connected
+                // This is handled in run_connection's select! branch
+            }
             _ => {}
         }
     }
@@ -1029,6 +1062,9 @@ async fn run_connection(
                                 ServerToClient::System { message } => {
                                     let _ = net_tx.send(NetToUi::System(message));
                                 }
+                                ServerToClient::AddFriendResult { username, success, message } => {
+                                    let _ = net_tx.send(NetToUi::AddFriendResult { username, success, message });
+                                }
                             }
                         }
                     }
@@ -1080,6 +1116,9 @@ async fn run_connection(
                     }
                     UiToNet::Report { username, reason } => {
                         send_json(&mut ws_tx, ClientToServer::Report { username, reason }).await?;
+                    }
+                    UiToNet::AddFriend { username } => {
+                        send_json(&mut ws_tx, ClientToServer::AddFriend { username }).await?;
                     }
                     UiToNet::Disconnect => {
                         let _ = ws_tx.send(Message::Close(None)).await;

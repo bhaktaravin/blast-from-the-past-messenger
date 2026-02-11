@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "chatmessagediscordclone"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "argon2",
  "chrono",

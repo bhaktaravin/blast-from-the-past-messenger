@@ -473,7 +473,52 @@ async fn handle_client_event(
                 }
             }
         }
-    }
+        }
+        ClientToServer::AddFriend { username } => {
+            if let Some((_, user_id)) = get_peer_identity(peers, id) {
+                match get_user_id_by_name(db, &username).await {
+                    Ok(Some(target_id)) => {
+                        match add_friend(db, user_id, target_id).await {
+                            Ok(true) => {
+                                send_to_peer(peers, id, ServerToClient::AddFriendResult {
+                                    username: username.clone(),
+                                    success: true,
+                                    message: format!("Friend request sent to {username} (auto-accepted)."),
+                                });
+                            }
+                            Ok(false) => {
+                                send_to_peer(peers, id, ServerToClient::AddFriendResult {
+                                    username: username.clone(),
+                                    success: false,
+                                    message: format!("You are already friends with {username} or request already sent."),
+                                });
+                            }
+                            Err(e) => {
+                                send_to_peer(peers, id, ServerToClient::AddFriendResult {
+                                    username: username.clone(),
+                                    success: false,
+                                    message: format!("Failed to add friend: {e}"),
+                                });
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        send_to_peer(peers, id, ServerToClient::AddFriendResult {
+                            username: username.clone(),
+                            success: false,
+                            message: "User not found.".to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        send_to_peer(peers, id, ServerToClient::AddFriendResult {
+                            username: username.clone(),
+                            success: false,
+                            message: format!("Failed to add friend: {e}"),
+                        });
+                    }
+                }
+            }
+        }
 }
 
 fn set_peer_auth(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize, user_id: i64, username: String) {
@@ -685,6 +730,46 @@ async fn send_threads_to_user_id(
 }
 
 async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS friends (\
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\
+                friend_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\
+                UNIQUE(user_id, friend_user_id)\
+            )"
+        )
+        .execute(db)
+        .await?;
+    // Add a friend (auto-accept, bidirectional)
+    async fn add_friend(db: &PgPool, user_id: i64, target_id: i64) -> Result<bool, sqlx::Error> {
+        if user_id == target_id {
+            return Ok(false);
+        }
+        // Check if already friends
+        let already = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM friends WHERE user_id = $1 AND friend_user_id = $2"
+        )
+        .bind(user_id)
+        .bind(target_id)
+        .fetch_optional(db)
+        .await?
+        .is_some();
+        if already {
+            return Ok(false);
+        }
+        // Insert both directions
+        sqlx::query("INSERT INTO friends (user_id, friend_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(user_id)
+            .bind(target_id)
+            .execute(db)
+            .await?;
+        sqlx::query("INSERT INTO friends (user_id, friend_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(target_id)
+            .bind(user_id)
+            .execute(db)
+            .await?;
+        Ok(true)
+    }
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS users (\
             id SERIAL PRIMARY KEY,\
