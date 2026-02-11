@@ -1456,12 +1456,24 @@ async fn run_connection(
 }
 
 fn download_and_install_update(version: &str) -> Result<(), String> {
-    // Get the current executable path
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get current exe: {}", e))?;
-    let _exe_dir = current_exe.parent()
-        .ok_or("Failed to get exe directory")?;
+    #[cfg(target_os = "windows")]
+    {
+        download_and_install_windows(version)
+    }
     
+    #[cfg(target_os = "macos")]
+    {
+        download_and_install_macos(version)
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        Err("Auto-update not yet supported on Linux. Please download from GitHub releases.".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn download_and_install_windows(version: &str) -> Result<(), String> {
     // Download the installer to a temporary location
     let temp_dir = std::env::temp_dir();
     let installer_path = temp_dir.join(format!("blast-from-the-past-messenger-update-{}.exe", version));
@@ -1486,20 +1498,48 @@ fn download_and_install_update(version: &str) -> Result<(), String> {
     
     // Launch the installer
     eprintln!("Launching installer from: {:?}", installer_path);
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(&["/C", installer_path.to_str().unwrap_or("")])
-            .spawn()
-            .map_err(|e| format!("Failed to launch installer: {}", e))?;
-    }
+    std::process::Command::new("cmd")
+        .args(&["/C", installer_path.to_str().unwrap_or("")])
+        .spawn()
+        .map_err(|e| format!("Failed to launch installer: {}", e))?;
     
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::process::Command::new(installer_path.to_str().unwrap_or(""))
-            .spawn()
-            .map_err(|e| format!("Failed to launch installer: {}", e))?;
-    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn download_and_install_macos(version: &str) -> Result<(), String> {
+    use std::path::PathBuf;
+    
+    // Download the DMG to a temporary location
+    let temp_dir = std::env::temp_dir();
+    let dmg_path = temp_dir.join(format!("BlastFromThePast-{}.dmg", version));
+    
+    let download_url = format!(
+        "https://github.com/ravinathannur/chatmessagediscordclone/releases/download/{}/BlastFromThePast-{}.dmg",
+        version, version
+    );
+    
+    // Download the DMG
+    eprintln!("Downloading update from: {}", download_url);
+    let response = reqwest::blocking::Client::new()
+        .get(&download_url)
+        .send()
+        .map_err(|e| format!("Failed to download: {}", e))?;
+    
+    let mut file = std::fs::File::create(&dmg_path)
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    
+    std::io::copy(&mut response.bytes().map_err(|e| format!("Failed to read response: {}", e))?.as_ref(), &mut file)
+        .map_err(|e| format!("Failed to write DMG: {}", e))?;
+    
+    // Mount the DMG and open it
+    eprintln!("Opening DMG from: {:?}", dmg_path);
+    std::process::Command::new("open")
+        .arg(&dmg_path)
+        .spawn()
+        .map_err(|e| format!("Failed to open DMG: {}", e))?;
+    
+    eprintln!("DMG opened. User will be guided to drag the app to Applications folder.");
     
     Ok(())
 }
