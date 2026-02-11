@@ -580,10 +580,13 @@ impl eframe::App for AolApp {
         } else if !self.checked_updates {
             // Check for updates on first completed frame
             self.checked_updates = true;
-            tokio::spawn(async move {
-                if let Ok(Some(version)) = update::check_for_updates().await {
-                    eprintln!("Update available: {}", version);
-                }
+            thread::spawn(|| {
+                let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
+                let _ = runtime.block_on(async {
+                    if let Ok(Some(version)) = update::check_for_updates().await {
+                        eprintln!("Update available: {}", version);
+                    }
+                });
             });
         }
         self.process_net_events();
