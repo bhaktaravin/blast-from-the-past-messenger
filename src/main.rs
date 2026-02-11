@@ -150,7 +150,7 @@ impl AolApp {
         if !name.is_empty() {
             let _ = self.network.tx.send(UiToNet::AddFriend { username: name.clone() });
             self.add_friend_name.clear();
-            self.toast = Some(Toast::new(format!("Added {0}", name)));
+            self.show_toast(format!("Added {0}", name), ToastKind::Success);
         } else {
             self.show_toast("Please enter a screen name.".to_string(), ToastKind::Error);
         }
