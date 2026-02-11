@@ -60,6 +60,8 @@ enum UiToNet {
     Unmute { username: String },
     Report { username: String, reason: String },
     AddFriend { username: String, nickname: Option<String> },
+    FriendRequest { to: String },
+    RespondToFriendRequest { from: String, accepted: bool },
     Disconnect,
 }
 
@@ -81,6 +83,8 @@ enum NetToUi {
     System(String),
     Error(String),
     FriendAdded { username: String },
+    FriendRequest { from: String },
+    FriendRequestResponse { from: String, accepted: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +136,7 @@ struct AolApp {
     friends: Vec<(String, Option<String>)>,
     add_friend_username: String,
     add_friend_nickname: String,
+    pending_friend_requests: Vec<String>,
 }
 
 struct SearchResult {
@@ -195,6 +200,7 @@ impl AolApp {
             friends: Vec::new(),
             add_friend_username: String::new(),
             add_friend_nickname: String::new(),
+            pending_friend_requests: Vec::new(),
         }
     }
 
@@ -356,6 +362,19 @@ impl AolApp {
                 }
                 NetToUi::FriendAdded { username } => {
                     self.show_toast(format!("Added {} as friend!", username), ToastKind::Success);
+                }
+                NetToUi::FriendRequest { from } => {
+                    if !self.pending_friend_requests.contains(&from) {
+                        self.pending_friend_requests.push(from.clone());
+                    }
+                    self.show_toast(format!("{} sent you a friend request!", from), ToastKind::Info);
+                }
+                NetToUi::FriendRequestResponse { from, accepted } => {
+                    if accepted {
+                        self.show_toast(format!("{} accepted your friend request!", from), ToastKind::Success);
+                    } else {
+                        self.show_toast(format!("{} declined your friend request.", from), ToastKind::Info);
+                    }
                 }
             }
         }
@@ -849,6 +868,52 @@ impl eframe::App for AolApp {
                             ui.label("No friends added.");
                         }
                         ui.add_space(8.0);
+                        ui.label("Friend Requests");
+                        let current_user = self.logged_in_user.clone().unwrap_or_default();
+                        let mut to_accept = None;
+                        let mut to_decline = None;
+                        let pending_requests = self.pending_friend_requests.clone();
+                        for (idx, requester) in pending_requests.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("📨 {} wants to add you", requester));
+                                if ui.button("Accept").clicked() {
+                                    to_accept = Some(idx);
+                                }
+                                if ui.button("Decline").clicked() {
+                                    to_decline = Some(idx);
+                                }
+                            });
+                        }
+                        
+                        // Process accept/decline after loop
+                        if let Some(idx) = to_accept {
+                            let requester = &self.pending_friend_requests[idx];
+                            let _ = self.network.tx.send(UiToNet::RespondToFriendRequest {
+                                from: requester.clone(),
+                                accepted: true,
+                            });
+                            if let Some(db) = &self.db {
+                                let _ = db.respond_to_friend_request(requester, &current_user, true);
+                            }
+                            self.friends.push((requester.clone(), None));
+                            self.pending_friend_requests.remove(idx);
+                        }
+                        if let Some(idx) = to_decline {
+                            let requester = &self.pending_friend_requests[idx];
+                            let _ = self.network.tx.send(UiToNet::RespondToFriendRequest {
+                                from: requester.clone(),
+                                accepted: false,
+                            });
+                            if let Some(db) = &self.db {
+                                let _ = db.respond_to_friend_request(requester, &current_user, false);
+                            }
+                            self.pending_friend_requests.remove(idx);
+                        }
+                        
+                        if self.pending_friend_requests.is_empty() {
+                            ui.label("No pending requests.");
+                        }
+                        ui.add_space(8.0);
                         ui.label("Buddies Online");
                         let buddies = self.buddies.clone();
                         for buddy in buddies {
@@ -1260,6 +1325,12 @@ async fn run_connection(
                     }
                     UiToNet::AddFriend { username, nickname } => {
                         send_json(&mut ws_tx, ClientToServer::AddFriend { username, nickname }).await?;
+                    }
+                    UiToNet::FriendRequest { to } => {
+                        send_json(&mut ws_tx, ClientToServer::FriendRequest { to }).await?;
+                    }
+                    UiToNet::RespondToFriendRequest { from, accepted } => {
+                        send_json(&mut ws_tx, ClientToServer::RespondToFriendRequest { from, accepted }).await?;
                     }
                     UiToNet::Disconnect => {
                         let _ = ws_tx.send(Message::Close(None)).await;

@@ -480,6 +480,19 @@ async fn handle_client_event(
                 ServerToClient::FriendAdded { username },
             );
         }
+        ClientToServer::FriendRequest { to } => {
+            // Send friend request to the recipient
+            send_to_username(peers, to.clone(), ServerToClient::FriendRequest {
+                from: peer.username.clone(),
+            });
+        }
+        ClientToServer::RespondToFriendRequest { from, accepted } => {
+            // Send response back to the requester
+            send_to_username(peers, from.clone(), ServerToClient::FriendRequestResponse {
+                from: peer.username.clone(),
+                accepted,
+            });
+        }
     }
 }
 
@@ -631,6 +644,20 @@ fn send_to_peer(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize, payload: Se
     let target = {
         if let Ok(guard) = peers.lock() {
             guard.get(&id).map(|peer| peer.tx.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(tx) = target {
+        let _ = tx.send(Message::Text(text));
+    }
+}
+
+fn send_to_username(peers: &Arc<Mutex<HashMap<usize, Peer>>>, username: String, payload: ServerToClient) {
+    let text = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    let target = {
+        if let Ok(guard) = peers.lock() {
+            guard.values().find(|peer| peer.username == username).map(|peer| peer.tx.clone())
         } else {
             None
         }

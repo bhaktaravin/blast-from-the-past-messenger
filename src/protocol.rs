@@ -37,6 +37,8 @@ pub enum ClientToServer {
     Unmute { username: String },
     Report { username: String, reason: String },
     AddFriend { username: String, nickname: Option<String> },
+    FriendRequest { to: String },
+    RespondToFriendRequest { from: String, accepted: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,8 @@ pub enum ServerToClient {
     },
     System { message: String },
     FriendAdded { username: String },
+    FriendRequest { from: String },
+    FriendRequestResponse { from: String, accepted: bool },
 }
 
 

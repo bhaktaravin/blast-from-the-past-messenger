@@ -50,6 +50,14 @@ impl LocalDb {
                 username TEXT NOT NULL UNIQUE,
                 nickname TEXT,
                 added_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS friend_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_user TEXT NOT NULL,
+                to_user TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                UNIQUE(from_user, to_user)
             );",
         )?;
         Ok(())
@@ -183,6 +191,48 @@ impl LocalDb {
         self.conn.execute(
             "DELETE FROM friends WHERE username = ?",
             params![username],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_friend_request(&self, from: String, to: String) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO friend_requests (from_user, to_user, created_at)
+             VALUES (?, ?, datetime('now'))",
+            params![&from, &to],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_pending_friend_requests(&self, to_user: &str) -> SqliteResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_user FROM friend_requests WHERE to_user = ? AND status = 'pending'
+             ORDER BY created_at DESC",
+        )?;
+        let requests = stmt.query_map(params![to_user], |row| {
+            row.get(0)
+        })?;
+
+        let mut result = Vec::new();
+        for req in requests {
+            result.push(req?);
+        }
+        Ok(result)
+    }
+
+    pub fn respond_to_friend_request(&self, from: &str, to: &str, accepted: bool) -> SqliteResult<()> {
+        if accepted {
+            // Add to friends table
+            self.conn.execute(
+                "INSERT OR IGNORE INTO friends (username, added_at) VALUES (?, datetime('now'))",
+                params![from],
+            )?;
+        }
+        // Update request status
+        let status = if accepted { "accepted" } else { "declined" };
+        self.conn.execute(
+            "UPDATE friend_requests SET status = ? WHERE from_user = ? AND to_user = ?",
+            params![status, from, to],
         )?;
         Ok(())
     }
