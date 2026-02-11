@@ -146,10 +146,11 @@ struct SearchResult {
 
 impl AolApp {
     fn send_add_friend(&mut self) {
-        let name = self.add_friend_name.trim();
+        let name = self.add_friend_name.trim().to_string();
         if !name.is_empty() {
-            let _ = self.network.tx.send(UiToNet::AddFriend { username: name.to_string() });
+            let _ = self.network.tx.send(UiToNet::AddFriend { username: name.clone() });
             self.add_friend_name.clear();
+            self.toast = Some(Toast::new(format!("Added {0}", name)));
         } else {
             self.show_toast("Please enter a screen name.".to_string(), ToastKind::Error);
         }
@@ -297,7 +298,7 @@ impl AolApp {
                     );
                     self.search_in_progress = false;
                 }
-                NetToUi::AddFriendResult { username, success, message } => {
+                NetToUi::AddFriendResult { username: _, success, message } => {
                     let kind = if success { ToastKind::Success } else { ToastKind::Error };
                     self.show_toast(message, kind);
                 }
@@ -963,7 +964,7 @@ async fn network_task(
             UiToNet::Disconnect => {
                 let _ = net_tx.send(NetToUi::Disconnected);
             }
-            UiToNet::AddFriend { username } => {
+            UiToNet::AddFriend { username: _ } => {
                 // Send AddFriend in a temporary connection (or extend run_connection to handle it if needed)
                 // For now, send via a new connection if needed, or handle in run_connection if connected
                 // This is handled in run_connection's select! branch

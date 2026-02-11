@@ -473,7 +473,7 @@ async fn handle_client_event(
                 }
             }
         }
-        }
+        
         ClientToServer::AddFriend { username } => {
             if let Some((_, user_id)) = get_peer_identity(peers, id) {
                 match get_user_id_by_name(db, &username).await {
@@ -519,7 +519,7 @@ async fn handle_client_event(
                 }
             }
         }
-}
+    }
 
 fn set_peer_auth(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize, user_id: i64, username: String) {
     if let Ok(mut guard) = peers.lock() {
