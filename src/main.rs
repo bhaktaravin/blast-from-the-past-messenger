@@ -23,6 +23,16 @@ struct Toast {
     ttl: f32,
 }
 
+impl Toast {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            kind: ToastKind::Info,
+            ttl: 3.0,
+        }
+    }
+}
+
 enum ToastKind {
     Info,
     Success,
@@ -847,7 +857,7 @@ impl eframe::App for AolApp {
                         
                         // Recent DMs section
                         ui.separator();
-                        egui::CollapsingHeader("📝 Recent DMs")
+                        egui::CollapsingHeader::new("📝 Recent DMs")
                             .default_open(true)
                             .show(ui, |ui| {
                                 if self.recent_threads.is_empty() {
@@ -864,7 +874,7 @@ impl eframe::App for AolApp {
                         
                         // Open Direct Message
                         ui.separator();
-                        egui::CollapsingHeader("✉️ Open Message")
+                        egui::CollapsingHeader::new("✉️ Open Message")
                             .default_open(true)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -885,7 +895,7 @@ impl eframe::App for AolApp {
                         
                         // Add Friend section
                         ui.separator();
-                        egui::CollapsingHeader("➕ Add Friend")
+                        egui::CollapsingHeader::new("➕ Add Friend")
                             .default_open(false)
                             .show(ui, |ui| {
                                 ui.add(
@@ -923,7 +933,7 @@ impl eframe::App for AolApp {
                         
                         // Friends list
                         ui.separator();
-                        egui::CollapsingHeader(format!("👥 Friends ({})", self.friends.len()))
+                        egui::CollapsingHeader::new(format!("👥 Friends ({})", self.friends.len()))
                             .default_open(true)
                             .show(ui, |ui| {
                                 if self.friends.is_empty() {
@@ -939,7 +949,7 @@ impl eframe::App for AolApp {
                         // Friend Requests section
                         ui.separator();
                         if !self.pending_friend_requests.is_empty() {
-                            egui::CollapsingHeader(format!("🔔 Requests ({})", self.pending_friend_requests.len()))
+                            egui::CollapsingHeader::new(format!("🔔 Requests ({})", self.pending_friend_requests.len()))
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     let current_user = self.logged_in_user.clone().unwrap_or_default();
@@ -987,7 +997,7 @@ impl eframe::App for AolApp {
                         
                         // Buddies Online section
                         ui.separator();
-                        egui::CollapsingHeader(format!("🟢 Online ({})", self.buddies.len()))
+                        egui::CollapsingHeader::new(format!("🟢 Online ({})", self.buddies.len()))
                             .default_open(true)
                             .show(ui, |ui| {
                                 if self.buddies.is_empty() {
@@ -1546,7 +1556,6 @@ fn download_and_install_windows(version: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn download_and_install_macos(version: &str) -> Result<(), String> {
-    use std::path::PathBuf;
     
     // Download the DMG to a temporary location
     let temp_dir = std::env::temp_dir();
