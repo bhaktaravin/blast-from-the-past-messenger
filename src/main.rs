@@ -159,6 +159,10 @@ struct AolApp {
     last_name: String,
     registered_users: Vec<UserInfo>,
     custom_background_path: Option<String>,
+    remember_me: bool,
+    typing_index: usize,
+    typing_started: Option<Instant>,
+    connection_message: String,
 }
 
 struct SearchResult {
@@ -185,6 +189,7 @@ impl AolApp {
 
         let db = LocalDb::new().ok();
         let custom_background_path = db.as_ref().and_then(|d| d.load_background_path().ok().flatten());
+        let remembered_username = db.as_ref().and_then(|d| d.load_remembered_username().ok().flatten()).unwrap_or_default();
 
         Self {
             screen: Screen::SignIn,
@@ -197,7 +202,7 @@ impl AolApp {
             auth_mode: AuthMode::Login,
             logged_in_user: None,
             server_url: "wss://blast-from-the-past-messenger.fly.dev".to_string(),
-            username: "RetroUser".to_string(),
+            username: remembered_username.clone(),
             password: String::new(),
             confirm_password: String::new(),
             show_password: false,
@@ -229,6 +234,10 @@ impl AolApp {
             last_name: String::new(),
             registered_users: Vec::new(),
             custom_background_path,
+            remember_me: !remembered_username.is_empty(),
+            typing_index: 0,
+            typing_started: Some(Instant::now()),
+            connection_message: String::new(),
         }
     }
 
@@ -302,12 +311,35 @@ impl AolApp {
         }
     }
 
+    fn update_typing_animation(&mut self, ctx: &egui::Context) {
+        const FULL_TEXT: &str = "Sign in to your retro inbox";
+        const CHARS_PER_FRAME: usize = 1;
+        const FRAME_TIME_MS: u128 = 50; // 50ms per character for typewriter effect
+
+        if let Some(start) = self.typing_started {
+            let elapsed = start.elapsed().as_millis();
+            let target_index = std::cmp::min(
+                (elapsed / FRAME_TIME_MS as u128 * CHARS_PER_FRAME as u128 + 1) as usize,
+                FULL_TEXT.len()
+            );
+            
+            if target_index > self.typing_index {
+                self.typing_index = target_index;
+                ctx.request_repaint();
+            } else if target_index < FULL_TEXT.len() {
+                // Still animating, keep requesting repaint
+                ctx.request_repaint();
+            }
+        }
+    }
+
     fn process_net_events(&mut self) {
         while let Ok(event) = self.network.rx.try_recv() {
             match event {
                 NetToUi::Connected => {
                     self.connected = true;
                     self.status = "Online".to_string();
+                    self.connection_message = format!("Connected. Logging in as {}...", self.username.trim());
                     self.sync_queued_messages();
                 }
                 NetToUi::Disconnected => {
@@ -372,6 +404,7 @@ impl AolApp {
                         AuthMode::Register => "Account created. Logged in.".to_string(),
                         AuthMode::Login => "Logged in.".to_string(),
                     };
+                    self.connection_message.clear();
                     self.show_toast(self.status.clone(), ToastKind::Success);
                     self.screen = Screen::Chat;
                     self.auth_mode = AuthMode::Login;
@@ -457,9 +490,19 @@ impl AolApp {
                 return;
             }
         }
+        
+        // Save username if Remember Me is checked
+        if self.remember_me && self.auth_mode == AuthMode::Login {
+            if let Some(db) = &self.db {
+                let _ = db.save_remembered_username(self.username.trim());
+            }
+        }
+        
         self.logging_in = true;
         self.login_started_at = Some(Instant::now());
         self.status = format!("Logging in as {}...", self.username.trim());
+        self.connection_message = format!("Connecting to: {}...", self.server_url.trim());
+        
         let mut url = self.server_url.trim().to_string();
         if let Some(stripped) = url.strip_prefix("https://") {
             url = format!("wss://{stripped}");
@@ -680,6 +723,12 @@ impl eframe::App for AolApp {
         }
         
         self.process_net_events();
+        
+        // Update typing animation on login screen
+        if matches!(self.screen, Screen::SignIn) {
+            self.update_typing_animation(ctx);
+        }
+        
         if self.show_background {
             self.draw_background(ctx);
         }
@@ -736,7 +785,18 @@ impl eframe::App for AolApp {
                             .inner_margin(egui::Margin::same(18.0))
                             .show(ui, |ui| {
                                 ui.set_max_width(360.0);
-                                ui.colored_label(text_color, "Sign in to your retro inbox");
+                                
+                                // Animated typing effect
+                                let full_text = "Sign in to your retro inbox";
+                                let typed_text = &full_text[..std::cmp::min(self.typing_index, full_text.len())];
+                                let cursor = if self.typing_index < full_text.len() { "▌" } else { "" };
+                                ui.colored_label(text_color, format!("{}{}", typed_text, cursor));
+                                
+                                // Connection status message
+                                if self.logging_in && self.connection_message.len() > 0 {
+                                    ui.colored_label(egui::Color32::YELLOW, &self.connection_message);
+                                }
+                                
                                 ui.add_space(14.0);
                                 ui.horizontal(|ui| {
                                     if ui
@@ -774,6 +834,12 @@ impl eframe::App for AolApp {
                                     ui.add(egui::TextEdit::singleline(&mut self.first_name).hint_text("First name"));
                                     ui.add(egui::TextEdit::singleline(&mut self.last_name).hint_text("Last name"));
                                 }
+                                
+                                // Remember Me checkbox (only show on Login)
+                                if self.auth_mode == AuthMode::Login {
+                                    ui.checkbox(&mut self.remember_me, "Remember me");
+                                }
+                                
                                 ui.add(egui::TextEdit::singleline(&mut self.server_url).hint_text("Server URL"));
                                 ui.add_space(12.0);
                                 let button_label = match self.auth_mode {

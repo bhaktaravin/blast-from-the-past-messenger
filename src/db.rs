@@ -264,4 +264,29 @@ impl LocalDb {
         )?;
         Ok(())
     }
+
+    pub fn save_remembered_username(&self, username: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO preferences (id, custom_background_path) VALUES (1, (SELECT custom_background_path FROM preferences WHERE id = 1 LIMIT 1))",
+            [],
+        )?;
+        // Store username in a separate table
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('remembered_username', ?)",
+            params![username],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_remembered_username(&self) -> SqliteResult<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT value FROM app_settings WHERE key = 'remembered_username'"
+        )?;
+        let result = stmt.query_row([], |row| row.get(0)).ok();
+        Ok(result)
+    }
 }
