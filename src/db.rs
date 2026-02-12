@@ -58,6 +58,10 @@ impl LocalDb {
                 status TEXT DEFAULT 'pending',
                 created_at TEXT NOT NULL,
                 UNIQUE(from_user, to_user)
+            );
+            CREATE TABLE IF NOT EXISTS preferences (
+                id INTEGER PRIMARY KEY,
+                custom_background_path TEXT
             );",
         )?;
         Ok(())
@@ -233,6 +237,30 @@ impl LocalDb {
         self.conn.execute(
             "UPDATE friend_requests SET status = ? WHERE from_user = ? AND to_user = ?",
             params![status, from, to],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_background_path(&self, path: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO preferences (id, custom_background_path) VALUES (1, ?)",
+            params![path],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_background_path(&self) -> SqliteResult<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT custom_background_path FROM preferences WHERE id = 1"
+        )?;
+        let result = stmt.query_row([], |row| row.get(0)).ok();
+        Ok(result)
+    }
+
+    pub fn clear_background(&self) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE preferences SET custom_background_path = NULL WHERE id = 1",
+            [],
         )?;
         Ok(())
     }

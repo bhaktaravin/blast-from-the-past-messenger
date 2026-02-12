@@ -158,6 +158,7 @@ struct AolApp {
     first_name: String,
     last_name: String,
     registered_users: Vec<UserInfo>,
+    custom_background_path: Option<String>,
 }
 
 struct SearchResult {
@@ -183,6 +184,7 @@ impl AolApp {
         apply_theme(&cc.egui_ctx, Theme::MidnightAmber);
 
         let db = LocalDb::new().ok();
+        let custom_background_path = db.as_ref().and_then(|d| d.load_background_path().ok().flatten());
 
         Self {
             screen: Screen::SignIn,
@@ -226,6 +228,7 @@ impl AolApp {
             first_name: String::new(),
             last_name: String::new(),
             registered_users: Vec::new(),
+            custom_background_path,
         }
     }
 
@@ -235,6 +238,39 @@ impl AolApp {
             egui::Order::Background,
             egui::Id::new("retro_bg"),
         ));
+
+        // Try to load and display custom background image
+        if let Some(bg_path) = &self.custom_background_path {
+            if let Ok(img) = image::open(bg_path) {
+                let rgba_image = img.to_rgba8();
+                let (width, height) = rgba_image.dimensions();
+                
+                // Create ColorImage from the loaded image
+                let color_image = egui::ColorImage {
+                    size: [width as usize, height as usize],
+                    pixels: rgba_image.pixels().map(|p| {
+                        egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])
+                    }).collect(),
+                };
+
+                // Draw the image as a texture
+                let texture_handle = ctx.load_texture(
+                    "custom_bg",
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                );
+
+                painter.image(
+                    texture_handle.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                return;
+            }
+        }
+
+        // Fallback to gradient background if no custom image or loading failed
         let steps = 12;
         for i in 0..steps {
             let t = i as f32 / (steps - 1) as f32;
@@ -790,6 +826,27 @@ impl eframe::App for AolApp {
                         let bg_label = if self.show_background { "BG: On" } else { "BG: Off" };
                         if ui.button(bg_label).clicked() {
                             self.show_background = !self.show_background;
+                        }
+                        if ui.button("🖼️ Choose BG").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif"])
+                                .pick_file()
+                            {
+                                let path_str = path.to_string_lossy().to_string();
+                                if let Some(db) = &self.db {
+                                    let _ = db.save_background_path(&path_str);
+                                }
+                                self.custom_background_path = Some(path_str);
+                                self.show_background = true;
+                                self.show_toast("Background image selected!".to_string(), ToastKind::Info);
+                            }
+                        }
+                        if self.custom_background_path.is_some() && ui.button("❌ Clear BG").clicked() {
+                            if let Some(db) = &self.db {
+                                let _ = db.clear_background();
+                            }
+                            self.custom_background_path = None;
+                            self.show_toast("Background cleared!".to_string(), ToastKind::Info);
                         }
                         let label = match self.theme {
                             Theme::Light => "Dark Mode",
