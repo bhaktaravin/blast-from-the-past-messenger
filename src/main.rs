@@ -104,6 +104,15 @@ enum NetToUi {
     Users { users: Vec<UserInfo> },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateCheckStatus {
+    Idle,
+    Checking,
+    Available(String),
+    UpToDate,
+    Failed(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Theme {
     Light,
@@ -115,6 +124,7 @@ struct NetworkHandle {
     tx: mpsc::UnboundedSender<UiToNet>,
     rx: std_mpsc::Receiver<NetToUi>,
     update_rx: std_mpsc::Receiver<String>,
+    update_status_rx: std_mpsc::Receiver<UpdateCheckStatus>,
 }
 
 struct AolApp {
@@ -151,6 +161,7 @@ struct AolApp {
     offline_queue_size: usize,
     update_available: Option<String>,
     checked_updates: bool,
+    update_check_status: UpdateCheckStatus,
     updating: bool,
     friends: Vec<(String, Option<String>)>,
     add_friend_username: String,
@@ -230,6 +241,7 @@ impl AolApp {
             offline_queue_size: 0,
             update_available: None,
             checked_updates: false,
+            update_check_status: UpdateCheckStatus::Idle,
             updating: false,
             friends: Vec::new(),
             add_friend_username: String::new(),
@@ -770,6 +782,17 @@ impl eframe::App for AolApp {
             self.show_toast("Update available! Click Update Now to download and install.".to_string(), ToastKind::Info);
         }
         
+        // Check for update status updates
+        if let Ok(status) = self.network.update_status_rx.try_recv() {
+            self.update_check_status = status;
+            match &self.update_check_status {
+                UpdateCheckStatus::Failed(error) => {
+                    self.show_toast(format!("Update check failed: {}", error), ToastKind::Error);
+                }
+                _ => {}
+            }
+        }
+        
         self.process_net_events();
         
         // Update typing animation on login screen
@@ -927,6 +950,34 @@ impl eframe::App for AolApp {
                                 egui::Color32::YELLOW,
                                 format!("⚠ {} queued", self.offline_queue_size),
                             );
+                        }
+                        // Display update check status
+                        match &self.update_check_status {
+                            UpdateCheckStatus::Idle => {},
+                            UpdateCheckStatus::Checking => {
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Spinner::new());
+                                    ui.label("Checking for updates...");
+                                });
+                            }
+                            UpdateCheckStatus::Available(version) => {
+                                ui.colored_label(
+                                    egui::Color32::LIGHT_GREEN,
+                                    format!("✨ Update available: v{}", version),
+                                );
+                            }
+                            UpdateCheckStatus::UpToDate => {
+                                ui.colored_label(
+                                    egui::Color32::LIGHT_GRAY,
+                                    "✓ Up to date",
+                                );
+                            }
+                            UpdateCheckStatus::Failed(error) => {
+                                ui.colored_label(
+                                    egui::Color32::LIGHT_RED,
+                                    format!("⚠ Update check failed: {}", error),
+                                );
+                            }
                         }
                         if let Some(version) = &self.update_available {
                             ui.colored_label(
@@ -1447,6 +1498,7 @@ fn spawn_network() -> NetworkHandle {
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiToNet>();
     let (net_tx, net_rx) = std_mpsc::channel::<NetToUi>();
     let (update_tx, update_rx) = std_mpsc::channel::<String>();
+    let (status_tx, status_rx) = std_mpsc::channel::<UpdateCheckStatus>();
 
     thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
@@ -1455,21 +1507,24 @@ fn spawn_network() -> NetworkHandle {
         });
     });
 
-    // Spawn update checker thread with retry logic
+    // Spawn update checker thread with retry logic and status updates
     thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
         runtime.block_on(async {
             // Try up to 3 times with 2 second delay between attempts
             for attempt in 1..=3 {
+                let _ = status_tx.send(UpdateCheckStatus::Checking);
                 eprintln!("Checking for updates (attempt {}/3)...", attempt);
                 match update::check_for_updates().await {
                     Ok(Some(version)) => {
                         eprintln!("Update available: {}", version);
+                        let _ = status_tx.send(UpdateCheckStatus::Available(version.clone()));
                         let _ = update_tx.send(version);
                         return;
                     }
                     Ok(None) => {
                         eprintln!("No update available");
+                        let _ = status_tx.send(UpdateCheckStatus::UpToDate);
                         return;
                     }
                     Err(e) => {
@@ -1481,10 +1536,11 @@ fn spawn_network() -> NetworkHandle {
                 }
             }
             eprintln!("Update check failed after 3 attempts");
+            let _ = status_tx.send(UpdateCheckStatus::Failed("Failed after 3 attempts".to_string()));
         });
     });
 
-    NetworkHandle { tx: ui_tx, rx: net_rx, update_rx }
+    NetworkHandle { tx: ui_tx, rx: net_rx, update_rx, update_status_rx: status_rx }
 }
 
 async fn network_task(
