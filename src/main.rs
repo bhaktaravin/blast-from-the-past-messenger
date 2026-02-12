@@ -909,7 +909,7 @@ impl eframe::App for AolApp {
                                         .desired_width(200.0),
                                 );
                                 if ui.button("Add Friend").clicked() {
-                                    let username = self.add_friend_username.trim();
+                                    let username = self.add_friend_username.trim().to_string();
                                     if !username.is_empty() {
                                         let nickname = if self.add_friend_nickname.trim().is_empty() {
                                             None
@@ -917,13 +917,13 @@ impl eframe::App for AolApp {
                                             Some(self.add_friend_nickname.trim().to_string())
                                         };
                                         let _ = self.network.tx.send(UiToNet::AddFriend {
-                                            username: username.to_string(),
+                                            username: username.clone(),
                                             nickname: nickname.clone(),
                                         });
                                         if let Some(db) = &self.db {
-                                            let _ = db.add_friend(username.to_string(), nickname.clone());
+                                            let _ = db.add_friend(username.clone(), nickname.clone());
                                         }
-                                        self.friends.push((username.to_string(), nickname));
+                                        self.friends.push((username.clone(), nickname));
                                         self.add_friend_username.clear();
                                         self.add_friend_nickname.clear();
                                         self.toast = Some(Toast::new(format!("Added {0}", username)));
@@ -1007,7 +1007,7 @@ impl eframe::App for AolApp {
                                         let status = buddy
                                             .away
                                             .as_ref()
-                                            .map(|msg| format!("(Away)"))
+                                            .map(|_msg| format!("(Away)"))
                                             .unwrap_or_else(|| "".to_string());
                                         let label = if status.is_empty() {
                                             format!("  {0}", buddy.username)
