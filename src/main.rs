@@ -74,6 +74,7 @@ enum UiToNet {
     Unmute { username: String },
     Report { username: String, reason: String },
     AddFriend { username: String, nickname: Option<String> },
+    #[allow(dead_code)]
     FriendRequest { to: String },
     RespondToFriendRequest { from: String, accepted: bool },
     GetUsers,
@@ -163,6 +164,10 @@ struct AolApp {
     typing_index: usize,
     typing_started: Option<Instant>,
     connection_message: String,
+    cached_background_image: Option<Vec<u8>>,
+    cached_bg_width: u32,
+    cached_bg_height: u32,
+    cached_bg_path: Option<String>,
 }
 
 struct SearchResult {
@@ -238,10 +243,14 @@ impl AolApp {
             typing_index: 0,
             typing_started: Some(Instant::now()),
             connection_message: String::new(),
+            cached_background_image: None,
+            cached_bg_width: 0,
+            cached_bg_height: 0,
+            cached_bg_path: None,
         }
     }
 
-    fn draw_background(&self, ctx: &egui::Context) {
+    fn draw_background(&mut self, ctx: &egui::Context) {
         let rect = ctx.screen_rect();
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Background,
@@ -249,22 +258,57 @@ impl AolApp {
         ));
 
         // Try to load and display custom background image
-        if let Some(bg_path) = &self.custom_background_path {
-            if let Ok(img) = image::open(bg_path) {
-                let rgba_image = img.to_rgba8();
-                let (width, height) = rgba_image.dimensions();
+        if let Some(bg_path) = &self.custom_background_path.clone() {
+            // Check if path changed - if so, clear cache
+            if self.cached_bg_path.as_ref() != Some(bg_path) {
+                self.cached_background_image = None;
+                self.cached_bg_path = Some(bg_path.clone());
+                eprintln!("Background path changed, cache cleared");
+            }
+
+            // Load image once and cache it
+            if self.cached_background_image.is_none() {
+                eprintln!("Loading background image from: {}", bg_path);
+                if let Ok(img) = image::open(bg_path) {
+                    let rgba_image = img.to_rgba8();
+                    let (width, height) = rgba_image.dimensions();
+                    
+                    // Cache the raw pixels
+                    let pixels: Vec<u8> = rgba_image.to_vec();
+                    self.cached_background_image = Some(pixels);
+                    self.cached_bg_width = width;
+                    self.cached_bg_height = height;
+                    eprintln!("Successfully loaded background image: {}x{}", width, height);
+                } else {
+                    eprintln!("Failed to load background image from: {}", bg_path);
+                }
+            }
+
+            // Render from cache
+            if let Some(ref pixels) = self.cached_background_image {
+                let width = self.cached_bg_width as usize;
+                let height = self.cached_bg_height as usize;
                 
-                // Create ColorImage from the loaded image
+                eprintln!("Rendering cached background: {}x{}", width, height);
+                
+                // Create ColorImage from cached pixels
+                let mut color_pixels = Vec::with_capacity(width * height);
+                for chunk in pixels.chunks_exact(4) {
+                    if chunk.len() == 4 {
+                        color_pixels.push(egui::Color32::from_rgba_unmultiplied(
+                            chunk[0], chunk[1], chunk[2], chunk[3],
+                        ));
+                    }
+                }
+
+                // Create and display texture
                 let color_image = egui::ColorImage {
-                    size: [width as usize, height as usize],
-                    pixels: rgba_image.pixels().map(|p| {
-                        egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])
-                    }).collect(),
+                    size: [width, height],
+                    pixels: color_pixels,
                 };
 
-                // Draw the image as a texture
                 let texture_handle = ctx.load_texture(
-                    "custom_bg",
+                    "custom_bg_cached",
                     color_image,
                     egui::TextureOptions::LINEAR,
                 );
@@ -277,6 +321,10 @@ impl AolApp {
                 );
                 return;
             }
+        } else {
+            // Clear cache if no background path
+            self.cached_background_image = None;
+            self.cached_bg_path = None;
         }
 
         // Fallback to gradient background if no custom image or loading failed
