@@ -1152,3 +1152,4 @@ async fn is_blocked_or_muted(db: &PgPool, recipient_id: i64, sender_id: i64) -> 
     .flatten()
     .is_some()
 }
+
