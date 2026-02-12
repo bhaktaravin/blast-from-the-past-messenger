@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
 use std::time::Instant;
