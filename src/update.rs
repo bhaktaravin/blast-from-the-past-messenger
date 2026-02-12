@@ -1,30 +1,52 @@
 use self_update::cargo_crate_version;
+use std::time::Duration;
 
 pub async fn check_for_updates() -> Result<Option<String>, String> {
-    // Run the blocking check in a spawn_blocking context
-    let result = tokio::task::spawn_blocking(|| {
-        self_update::backends::github::ReleaseList::configure()
-            .repo_owner("ravinathannur")
-            .repo_name("chatmessagediscordclone")
-            .build()
-            .map_err(|e| format!("Failed to build release list: {}", e))?
-            .fetch()
-            .map_err(|e| format!("Failed to fetch releases: {}", e))
-    })
-    .await
-    .map_err(|e| format!("Task error: {}", e))?;
-
-    match result {
-        Ok(releases) => {
-            if let Some(latest) = releases.first() {
-                let current_version = cargo_crate_version!();
-                if should_update(current_version, &latest.version) {
-                    return Ok(Some(latest.version.clone()));
+    // Run the blocking check in a spawn_blocking context with timeout
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(|| {
+            match self_update::backends::github::ReleaseList::configure()
+                .repo_owner("ravinathannur")
+                .repo_name("chatmessagediscordclone")
+                .build()
+            {
+                Ok(release_list) => {
+                    match release_list.fetch() {
+                        Ok(releases) => {
+                            if let Some(latest) = releases.first() {
+                                let current_version = cargo_crate_version!();
+                                eprintln!("Update check: current={}, latest={}", current_version, latest.version);
+                                if should_update(current_version, &latest.version) {
+                                    return Ok(Some(latest.version.clone()));
+                                }
+                            }
+                            Ok(None)
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to fetch releases: {}", e);
+                            Err(format!("Failed to fetch releases: {}", e))
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to build release list: {}", e);
+                    Err(format!("Failed to build release list: {}", e))
                 }
             }
-            Ok(None)
+        })
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            eprintln!("Update check task error: {}", e);
+            Err(format!("Update check task error: {}", e))
         }
-        Err(e) => Err(e),
+        Err(_) => {
+            eprintln!("Update check timeout");
+            Err("Update check timed out".to_string())
+        }
     }
 }
 

@@ -1341,13 +1341,32 @@ fn spawn_network() -> NetworkHandle {
         });
     });
 
-    // Spawn update checker thread
+    // Spawn update checker thread with retry logic
     thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
-        let _ = runtime.block_on(async {
-            if let Ok(Some(version)) = update::check_for_updates().await {
-                let _ = update_tx.send(version);
+        runtime.block_on(async {
+            // Try up to 3 times with 2 second delay between attempts
+            for attempt in 1..=3 {
+                eprintln!("Checking for updates (attempt {}/3)...", attempt);
+                match update::check_for_updates().await {
+                    Ok(Some(version)) => {
+                        eprintln!("Update available: {}", version);
+                        let _ = update_tx.send(version);
+                        return;
+                    }
+                    Ok(None) => {
+                        eprintln!("No update available");
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("Update check failed: {} (attempt {}/3)", e, attempt);
+                        if attempt < 3 {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                }
             }
+            eprintln!("Update check failed after 3 attempts");
         });
     });
 
