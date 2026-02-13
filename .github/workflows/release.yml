@@ -205,8 +205,9 @@ jobs:
           # Submit for notarization and wait
           echo "Submitting DMG for notarization..."
           xcrun notarytool submit "$DMG_PATH" \
-            --apple-id "${{ secrets.APPLE_DEVELOPER_ID }}" \
-            --password "${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" \
+            --apple-id "${{ secrets.APPLE_ID }}" \
+            --password "${{ secrets.APPLE_PASSWORD }}" \
+            --team-id "${{ secrets.APPLE_TEAM_ID }}" \
             --wait
           
           # Staple the notarization ticket to the DMG
