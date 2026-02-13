@@ -153,11 +153,30 @@ jobs:
 
       - name: Import Developer Certificate
         run: |
+          # Decode base64 certificate
           echo "${{ secrets.DEVELOPER_CERTIFICATE_P12_BASE64 }}" | base64 --decode > /tmp/certificate.p12
+          
+          # Verify file was created and has content
+          if [ ! -f /tmp/certificate.p12 ] || [ ! -s /tmp/certificate.p12 ]; then
+            echo "Error: Certificate file not created or is empty"
+            exit 1
+          fi
+          
+          # Create and unlock keychain
           security create-keychain -p "" build.keychain
           security unlock-keychain -p "" build.keychain
-          security import /tmp/certificate.p12 -k build.keychain -P "${{ secrets.DEVELOPER_CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
+          
+          # Import certificate (try without password first since it may not be protected)
+          if [ -z "${{ secrets.DEVELOPER_CERTIFICATE_PASSWORD }}" ] || [ "${{ secrets.DEVELOPER_CERTIFICATE_PASSWORD }}" == '""' ]; then
+            security import /tmp/certificate.p12 -k build.keychain -T /usr/bin/codesign || security import /tmp/certificate.p12 -k build.keychain -P "" -T /usr/bin/codesign
+          else
+            security import /tmp/certificate.p12 -k build.keychain -P "${{ secrets.DEVELOPER_CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
+          fi
+          
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
+          
+          # Cleanup
+          rm /tmp/certificate.p12
           rm /tmp/certificate.p12
 
       - name: Code sign app
