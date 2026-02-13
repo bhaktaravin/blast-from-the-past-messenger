@@ -89,7 +89,7 @@ enum NetToUi {
     AuthError(String),
     System(String),
     Error(String),
-    AddFriendResult { username: String, success: bool, message: String },
+    AddFriendResult { _username: String, success: bool, message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,7 +298,7 @@ impl AolApp {
                     );
                     self.search_in_progress = false;
                 }
-                NetToUi::AddFriendResult { username: _, success, message } => {
+                NetToUi::AddFriendResult { _username: _, success, message } => {
                     let kind = if success { ToastKind::Success } else { ToastKind::Error };
                     self.show_toast(message, kind);
                 }
@@ -1063,8 +1063,8 @@ async fn run_connection(
                                 ServerToClient::System { message } => {
                                     let _ = net_tx.send(NetToUi::System(message));
                                 }
-                                ServerToClient::AddFriendResult { username, success, message } => {
-                                    let _ = net_tx.send(NetToUi::AddFriendResult { username, success, message });
+                                ServerToClient::AddFriendResult { _username, success, message } => {
+                                    let _ = net_tx.send(NetToUi::AddFriendResult { _username, success, message });
                                 }
                             }
                         }

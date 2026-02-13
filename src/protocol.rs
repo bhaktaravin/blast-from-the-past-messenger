@@ -56,7 +56,7 @@ pub enum ServerToClient {
         messages: Vec<MessageRecord>,
     },
     System { message: String },
-    AddFriendResult { username: String, success: bool, message: String },
+    AddFriendResult { _username: String, success: bool, message: String },
 }
 
 

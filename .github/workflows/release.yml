@@ -187,6 +187,7 @@ jobs:
         run: |
           TAG=${{ github.ref }}
           VERSION=${TAG#refs/tags/}
+          VERSION=${VERSION#v}
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Download DMG artifact

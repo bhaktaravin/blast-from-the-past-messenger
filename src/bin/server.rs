@@ -481,21 +481,21 @@ async fn handle_client_event(
                         match add_friend(db, user_id, target_id).await {
                             Ok(true) => {
                                 send_to_peer(peers, id, ServerToClient::AddFriendResult {
-                                    username: username.clone(),
+                                    _username: username.clone(),
                                     success: true,
                                     message: format!("Friend request sent to {username} (auto-accepted)."),
                                 });
                             }
                             Ok(false) => {
                                 send_to_peer(peers, id, ServerToClient::AddFriendResult {
-                                    username: username.clone(),
+                                    _username: username.clone(),
                                     success: false,
                                     message: format!("You are already friends with {username} or request already sent."),
                                 });
                             }
                             Err(e) => {
                                 send_to_peer(peers, id, ServerToClient::AddFriendResult {
-                                    username: username.clone(),
+                                    _username: username.clone(),
                                     success: false,
                                     message: format!("Failed to add friend: {e}"),
                                 });
@@ -504,14 +504,14 @@ async fn handle_client_event(
                     }
                     Ok(None) => {
                         send_to_peer(peers, id, ServerToClient::AddFriendResult {
-                            username: username.clone(),
+                            _username: username.clone(),
                             success: false,
                             message: "User not found.".to_string(),
                         });
                     }
                     Err(e) => {
                         send_to_peer(peers, id, ServerToClient::AddFriendResult {
-                            username: username.clone(),
+                            _username: username.clone(),
                             success: false,
                             message: format!("Failed to add friend: {e}"),
                         });
@@ -520,6 +520,7 @@ async fn handle_client_event(
             }
         }
     }
+}
 
 fn set_peer_auth(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize, user_id: i64, username: String) {
     if let Ok(mut guard) = peers.lock() {
@@ -740,36 +741,6 @@ async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
         )
         .execute(db)
         .await?;
-    // Add a friend (auto-accept, bidirectional)
-    async fn add_friend(db: &PgPool, user_id: i64, target_id: i64) -> Result<bool, sqlx::Error> {
-        if user_id == target_id {
-            return Ok(false);
-        }
-        // Check if already friends
-        let already = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM friends WHERE user_id = $1 AND friend_user_id = $2"
-        )
-        .bind(user_id)
-        .bind(target_id)
-        .fetch_optional(db)
-        .await?
-        .is_some();
-        if already {
-            return Ok(false);
-        }
-        // Insert both directions
-        sqlx::query("INSERT INTO friends (user_id, friend_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-            .bind(user_id)
-            .bind(target_id)
-            .execute(db)
-            .await?;
-        sqlx::query("INSERT INTO friends (user_id, friend_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-            .bind(target_id)
-            .bind(user_id)
-            .execute(db)
-            .await?;
-        Ok(true)
-    }
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS users (\
             id SERIAL PRIMARY KEY,\
@@ -1113,6 +1084,37 @@ async fn report_user(db: &PgPool, user_id: i64, target_id: i64, reason: &str) ->
         .execute(db)
         .await?;
     Ok(())
+}
+
+// Add a friend (auto-accept, bidirectional)
+async fn add_friend(db: &PgPool, user_id: i64, target_id: i64) -> Result<bool, sqlx::Error> {
+    if user_id == target_id {
+        return Ok(false);
+    }
+    // Check if already friends
+    let already = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM friends WHERE user_id = $1 AND friend_user_id = $2"
+    )
+    .bind(user_id)
+    .bind(target_id)
+    .fetch_optional(db)
+    .await?
+    .is_some();
+    if already {
+        return Ok(false);
+    }
+    // Insert both directions
+    sqlx::query("INSERT INTO friends (user_id, friend_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(user_id)
+        .bind(target_id)
+        .execute(db)
+        .await?;
+    sqlx::query("INSERT INTO friends (user_id, friend_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(target_id)
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(true)
 }
 
 async fn is_blocked_or_muted(db: &PgPool, recipient_id: i64, sender_id: i64) -> bool {
