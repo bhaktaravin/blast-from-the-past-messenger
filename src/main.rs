@@ -409,8 +409,22 @@ impl AolApp {
                     self.logged_in_user = None;
                     self.logging_in = false;
                     self.login_started_at = None;
+                    self.friends.clear();
+                    self.messages.clear();
+                    self.buddies.clear();
+                    self.recent_threads.clear();
                 }
-                NetToUi::Presence(users) => {
+                NetToUi::Presence(mut users) => {
+                    // Add current user to the online list
+                    if let Some(current_user) = &self.logged_in_user {
+                        // Check if current user is not already in the list
+                        if !users.iter().any(|u| u.username == *current_user) {
+                            users.insert(0, UserStatus {
+                                username: current_user.clone(),
+                                away: None,
+                            });
+                        }
+                    }
                     self.buddies = users;
                 }
                 NetToUi::Chat { from, body } => {
@@ -472,6 +486,12 @@ impl AolApp {
                     self.password.clear();
                     self.logging_in = false;
                     self.login_started_at = None;
+                    // Clear old user data
+                    self.friends.clear();
+                    self.messages.clear();
+                    self.buddies.clear();
+                    self.recent_threads.clear();
+                    self.pending_friend_requests.clear();
                     let _ = self
                         .network
                         .tx
@@ -486,11 +506,11 @@ impl AolApp {
                             ToastKind::Info,
                         );
                     }
-                    // Load friends from database
+                    // Don't auto-load friends from local DB - each user starts with empty list
+                    // Friends are user-specific and should only be added manually
                     if let Some(db) = &self.db {
-                        if let Ok(friends) = db.get_friends() {
-                            self.friends = friends;
-                        }
+                        // Keep this for cleanliness but don't load friends
+                        let _ = db.get_friends();
                     }
                 }
                 NetToUi::AuthError(message) => {
@@ -935,6 +955,14 @@ impl eframe::App for AolApp {
                                     });
                                 }
                                 ui.colored_label(text_color, format!("Status: {}", self.status));
+                                
+                                // Only show update status if an update is available
+                                if let UpdateCheckStatus::Available(version) = &self.update_check_status {
+                                    ui.colored_label(
+                                        egui::Color32::LIGHT_GREEN,
+                                        format!("✨ Update available: v{}", version),
+                                    );
+                                }
                             });
                     });
                 });
@@ -951,33 +979,12 @@ impl eframe::App for AolApp {
                                 format!("⚠ {} queued", self.offline_queue_size),
                             );
                         }
-                        // Display update check status
-                        match &self.update_check_status {
-                            UpdateCheckStatus::Idle => {},
-                            UpdateCheckStatus::Checking => {
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::Spinner::new());
-                                    ui.label("Checking for updates...");
-                                });
-                            }
-                            UpdateCheckStatus::Available(version) => {
-                                ui.colored_label(
-                                    egui::Color32::LIGHT_GREEN,
-                                    format!("✨ Update available: v{}", version),
-                                );
-                            }
-                            UpdateCheckStatus::UpToDate => {
-                                ui.colored_label(
-                                    egui::Color32::LIGHT_GRAY,
-                                    "✓ Up to date",
-                                );
-                            }
-                            UpdateCheckStatus::Failed(error) => {
-                                ui.colored_label(
-                                    egui::Color32::LIGHT_RED,
-                                    format!("⚠ Update check failed: {}", error),
-                                );
-                            }
+                        // Display update check status - only show if update is available
+                        if let UpdateCheckStatus::Available(version) = &self.update_check_status {
+                            ui.colored_label(
+                                egui::Color32::LIGHT_GREEN,
+                                format!("✨ Update available: v{}", version),
+                            );
                         }
                         if let Some(version) = &self.update_available {
                             ui.colored_label(
@@ -1078,82 +1085,6 @@ impl eframe::App for AolApp {
                         if ui.selectable_label(self.selected_target == ChatTarget::Lobby, "📍 Lobby").clicked() {
                             self.select_target(ChatTarget::Lobby);
                         }
-                        
-                        // Recent DMs section
-                        ui.separator();
-                        egui::CollapsingHeader::new("📝 Recent DMs")
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                if self.recent_threads.is_empty() {
-                                    ui.label("  (none)");
-                                } else {
-                                    for name in self.recent_threads.clone() {
-                                        let target = ChatTarget::Direct(name.clone());
-                                        if ui.selectable_label(self.selected_target == target, format!("  {0}", name)).clicked() {
-                                            self.select_target(ChatTarget::Direct(name));
-                                        }
-                                    }
-                                }
-                            });
-                        
-                        // Open Direct Message
-                        ui.separator();
-                        egui::CollapsingHeader::new("✉️ Open Message")
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.dm_target)
-                                            .hint_text("Screen name")
-                                            .desired_width(150.0),
-                                    );
-                                    if ui.small_button("Go").clicked() {
-                                        let target = self.dm_target.trim();
-                                        if !target.is_empty() {
-                                            self.select_target(ChatTarget::Direct(target.to_string()));
-                                            self.dm_target.clear();
-                                        }
-                                    }
-                                });
-                            });
-                        
-                        // Add Friend section
-                        ui.separator();
-                        egui::CollapsingHeader::new("➕ Add Friend")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.add_friend_username)
-                                        .hint_text("Username")
-                                        .desired_width(200.0),
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.add_friend_nickname)
-                                        .hint_text("Nickname (optional)")
-                                        .desired_width(200.0),
-                                );
-                                if ui.button("Add Friend").clicked() {
-                                    let username = self.add_friend_username.trim().to_string();
-                                    if !username.is_empty() {
-                                        let nickname = if self.add_friend_nickname.trim().is_empty() {
-                                            None
-                                        } else {
-                                            Some(self.add_friend_nickname.trim().to_string())
-                                        };
-                                        let _ = self.network.tx.send(UiToNet::AddFriend {
-                                            username: username.clone(),
-                                            nickname: nickname.clone(),
-                                        });
-                                        if let Some(db) = &self.db {
-                                            let _ = db.add_friend(username.clone(), nickname.clone());
-                                        }
-                                        self.friends.push((username.clone(), nickname));
-                                        self.add_friend_username.clear();
-                                        self.add_friend_nickname.clear();
-                                        self.toast = Some(Toast::new(format!("Added {0}", username)));
-                                    }
-                                }
-                            });
                         
                         // Friends list
                         ui.separator();
