@@ -162,21 +162,24 @@ jobs:
             exit 1
           fi
           
-          # Create and unlock keychain
-          security create-keychain -p "" build.keychain
-          security unlock-keychain -p "" build.keychain
+          # Create and unlock keychain with long timeout
+          KEYCHAIN_PATH=$HOME/Library/Keychains/build.keychain-db
+          security create-keychain -p "" "$KEYCHAIN_PATH" || true
+          security unlock-keychain -p "" "$KEYCHAIN_PATH" || true
           
-          # Import certificate (try without password first since it may not be protected)
-          if [ -z "${{ secrets.DEVELOPER_CERTIFICATE_PASSWORD }}" ] || [ "${{ secrets.DEVELOPER_CERTIFICATE_PASSWORD }}" == '""' ]; then
-            security import /tmp/certificate.p12 -k build.keychain -T /usr/bin/codesign || security import /tmp/certificate.p12 -k build.keychain -P "" -T /usr/bin/codesign
-          else
-            security import /tmp/certificate.p12 -k build.keychain -P "${{ secrets.DEVELOPER_CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
-          fi
+          # Set keychain settings to prevent timeout
+          security set-keychain-settings -t 3600 -u "$KEYCHAIN_PATH" || true
           
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
+          # Import certificate with explicit password
+          echo "" | security import /tmp/certificate.p12 -k "$KEYCHAIN_PATH" -P "" -T /usr/bin/codesign -T /usr/bin/security
+          
+          # Set partition list
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN_PATH"
+          
+          # Set as default keychain
+          security default-keychain -s "$KEYCHAIN_PATH"
           
           # Cleanup
-          rm /tmp/certificate.p12
           rm /tmp/certificate.p12
 
       - name: Code sign app
