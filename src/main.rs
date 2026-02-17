@@ -260,7 +260,7 @@ impl AolApp {
             show_background: false,
             auth_mode: AuthMode::Login,
             logged_in_user: None,
-            server_url: "wss://blast-from-the-past-messenger.fly.dev".to_string(),
+            server_url: "wss://blast-from-the-past-messenger-production.up.railway.app".to_string(),
             username: "RetroUser".to_string(),
             password: String::new(),
             confirm_password: String::new(),
