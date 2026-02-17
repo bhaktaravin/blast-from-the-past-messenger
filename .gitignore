@@ -1,5 +1,6 @@
 .env
 /target/
+/dist/
 **/*.rs.bk
 **/*.pdb
 **/*.dSYM/

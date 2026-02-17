@@ -1,0 +1,71 @@
+use rodio::{Decoder, OutputStream, Sink};
+use rust_embed::RustEmbed;
+use std::io::Cursor;
+
+#[derive(RustEmbed)]
+#[folder = "assets/sounds"]
+pub struct SoundAssets;
+
+#[derive(Debug, Clone, Copy)]
+pub enum SoundEffect {
+    BuddySignOn,
+    BuddySignOff,
+    MessageReceived,
+    MessageSent,
+}
+
+pub struct AudioManager {
+    enabled: bool,
+    volume: f32,
+}
+
+impl AudioManager {
+    pub fn new() -> Self {
+        Self {
+            enabled: true,
+            volume: 0.8,
+        }
+    }
+
+    pub fn play(&self, effect: SoundEffect) {
+        if !self.enabled {
+            return;
+        }
+
+        let volume = self.volume;
+        tokio::task::spawn_blocking(move || {
+            let filename = match effect {
+                SoundEffect::BuddySignOn => "buddy-in.wav",
+                SoundEffect::BuddySignOff => "buddy-out.wav",
+                SoundEffect::MessageReceived => "message.wav",
+                SoundEffect::MessageSent => "send.wav",
+            };
+
+            if let Some(sound_data) = SoundAssets::get(filename) {
+                // Clone the data to move it into the closure
+                let data = sound_data.data.to_vec();
+
+                // Try to get default output stream
+                if let Ok((_stream, stream_handle)) = OutputStream::try_default() {
+                    let cursor = Cursor::new(data);
+                    if let Ok(source) = Decoder::new(cursor) {
+                        // Create sink and play sound
+                        if let Ok(sink) = Sink::try_new(&stream_handle) {
+                            sink.set_volume(volume);
+                            sink.append(source);
+                            sink.sleep_until_end();
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+    }
+}

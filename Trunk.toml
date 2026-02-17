@@ -1,0 +1,16 @@
+[[hooks]]
+stage = "pre_build"
+command = "echo"
+command_arguments = ["Building Blast From The Past Messenger for Web..."]
+
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+ignore = ["dist", "target", "src/bin"]
+
+[serve]
+address = "127.0.0.1"
+port = 8080
+open = true

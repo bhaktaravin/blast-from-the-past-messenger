@@ -1,18 +1,93 @@
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
 use std::time::Instant;
-use std::thread;
 
 use chrono::Utc;
 use eframe::egui;
+
+// Native-only imports
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread;
+#[cfg(not(target_arch = "wasm32"))]
 use futures_util::{Sink, SinkExt, StreamExt};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::mpsc;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::connect_async;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::tungstenite::Message;
 
+// Web-only imports
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
+// Web stub for mpsc (since tokio mpsc is not available on wasm)
+#[cfg(target_arch = "wasm32")]
+mod mpsc {
+    use std::sync::mpsc as std_mpsc;
+
+    pub struct UnboundedSender<T> {
+        _phantom: std::marker::PhantomData<T>,
+    }
+
+    impl<T> UnboundedSender<T> {
+        pub fn send(&self, _msg: T) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    pub fn unbounded_channel<T>() -> (UnboundedSender<T>, std_mpsc::Receiver<T>) {
+        let (_, rx) = std_mpsc::channel();
+        (UnboundedSender { _phantom: std::marker::PhantomData }, rx)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+use chatmessagediscordclone::audio::{AudioManager, SoundEffect};
 use chatmessagediscordclone::protocol::{
     ClientToServer, HistoryTarget, ServerToClient, UserStatus,
 };
+
+// Stub audio for web
+#[cfg(target_arch = "wasm32")]
+mod audio_stub {
+    #[derive(Debug, Clone, Copy)]
+    pub enum SoundEffect {
+        BuddySignOn,
+        BuddySignOff,
+        MessageReceived,
+        MessageSent,
+    }
+
+    pub struct AudioManager {
+        enabled: bool,
+        volume: f32,
+    }
+
+    impl AudioManager {
+        pub fn new() -> Self {
+            Self {
+                enabled: false,
+                volume: 0.8,
+            }
+        }
+
+        pub fn play(&self, _effect: SoundEffect) {
+            // No-op on web
+        }
+
+        pub fn set_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
+
+        pub fn set_volume(&mut self, volume: f32) {
+            self.volume = volume.clamp(0.0, 1.0);
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+use audio_stub::{AudioManager, SoundEffect};
 
 #[derive(Debug, Clone)]
 struct ChatMessage {
@@ -137,6 +212,10 @@ struct AolApp {
     // Add Friend modal state
     show_add_friend_modal: bool,
     add_friend_name: String,
+    // Audio settings
+    audio_manager: AudioManager,
+    sound_enabled: bool,
+    sound_volume: f32,
 }
 
 struct SearchResult {
@@ -203,6 +282,9 @@ impl AolApp {
             toast: None,
             show_add_friend_modal: false,
             add_friend_name: String::new(),
+            audio_manager: AudioManager::new(),
+            sound_enabled: true,
+            sound_volume: 0.8,
         }
     }
 
@@ -259,7 +341,42 @@ impl AolApp {
                     self.login_started_at = None;
                 }
                 NetToUi::Presence(users) => {
+                    // Detect buddy sign-ons and sign-offs
+                    use std::collections::HashSet;
+                    let old_buddies: HashSet<_> =
+                        self.buddies.iter().map(|u| u.username.clone()).collect();
+                    let new_buddies: HashSet<_> =
+                        users.iter().map(|u| u.username.clone()).collect();
+
+                    // Collect usernames that signed on/off (owned Strings)
+                    let signed_on: Vec<String> = new_buddies
+                        .difference(&old_buddies)
+                        .cloned()
+                        .collect();
+                    let signed_off: Vec<String> = old_buddies
+                        .difference(&new_buddies)
+                        .cloned()
+                        .collect();
+
+                    // Update buddies list
                     self.buddies = users;
+
+                    // Now we can safely use self mutably
+                    for username in signed_on {
+                        self.show_toast(
+                            format!("{} signed on", username),
+                            ToastKind::Info
+                        );
+                        self.audio_manager.play(SoundEffect::BuddySignOn);
+                    }
+
+                    for username in signed_off {
+                        self.show_toast(
+                            format!("{} signed off", username),
+                            ToastKind::Info
+                        );
+                        self.audio_manager.play(SoundEffect::BuddySignOff);
+                    }
                 }
                 NetToUi::Chat { from, body } => {
                     let entry = self.messages.entry(ChatTarget::Lobby).or_default();
@@ -268,6 +385,7 @@ impl AolApp {
                         body,
                         at: Utc::now().to_rfc3339(),
                     });
+                    self.audio_manager.play(SoundEffect::MessageReceived);
                 }
                 NetToUi::DirectMessage { from, body } => {
                     let target = ChatTarget::Direct(from.clone());
@@ -277,6 +395,7 @@ impl AolApp {
                         body,
                         at: Utc::now().to_rfc3339(),
                     });
+                    self.audio_manager.play(SoundEffect::MessageReceived);
                 }
                 NetToUi::Threads(users) => {
                     self.recent_threads = users;
@@ -405,6 +524,7 @@ impl AolApp {
                 });
             }
         }
+        self.audio_manager.play(SoundEffect::MessageSent);
         self.chat_input.clear();
     }
 
@@ -626,6 +746,11 @@ impl eframe::App for AolApp {
                         if let Some(name) = &self.logged_in_user {
                             ui.label(format!("User: {name}"));
                         }
+
+                        ui.separator();
+                        let online_count = self.buddies.iter().filter(|b| b.away.is_none()).count();
+                        let away_count = self.buddies.len() - online_count;
+                        ui.label(format!("👥 {} online, {} away", online_count, away_count));
                         if ui.button("Add Friend").clicked() {
                             self.show_add_friend_modal = true;
                         }
@@ -635,6 +760,35 @@ impl eframe::App for AolApp {
                             self.logged_in_user = None;
                             self.selected_target = ChatTarget::Lobby;
                         }
+
+                        ui.separator();
+
+                        // Audio settings menu
+                        ui.menu_button("🔊 Audio", |ui| {
+                            ui.checkbox(&mut self.sound_enabled, "Enable sound effects");
+
+                            ui.horizontal(|ui| {
+                                ui.label("Volume:");
+                                ui.add(egui::Slider::new(&mut self.sound_volume, 0.0..=1.0)
+                                    .show_value(false));
+                            });
+
+                            // Apply settings to audio manager
+                            self.audio_manager.set_enabled(self.sound_enabled);
+                            self.audio_manager.set_volume(self.sound_volume);
+
+                            ui.separator();
+                            ui.label("Test Sounds:");
+                            if ui.button("🔔 Sign On").clicked() {
+                                self.audio_manager.play(SoundEffect::BuddySignOn);
+                            }
+                            if ui.button("🚪 Sign Off").clicked() {
+                                self.audio_manager.play(SoundEffect::BuddySignOff);
+                            }
+                            if ui.button("💬 Message").clicked() {
+                                self.audio_manager.play(SoundEffect::MessageReceived);
+                            }
+                        });
                     });
                     // Modal for Add Friend
                     if self.show_add_friend_modal {
@@ -705,20 +859,101 @@ impl eframe::App for AolApp {
                             }
                         });
                         ui.add_space(8.0);
+
+                        // Separate buddies by status
                         let buddies = self.buddies.clone();
-                        for buddy in buddies {
-                            let status = buddy
-                                .away
-                                .as_ref()
-                                .map(|msg| format!("Away: {msg}"))
-                                .unwrap_or_else(|| "Available".to_string());
-                            let label = format!("{} - {}", buddy.username, status);
-                            let target = ChatTarget::Direct(buddy.username.clone());
-                            if ui.selectable_label(self.selected_target == target, label).clicked() {
-                                self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                        let (online, away): (Vec<_>, Vec<_>) = buddies
+                            .iter()
+                            .partition(|b| b.away.is_none());
+
+                        // Online buddies section
+                        if !online.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0, 200, 0),
+                                format!("🟢 Online ({})", online.len())
+                            );
+                            ui.separator();
+
+                            for buddy in &online {
+                                ui.horizontal(|ui| {
+                                    // Small profile circle
+                                    let color = username_to_color(&buddy.username);
+                                    let initials = get_initials(&buddy.username);
+
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(24.0, 24.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(rect.center(), 12.0, color);
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        &initials,
+                                        egui::FontId::proportional(10.0),
+                                        egui::Color32::WHITE,
+                                    );
+
+                                    let target = ChatTarget::Direct(buddy.username.clone());
+                                    if ui.selectable_label(
+                                        self.selected_target == target,
+                                        &buddy.username
+                                    ).clicked() {
+                                        self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                    }
+                                });
                             }
                         }
-                        if self.buddies.is_empty() {
+
+                        ui.add_space(8.0);
+
+                        // Away buddies section
+                        if !away.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 200, 0),
+                                format!("🟡 Away ({})", away.len())
+                            );
+                            ui.separator();
+
+                            for buddy in &away {
+                                ui.horizontal(|ui| {
+                                    // Small profile circle
+                                    let color = username_to_color(&buddy.username);
+                                    let initials = get_initials(&buddy.username);
+
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(24.0, 24.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(rect.center(), 12.0, color);
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        &initials,
+                                        egui::FontId::proportional(10.0),
+                                        egui::Color32::WHITE,
+                                    );
+
+                                    let target = ChatTarget::Direct(buddy.username.clone());
+                                    if ui.selectable_label(
+                                        self.selected_target == target,
+                                        &buddy.username
+                                    ).clicked() {
+                                        self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                    }
+
+                                    if let Some(ref away_msg) = buddy.away {
+                                        ui.label(
+                                            egui::RichText::new(format!("({})", away_msg))
+                                                .italics()
+                                                .small()
+                                                .color(egui::Color32::GRAY)
+                                        );
+                                    }
+                                });
+                            }
+                        }
+
+                        if online.is_empty() && away.is_empty() {
                             ui.label("No buddies online.");
                         }
                     });
@@ -815,12 +1050,53 @@ impl eframe::App for AolApp {
                         };
 
                         for message in messages {
-                            let relative = format_relative_time(&message.at);
-                            if relative.is_empty() {
-                                ui.label(format!("{}: {}", message.from, message.body));
-                            } else {
-                                ui.label(format!("[{relative}] {}: {}", message.from, message.body));
-                            }
+                            ui.horizontal(|ui| {
+                                // Profile circle with initials
+                                let color = username_to_color(&message.from);
+                                let initials = get_initials(&message.from);
+
+                                // Draw circle
+                                let (rect, _response) = ui.allocate_exact_size(
+                                    egui::vec2(32.0, 32.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(
+                                    rect.center(),
+                                    16.0,
+                                    color,
+                                );
+                                // Draw initials
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    &initials,
+                                    egui::FontId::proportional(14.0),
+                                    egui::Color32::WHITE,
+                                );
+
+                                // Message content
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&message.from)
+                                                .strong()
+                                                .color(color)
+                                        );
+                                        let relative = format_relative_time(&message.at);
+                                        if !relative.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(format!("• {}", relative))
+                                                    .small()
+                                                    .color(egui::Color32::GRAY)
+                                            );
+                                        }
+                                    });
+                                    // Convert emoticons and display message
+                                    let body_with_emoji = convert_emoticons(&message.body);
+                                    ui.label(&body_with_emoji);
+                                });
+                            });
+                            ui.add_space(4.0);
                         }
                         if self
                             .search_results
@@ -844,14 +1120,31 @@ impl eframe::App for AolApp {
                     ui.horizontal(|ui| {
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.chat_input)
-                                .hint_text("Type your message...")
+                                .hint_text("Type your message... (Ctrl+Enter to send)")
                                 .desired_width(f32::INFINITY),
                         );
-                        if ui.button("Send").clicked()
+
+                        // Multiple ways to send:
+                        // 1. Click Send button
+                        // 2. Press Enter when not focused (lost focus)
+                        // 3. Press Ctrl/Cmd+Enter while typing
+                        let should_send = ui.button("Send").clicked()
                             || (response.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        {
+                            || (response.has_focus()
+                                && ui.input(|i| {
+                                    i.key_pressed(egui::Key::Enter)
+                                        && (i.modifiers.command || i.modifiers.ctrl)
+                                }));
+
+                        if should_send {
                             self.send_chat();
+                            response.request_focus();
+                        }
+
+                        // Escape to clear input
+                        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.chat_input.clear();
                         }
                     });
                 });
@@ -930,6 +1223,75 @@ fn format_relative_time(at: &str) -> String {
     format!("{}w", days / 7)
 }
 
+// Convert classic AIM emoticons to emoji
+fn convert_emoticons(text: &str) -> String {
+    text.replace(":)", "😊")
+        .replace(":(", "😢")
+        .replace(":D", "😄")
+        .replace(";)", "😉")
+        .replace(":P", "😛")
+        .replace(":p", "😛")
+        .replace("<3", "❤️")
+        .replace(":|", "😐")
+        .replace(":o", "😮")
+        .replace(":O", "😮")
+        .replace("8)", "😎")
+        .replace(":*", "😘")
+        .replace(":'(", "😢")
+        .replace("XD", "😆")
+        .replace("^_^", "😊")
+        .replace("-_-", "😑")
+}
+
+// Generate a color from username (consistent colors per user)
+fn username_to_color(username: &str) -> egui::Color32 {
+    let mut hash: u32 = 0;
+    for byte in username.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(byte as u32);
+    }
+
+    // Generate pleasant, distinct colors (not too dark, not too light)
+    let hue = (hash % 360) as f32;
+    let saturation = 0.6 + ((hash >> 8) % 20) as f32 / 100.0; // 0.6-0.8
+    let value = 0.7 + ((hash >> 16) % 20) as f32 / 100.0; // 0.7-0.9
+
+    // HSV to RGB conversion
+    let c = value * saturation;
+    let x = c * (1.0 - ((hue / 60.0) % 2.0 - 1.0).abs());
+    let m = value - c;
+
+    let (r, g, b) = if hue < 60.0 {
+        (c, x, 0.0)
+    } else if hue < 120.0 {
+        (x, c, 0.0)
+    } else if hue < 180.0 {
+        (0.0, c, x)
+    } else if hue < 240.0 {
+        (0.0, x, c)
+    } else if hue < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+
+    egui::Color32::from_rgb(
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
+}
+
+// Get user initials (first 2 chars, uppercase)
+fn get_initials(username: &str) -> String {
+    username
+        .chars()
+        .take(2)
+        .collect::<String>()
+        .to_uppercase()
+}
+
+// Native network implementation
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_network() -> NetworkHandle {
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiToNet>();
     let (net_tx, net_rx) = std_mpsc::channel::<NetToUi>();
@@ -944,6 +1306,7 @@ fn spawn_network() -> NetworkHandle {
     NetworkHandle { tx: ui_tx, rx: net_rx }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn network_task(
     mut ui_rx: mpsc::UnboundedReceiver<UiToNet>,
     net_tx: std_mpsc::Sender<NetToUi>,
@@ -974,6 +1337,7 @@ async fn network_task(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn run_connection(
     url: String,
     username: String,
@@ -1135,6 +1499,7 @@ async fn run_connection(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn send_json<S>(ws_tx: &mut S, payload: ClientToServer) -> Result<(), String>
 where
     S: Sink<Message> + Unpin,
@@ -1147,6 +1512,19 @@ where
         .map_err(|err| err.to_string())
 }
 
+// Web network stub
+#[cfg(target_arch = "wasm32")]
+fn spawn_network() -> NetworkHandle {
+    let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiToNet>();
+    let (_net_tx, net_rx) = std_mpsc::channel::<NetToUi>();
+
+    // TODO: Implement web_sys WebSocket support
+    // For now, just return a dummy handle
+    NetworkHandle { tx: ui_tx, rx: net_rx }
+}
+
+// Native entry point
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1158,4 +1536,27 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Box::new(AolApp::new(cc))),
     )
+}
+
+// Web entry point
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    // Initialize panic hook for better error messages in the browser console
+    console_error_panic_hook::set_once();
+
+    // Redirect tracing to console.log
+    tracing_wasm::set_as_global_default();
+
+    let web_options = eframe::WebOptions::default();
+
+    wasm_bindgen_futures::spawn_local(async {
+        eframe::WebRunner::new()
+            .start(
+                "the_canvas_id",
+                web_options,
+                Box::new(|cc| Box::new(AolApp::new(cc))),
+            )
+            .await
+            .expect("failed to start eframe");
+    });
 }
