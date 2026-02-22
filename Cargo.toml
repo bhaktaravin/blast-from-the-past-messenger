@@ -21,6 +21,8 @@ dirs = "5.0"
 reqwest = { version = "0.11", features = ["blocking", "stream"] }
 image = "0.24"
 rfd = "0.15"
+thiserror = "1.0"
+url = "2.5.8"
 
 [package.metadata.bundle]
 name = "BlastFromThePast"

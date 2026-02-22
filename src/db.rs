@@ -1,5 +1,5 @@
-use rusqlite::{Connection, Result as SqliteResult, params};
 use crate::{ChatMessage, ChatTarget};
+use rusqlite::{params, Connection, Result as SqliteResult};
 use std::path::PathBuf;
 
 pub struct LocalDb {
@@ -9,11 +9,19 @@ pub struct LocalDb {
 impl LocalDb {
     pub fn new() -> SqliteResult<Self> {
         let db_path = Self::get_db_path();
-        std::fs::create_dir_all(db_path.parent().unwrap()).ok();
+
+        // Ensure parent directories exist
+        if let Some(parent) = db_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("Warning: Failed to create database directory: {}", e);
+            }
+        }
+
         let conn = Connection::open(&db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;",
         )?;
         let db = Self { conn };
         db.init_schema()?;
@@ -68,7 +76,7 @@ impl LocalDb {
     }
 
     pub fn save_message(
-        &self,
+        &mut self,
         target: &ChatTarget,
         from: String,
         body: String,
@@ -78,11 +86,13 @@ impl LocalDb {
             ChatTarget::Lobby => "lobby".to_string(),
             ChatTarget::Direct(name) => format!("direct:{}", name),
         };
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "INSERT INTO messages (target, from_user, body, timestamp, synced)
              VALUES (?, ?, ?, ?, 1)",
             params![&target_str, &from, &body, &timestamp],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -92,7 +102,7 @@ impl LocalDb {
             ChatTarget::Direct(name) => format!("direct:{}", name),
         };
         let mut stmt = self.conn.prepare(
-            "SELECT from_user, body, timestamp FROM messages 
+            "SELECT from_user, body, timestamp FROM messages
              WHERE target = ?
              ORDER BY id ASC",
         )?;
@@ -111,23 +121,34 @@ impl LocalDb {
         Ok(result)
     }
 
-    pub fn queue_message(&self, target: &ChatTarget, body: String) -> SqliteResult<()> {
+    pub fn queue_message(&mut self, target: &ChatTarget, body: String) -> SqliteResult<()> {
         let (target_str, to_user) = match target {
             ChatTarget::Lobby => ("lobby".to_string(), None),
             ChatTarget::Direct(name) => (format!("direct:{}", name), Some(name.clone())),
         };
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        let result = tx.execute(
             "INSERT INTO queued_messages (target, to_user, body, created_at, sent)
              VALUES (?, ?, ?, datetime('now'), 0)",
             params![&target_str, &to_user, &body],
-        )?;
-        Ok(())
+        );
+
+        match result {
+            Ok(_rows_affected) => {
+                tx.commit()?;
+                Ok(())
+            }
+            Err(e) => {
+                tx.rollback()?;
+                Err(e)
+            }
+        }
     }
 
     pub fn get_queued_messages(&self) -> SqliteResult<Vec<(i32, ChatTarget, String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, target, to_user, body FROM queued_messages WHERE sent = 0",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, target, to_user, body FROM queued_messages WHERE sent = 0")?;
         let messages = stmt.query_map([], |row| {
             let id: i32 = row.get(0)?;
             let target_str: String = row.get(1)?;
@@ -158,12 +179,17 @@ impl LocalDb {
         Ok(())
     }
 
-    pub fn clear_old_messages(&self, days: i64) -> SqliteResult<()> {
-        self.conn.execute(
-            "DELETE FROM messages 
+    pub fn clear_old_messages(&mut self, days: i64) -> SqliteResult<()> {
+        // Use a transaction for safety
+        let tx = self.conn.transaction()?;
+        let deleted_count = tx.execute(
+            "DELETE FROM messages
              WHERE timestamp < datetime('now', ? || ' days')",
             params![format!("-{}", days)],
         )?;
+        tx.commit()?;
+
+        println!("Cleared {} old messages", deleted_count);
         Ok(())
     }
 
@@ -177,12 +203,10 @@ impl LocalDb {
     }
 
     pub fn get_friends(&self) -> SqliteResult<Vec<(String, Option<String>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT username, nickname FROM friends ORDER BY added_at DESC",
-        )?;
-        let friends = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT username, nickname FROM friends ORDER BY added_at DESC")?;
+        let friends = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         let mut result = Vec::new();
         for friend in friends {
@@ -192,10 +216,8 @@ impl LocalDb {
     }
 
     pub fn remove_friend(&self, username: &str) -> SqliteResult<()> {
-        self.conn.execute(
-            "DELETE FROM friends WHERE username = ?",
-            params![username],
-        )?;
+        self.conn
+            .execute("DELETE FROM friends WHERE username = ?", params![username])?;
         Ok(())
     }
 
@@ -213,9 +235,7 @@ impl LocalDb {
             "SELECT from_user FROM friend_requests WHERE to_user = ? AND status = 'pending'
              ORDER BY created_at DESC",
         )?;
-        let requests = stmt.query_map(params![to_user], |row| {
-            row.get(0)
-        })?;
+        let requests = stmt.query_map(params![to_user], |row| row.get(0))?;
 
         let mut result = Vec::new();
         for req in requests {
@@ -224,7 +244,12 @@ impl LocalDb {
         Ok(result)
     }
 
-    pub fn respond_to_friend_request(&self, from: &str, to: &str, accepted: bool) -> SqliteResult<()> {
+    pub fn respond_to_friend_request(
+        &self,
+        from: &str,
+        to: &str,
+        accepted: bool,
+    ) -> SqliteResult<()> {
         if accepted {
             // Add to friends table
             self.conn.execute(
@@ -250,9 +275,9 @@ impl LocalDb {
     }
 
     pub fn load_background_path(&self) -> SqliteResult<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT custom_background_path FROM preferences WHERE id = 1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT custom_background_path FROM preferences WHERE id = 1")?;
         let result = stmt.query_row([], |row| row.get(0)).ok();
         Ok(result)
     }
@@ -265,27 +290,30 @@ impl LocalDb {
         Ok(())
     }
 
-    pub fn save_remembered_username(&self, username: &str) -> SqliteResult<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO preferences (id, custom_background_path) VALUES (1, (SELECT custom_background_path FROM preferences WHERE id = 1 LIMIT 1))",
-            [],
-        )?;
-        // Store username in a separate table
-        self.conn.execute(
+    pub fn save_remembered_username(&mut self, username: &str) -> SqliteResult<()> {
+        // Use a transaction for consistency
+        let tx = self.conn.transaction()?;
+
+        // Ensure app_settings table exists
+        tx.execute(
             "CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)",
             [],
         )?;
-        self.conn.execute(
+
+        // Store username in the app_settings table
+        tx.execute(
             "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('remembered_username', ?)",
             params![username],
         )?;
+
+        tx.commit()?;
         Ok(())
     }
 
     pub fn load_remembered_username(&self) -> SqliteResult<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT value FROM app_settings WHERE key = 'remembered_username'"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM app_settings WHERE key = 'remembered_username'")?;
         let result = stmt.query_row([], |row| row.get(0)).ok();
         Ok(result)
     }

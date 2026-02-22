@@ -1,5 +1,6 @@
-pub mod protocol;
 pub mod db;
+pub mod network;
+pub mod protocol;
 pub mod update;
 
 #[derive(Debug, Clone)]
