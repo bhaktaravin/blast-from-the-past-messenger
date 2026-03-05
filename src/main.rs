@@ -19,13 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 // Web-only imports
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
-#[cfg(target_arch = "wasm32")]
-use gloo_net::websocket::{WebSocket, WebSocketError};
-#[cfg(target_arch = "wasm32")]
-use futures_util::StreamExt;
-#[cfg(target_arch = "wasm32")]
-use std::sync::{Arc, Mutex};
+use web_sys::WebSocket;
 
 // Web stub for mpsc (use a simple Arc<Mutex<Vec>> based queue)
 #[cfg(target_arch = "wasm32")]
@@ -1554,184 +1548,13 @@ where
 // Web network stub
 #[cfg(target_arch = "wasm32")]
 fn spawn_network() -> NetworkHandle {
-    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiToNet>();
-    let (net_tx, net_rx) = std_mpsc::channel::<NetToUi>();
+    let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiToNet>();
+    let (_net_tx, net_rx) = std_mpsc::channel::<NetToUi>();
 
-    wasm_bindgen_futures::spawn_local(async move {
-        network_task_web(&mut ui_rx, &net_tx).await;
-    });
-
+    // Web networking is stubbed for now - UI will work, networking will be implemented next
+    // The network handle allows UI commands to be queued but they won't be processed
+    
     NetworkHandle { tx: ui_tx, rx: net_rx }
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn network_task_web(
-    ui_rx: &mut mpsc::UnboundedReceiver<UiToNet>,
-    net_tx: &std_mpsc::Sender<NetToUi>,
-) {
-    while let Some(command) = ui_rx.recv().await {
-        match command {
-            UiToNet::Connect {
-                url,
-                username,
-                password,
-                mode,
-            } => {
-                let result = run_connection_web(url, username, password, mode, ui_rx, net_tx).await;
-                if let Err(message) = result {
-                    let _ = net_tx.send(NetToUi::Error(message));
-                }
-            }
-            UiToNet::Disconnect => {
-                let _ = net_tx.send(NetToUi::Disconnected);
-            }
-            _ => {}
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn run_connection_web(
-    url: String,
-    username: String,
-    password: String,
-    mode: AuthMode,
-    ui_rx: &mut mpsc::UnboundedReceiver<UiToNet>,
-    net_tx: &std_mpsc::Sender<NetToUi>,
-) -> Result<(), String> {
-    let ws = WebSocket::open(&url)
-        .map_err(|err| format!("WebSocket connection failed: {:?}", err))?;
-
-    // Send initial auth message
-    match mode {
-        AuthMode::Login => {
-            let auth = ClientToServer::Login { username, password };
-            let text = serde_json::to_string(&auth).map_err(|e| e.to_string())?;
-            ws.send_string(&text)
-                .await
-                .map_err(|err| format!("Failed to send auth: {:?}", err))?;
-        }
-        AuthMode::Register => {
-            let auth = ClientToServer::Register { username, password };
-            let text = serde_json::to_string(&auth).map_err(|e| e.to_string())?;
-            ws.send_string(&text)
-                .await
-                .map_err(|err| format!("Failed to send auth: {:?}", err))?;
-        }
-    }
-
-    let _ = net_tx.send(NetToUi::Connected);
-
-    // Main event loop: poll for UI commands
-    loop {
-        // Check for UI commands
-        if let Ok(command) = ui_rx.try_recv() {
-            match command {
-                UiToNet::SendChat { body } => {
-                    let msg = ClientToServer::Chat { body };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::SendDirect { to, body } => {
-                    let msg = ClientToServer::DirectMessage { to, body };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::FetchHistory { target } => {
-                    let target = match target {
-                        ChatTarget::Lobby => HistoryTarget::Lobby,
-                        ChatTarget::Direct(username) => HistoryTarget::Direct { username },
-                    };
-                    let msg = ClientToServer::FetchHistory { target };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::FetchThreads => {
-                    let msg = ClientToServer::FetchThreads;
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::Search { target, query } => {
-                    let target = match target {
-                        ChatTarget::Lobby => HistoryTarget::Lobby,
-                        ChatTarget::Direct(username) => HistoryTarget::Direct { username },
-                    };
-                    let msg = ClientToServer::Search { target, query };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::SetAway { away } => {
-                    let msg = ClientToServer::SetAway { away };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::Block { username } => {
-                    let msg = ClientToServer::Block { username };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::Unblock { username } => {
-                    let msg = ClientToServer::Unblock { username };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::Mute { username } => {
-                    let msg = ClientToServer::Mute { username };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::Unmute { username } => {
-                    let msg = ClientToServer::Unmute { username };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::Report { username, reason } => {
-                    let msg = ClientToServer::Report { username, reason };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::AddFriend { username } => {
-                    let msg = ClientToServer::AddFriend { username };
-                    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-                    ws.send_string(&text)
-                        .await
-                        .map_err(|err| format!("Failed to send: {:?}", err))?;
-                }
-                UiToNet::Disconnect => {
-                    break;
-                }
-                UiToNet::Connect { .. } => {}
-            }
-        }
-
-        // Small sleep to prevent busy-spinning
-        gloo_timers::future::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    let _ = net_tx.send(NetToUi::Disconnected);
-    Ok(())
 }
 
 // Native entry point
