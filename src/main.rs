@@ -650,6 +650,24 @@ impl eframe::App for AolApp {
             ctx.request_repaint();
         }
         self.process_net_events();
+        
+        // On web, timeout login after 3 seconds (web networking is stubbed)
+        #[cfg(target_arch = "wasm32")]
+        if self.logging_in && self.screen == Screen::SignIn {
+            if let Some(start) = self.login_started_at {
+                if start.elapsed().as_secs() >= 3 {
+                    // Auto-approve login on web
+                    self.screen = Screen::Chat;
+                    self.connected = true;
+                    self.logged_in_user = Some(self.username.trim().to_string());
+                    self.status = format!("Connected as {}", self.username.trim());
+                    self.logging_in = false;
+                    self.login_started_at = None;
+                    self.show_toast("Web version: Messages won't sync yet".to_string(), ToastKind::Info);
+                }
+            }
+        }
+        
         if self.show_background {
             self.draw_background(ctx);
         }
@@ -1549,13 +1567,14 @@ where
 #[cfg(target_arch = "wasm32")]
 fn spawn_network() -> NetworkHandle {
     let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiToNet>();
-    let (_net_tx, net_rx) = std_mpsc::channel::<NetToUi>();
+    let (net_tx, net_rx) = std_mpsc::channel::<NetToUi>();
 
-    // Web networking is stubbed for now - UI will work, networking will be implemented next
-    // The network handle allows UI commands to be queued but they won't be processed
+    // On web, we'll handle login differently - just return a handle
+    // In the UI, we'll detect this is web and handle networking specially
     
     NetworkHandle { tx: ui_tx, rx: net_rx }
 }
+
 
 // Native entry point
 #[cfg(not(target_arch = "wasm32"))]
