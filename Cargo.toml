@@ -44,3 +44,6 @@ web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "ErrorEven
 console_error_panic_hook = "0.1"
 tracing-wasm = "0.2"
 getrandom = { version = "0.2", features = ["js"] }
+gloo-net = { version = "0.2", features = ["websocket"] }
+gloo-utils = "0.1"
+gloo-timers = { version = "0.2", features = ["futures"] }
