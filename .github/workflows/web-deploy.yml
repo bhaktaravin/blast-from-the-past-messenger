@@ -21,7 +21,7 @@ jobs:
         run: cargo install --locked trunk
 
       - name: Build Web
-        run: trunk build --release
+        run: trunk build --release --public-url /blast-from-the-past-messenger/
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
