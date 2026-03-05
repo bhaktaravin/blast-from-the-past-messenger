@@ -4,6 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <!-- Prevent extension interference -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'wasm-unsafe-eval'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';">
+    <meta name="description" content="Blast From The Past Messenger - Retro AOL Messenger">
+    <meta name="referrer" content="strict-origin-when-cross-origin">
     <title>Blast From The Past Messenger</title>
 
     <style>
@@ -58,7 +62,7 @@
             border-radius: 3px;
         }
     </style>
-<link rel="modulepreload" href="/blast-from-the-past-messenger/chatmessagediscordclone-6565bc1829e5008e.js" crossorigin="anonymous" integrity="sha384-bpdbBZ9BGJduBhnXmQxBhxs2tk5YYYrOUl8k4wdocEPBT/cBYmhh7T8zmYggLrU+"><link rel="preload" href="/blast-from-the-past-messenger/chatmessagediscordclone-6565bc1829e5008e_bg.wasm" crossorigin="anonymous" integrity="sha384-MlqoNsNJwrPc6ndx6eeF+azztvUAfC9GRGW5dPQLt0UNSH0KcfEczgwKthxJyLLT" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/blast-from-the-past-messenger/chatmessagediscordclone-8aa3bff21aa3f43a.js" crossorigin="anonymous" integrity="sha384-bpdbBZ9BGJduBhnXmQxBhxs2tk5YYYrOUl8k4wdocEPBT/cBYmhh7T8zmYggLrU+"><link rel="preload" href="/blast-from-the-past-messenger/chatmessagediscordclone-8aa3bff21aa3f43a_bg.wasm" crossorigin="anonymous" integrity="sha384-hDBVZKwuh8KphCaUWj4Hd5xuapsEm7CsHNZ/gp+NqO3IdioLZAa8BlkZ0dzMDlVj" as="fetch" type="application/wasm"></head>
 <body>
     <div id="loading">
         <div class="spinner"></div>
@@ -71,6 +75,22 @@
     <div class="status">Powered by egui + wasm</div>
 
     <script>
+        // Prevent extension interference with input handling
+        const originalAddEventListener = Element.prototype.addEventListener;
+        const blockedExtensionPatterns = [
+            'grammarly', 'lastpass', 'dashlane', 'bitwarden', 
+            '1password', 'roboform', 'keepass', 'password'
+        ];
+        
+        // Block suspicious extension listeners
+        Element.prototype.addEventListener = function(type, listener, options) {
+            const listenerStr = listener.toString().toLowerCase();
+            const isBlocked = blockedExtensionPatterns.some(pattern => listenerStr.includes(pattern));
+            if (!isBlocked || !['input', 'change', 'paste', 'cut', 'copy', 'keydown', 'keyup'].includes(type)) {
+                originalAddEventListener.call(this, type, listener, options);
+            }
+        };
+
         // Remove loading screen when app loads
         window.addEventListener('load', function() {
             setTimeout(function() {
@@ -79,12 +99,43 @@
                     loading.style.display = 'none';
                 }
             }, 500);
+            
+            // Protect the canvas from extension manipulation
+            const canvas = document.getElementById('the_canvas_id');
+            if (canvas) {
+                // Mark canvas as protected
+                canvas.setAttribute('data-protected', 'true');
+                canvas.setAttribute('data-app', 'messenger');
+                
+                // Prevent right-click context menus (common extension vector)
+                canvas.addEventListener('contextmenu', e => e.preventDefault());
+                
+                // Prevent drag/drop interference
+                canvas.addEventListener('dragover', e => e.preventDefault());
+                canvas.addEventListener('drop', e => e.preventDefault());
+            }
         });
+        
+        // Block common extension scripts from modifying the DOM
+        const originalMutationHandler = MutationObserver.prototype;
+        const originalObserve = MutationObserver.prototype.observe;
+        
+        MutationObserver.prototype.observe = function(target, options) {
+            // Allow mutations only on our protected canvas area
+            if (target && target.id !== 'the_canvas_id' && target !== document.body) {
+                // Check if this looks like an extension trying to inject
+                const stack = new Error().stack || '';
+                if (stack.includes('chrome-extension://') || stack.includes('moz-extension://')) {
+                    return; // Block extension DOM observers
+                }
+            }
+            return originalObserve.call(this, target, options);
+        };
     </script>
 
 <script type="module">
-import init, * as bindings from '/blast-from-the-past-messenger/chatmessagediscordclone-6565bc1829e5008e.js';
-const wasm = await init({ module_or_path: '/blast-from-the-past-messenger/chatmessagediscordclone-6565bc1829e5008e_bg.wasm' });
+import init, * as bindings from '/blast-from-the-past-messenger/chatmessagediscordclone-8aa3bff21aa3f43a.js';
+const wasm = await init({ module_or_path: '/blast-from-the-past-messenger/chatmessagediscordclone-8aa3bff21aa3f43a_bg.wasm' });
 
 
 window.wasmBindings = bindings;
