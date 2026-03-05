@@ -183,6 +183,8 @@ enum UiToNet {
     Report { username: String, reason: String },
     Disconnect,
     AddFriend { username: String },
+    AcceptFriendRequest { username: String },
+    DeclineFriendRequest { username: String },
 }
 
 enum NetToUi {
@@ -203,6 +205,8 @@ enum NetToUi {
     System(String),
     Error(String),
     AddFriendResult { _username: String, success: bool, message: String },
+    FriendRequest { from: String },
+    FriendRequestResult { username: String, accepted: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +255,9 @@ struct AolApp {
     // Add Friend modal state
     show_add_friend_modal: bool,
     add_friend_name: String,
+    // Incoming friend requests
+    pending_friend_requests: Vec<String>,
+    show_friend_requests_modal: bool,
     // Audio settings
     audio_manager: AudioManager,
     sound_enabled: bool,
@@ -273,6 +280,15 @@ impl AolApp {
             self.show_toast("Please enter a screen name.".to_string(), ToastKind::Error);
         }
     }
+    
+    fn accept_friend_request(&mut self, username: String) {
+        let _ = self.network.tx.send(UiToNet::AcceptFriendRequest { username: username.clone() });
+    }
+    
+    fn decline_friend_request(&mut self, username: String) {
+        let _ = self.network.tx.send(UiToNet::DeclineFriendRequest { username: username.clone() });
+    }
+    
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut style = (*cc.egui_ctx.style()).clone();
         let mono = egui::FontId::new(16.0, egui::FontFamily::Monospace);
@@ -325,6 +341,8 @@ impl AolApp {
             audio_manager: AudioManager::new(),
             sound_enabled: true,
             sound_volume: 0.8,
+            pending_friend_requests: Vec::new(),
+            show_friend_requests_modal: false,
         }
     }
 
@@ -502,6 +520,24 @@ impl AolApp {
                     self.show_toast(self.status.clone(), ToastKind::Error);
                     self.logging_in = false;
                     self.login_started_at = None;
+                }
+                NetToUi::FriendRequest { from } => {
+                    if !self.pending_friend_requests.contains(&from) {
+                        self.pending_friend_requests.push(from.clone());
+                        self.show_toast(
+                            format!("{} wants to add you", from),
+                            ToastKind::Info,
+                        );
+                    }
+                }
+                NetToUi::FriendRequestResult { username, accepted } => {
+                    let msg = if accepted {
+                        format!("Accepted friend request from {}", username)
+                    } else {
+                        format!("Declined friend request from {}", username)
+                    };
+                    self.show_toast(msg, ToastKind::Success);
+                    self.pending_friend_requests.retain(|u| u != &username);
                 }
             }
         }
@@ -835,6 +871,16 @@ impl eframe::App for AolApp {
                         if ui.button("Add Friend").clicked() {
                             self.show_add_friend_modal = true;
                         }
+                        // Show friend requests button with pending count
+                        let pending_count = self.pending_friend_requests.len();
+                        let fr_label = if pending_count > 0 {
+                            format!("Friend Requests ({})", pending_count)
+                        } else {
+                            "Friend Requests".to_string()
+                        };
+                        if ui.button(fr_label).clicked() {
+                            self.show_friend_requests_modal = true;
+                        }
                         if ui.button("Disconnect").clicked() {
                             let _ = self.network.tx.send(UiToNet::Disconnect);
                             self.screen = Screen::SignIn;
@@ -889,6 +935,41 @@ impl eframe::App for AolApp {
                                         self.show_add_friend_modal = false;
                                     }
                                 });
+                            });
+                    }
+                    // Modal for Friend Requests
+                    if self.show_friend_requests_modal {
+                        egui::Window::new("Friend Requests")
+                            .collapsible(false)
+                            .resizable(true)
+                            .default_size([400.0, 300.0])
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                if self.pending_friend_requests.is_empty() {
+                                    ui.label("No pending friend requests");
+                                } else {
+                                    ui.label(format!("You have {} pending request(s):", self.pending_friend_requests.len()));
+                                    ui.separator();
+                                    
+                                    // Display each pending request
+                                    let requests = self.pending_friend_requests.clone();  // Clone to avoid borrow issues
+                                    for username in requests {
+                                        ui.horizontal(|ui| {
+                                            ui.label(&username);
+                                            if ui.button("✓ Accept").clicked() {
+                                                self.accept_friend_request(username.clone());
+                                            }
+                                            if ui.button("✗ Decline").clicked() {
+                                                self.decline_friend_request(username.clone());
+                                            }
+                                        });
+                                    }
+                                }
+                                
+                                ui.separator();
+                                if ui.button("Close").clicked() {
+                                    self.show_friend_requests_modal = false;
+                                }
                             });
                     }
                     ui.horizontal(|ui| {
@@ -1511,6 +1592,12 @@ async fn run_connection(
                                 ServerToClient::AddFriendResult { _username, success, message } => {
                                     let _ = net_tx.send(NetToUi::AddFriendResult { _username, success, message });
                                 }
+                                ServerToClient::FriendRequest { from } => {
+                                    let _ = net_tx.send(NetToUi::FriendRequest { from });
+                                }
+                                ServerToClient::FriendRequestResult { username, accepted } => {
+                                    let _ = net_tx.send(NetToUi::FriendRequestResult { username, accepted });
+                                }
                             }
                         }
                     }
@@ -1565,6 +1652,12 @@ async fn run_connection(
                     }
                     UiToNet::AddFriend { username } => {
                         send_json(&mut ws_tx, ClientToServer::AddFriend { username }).await?;
+                    }
+                    UiToNet::AcceptFriendRequest { username } => {
+                        send_json(&mut ws_tx, ClientToServer::AcceptFriendRequest { username }).await?;
+                    }
+                    UiToNet::DeclineFriendRequest { username } => {
+                        send_json(&mut ws_tx, ClientToServer::DeclineFriendRequest { username }).await?;
                     }
                     UiToNet::Disconnect => {
                         let _ = ws_tx.send(Message::Close(None)).await;

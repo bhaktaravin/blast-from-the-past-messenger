@@ -485,6 +485,14 @@ async fn handle_client_event(
                                     success: true,
                                     message: format!("Friend request sent to {username} (auto-accepted)."),
                                 });
+                                // Notify target user if online
+                                if let Some((peer_id, _)) = get_peer_by_user_id(peers, target_id) {
+                                    if let Some((requester, _)) = get_peer_identity(peers, id) {
+                                        send_to_peer(peers, peer_id, ServerToClient::FriendRequest {
+                                            from: requester.username.clone(),
+                                        });
+                                    }
+                                }
                             }
                             Ok(false) => {
                                 send_to_peer(peers, id, ServerToClient::AddFriendResult {
@@ -519,6 +527,22 @@ async fn handle_client_event(
                 }
             }
         }
+        
+        ClientToServer::AcceptFriendRequest { username } => {
+            // Send success notification back to user
+            send_to_peer(peers, id, ServerToClient::FriendRequestResult {
+                username: username.clone(),
+                accepted: true,
+            });
+        }
+        
+        ClientToServer::DeclineFriendRequest { username } => {
+            // Send success notification back to user
+            send_to_peer(peers, id, ServerToClient::FriendRequestResult {
+                username: username.clone(),
+                accepted: false,
+            });
+        }
     }
 }
 
@@ -546,6 +570,13 @@ fn get_peer_identity(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize) -> Opt
                 .user_id
                 .map(|user_id| (peer.username.clone(), user_id))
         })
+    })
+}
+
+fn get_peer_by_user_id(peers: &Arc<Mutex<HashMap<usize, Peer>>>, user_id: i64) -> Option<(usize, String)> {
+    peers.lock().ok().and_then(|guard| {
+        guard.iter().find(|(_, peer)| peer.user_id == Some(user_id))
+            .map(|(id, peer)| (*id, peer.username.clone()))
     })
 }
 
