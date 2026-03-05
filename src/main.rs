@@ -664,8 +664,16 @@ impl eframe::App for AolApp {
                     self.logging_in = false;
                     self.login_started_at = None;
                     self.show_toast("Web version: Messages won't sync yet".to_string(), ToastKind::Info);
+                } else {
+                    // Still waiting, keep requesting repaints
+                    ctx.request_repaint();
                 }
             }
+        }
+        
+        // Always request repaint if we're logging in (to show spinner)
+        if self.logging_in {
+            ctx.request_repaint();
         }
         
         if self.show_background {
