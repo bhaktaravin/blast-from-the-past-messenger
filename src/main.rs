@@ -1,9 +1,14 @@
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
-use std::time::Instant;
 
 use chrono::Utc;
 use eframe::egui;
+
+// Platform-specific timing
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+type Instant = u32;  // Frame counter on web
 
 // Native-only imports
 #[cfg(not(target_arch = "wasm32"))]
@@ -235,6 +240,7 @@ struct AolApp {
     report_reason: String,
     logging_in: bool,
     login_started_at: Option<Instant>,
+    login_frame_count: u32,  // Web: tracks elapsed frames for 3-second timeout
     search_query: String,
     search_in_progress: bool,
     search_results: HashMap<ChatTarget, SearchResult>,
@@ -306,6 +312,7 @@ impl AolApp {
             report_reason: String::new(),
             logging_in: false,
             login_started_at: None,
+            login_frame_count: 0,
             search_query: String::new(),
             search_in_progress: false,
             search_results: HashMap::new(),
@@ -507,7 +514,15 @@ impl AolApp {
             return;
         }
         self.logging_in = true;
-        self.login_started_at = Some(Instant::now());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.login_started_at = Some(Instant::now());
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.login_started_at = Some(0);  // Start frame count at 0
+            self.login_frame_count = 0;
+        }
         self.status = format!("Logging in as {}...", self.username.trim());
         let mut url = self.server_url.trim().to_string();
         if let Some(stripped) = url.strip_prefix("https://") {
@@ -654,20 +669,21 @@ impl eframe::App for AolApp {
         // On web, timeout login after 3 seconds (web networking is stubbed)
         #[cfg(target_arch = "wasm32")]
         if self.logging_in && self.screen == Screen::SignIn {
-            if let Some(start) = self.login_started_at {
-                if start.elapsed().as_secs() >= 3 {
-                    // Auto-approve login on web
-                    self.screen = Screen::Chat;
-                    self.connected = true;
-                    self.logged_in_user = Some(self.username.trim().to_string());
-                    self.status = format!("Connected as {}", self.username.trim());
-                    self.logging_in = false;
-                    self.login_started_at = None;
-                    self.show_toast("Web version: Messages won't sync yet".to_string(), ToastKind::Info);
-                } else {
-                    // Still waiting, keep requesting repaints
-                    ctx.request_repaint();
-                }
+            self.login_frame_count += 1;
+            let timeout_frames = 180;  // ~3 seconds at 60 FPS
+            if self.login_frame_count >= timeout_frames {
+                // Auto-approve login on web
+                self.screen = Screen::Chat;
+                self.connected = true;
+                self.logged_in_user = Some(self.username.trim().to_string());
+                self.status = format!("Connected as {}", self.username.trim());
+                self.logging_in = false;
+                self.login_started_at = None;
+                self.login_frame_count = 0;
+                self.show_toast("Web version: Messages won't sync yet".to_string(), ToastKind::Info);
+            } else {
+                // Still waiting, keep requesting repaints
+                ctx.request_repaint();
             }
         }
         
@@ -780,11 +796,17 @@ impl eframe::App for AolApp {
                                 ui.add_space(10.0);
                                 if self.logging_in {
                                     let frames = ["[LOCKED]", "[LOCK--]", "[LOCK> ]", "[UNLOCK]"];
+                                    #[cfg(not(target_arch = "wasm32"))]
                                     let frame = if let Some(start) = self.login_started_at {
                                         let idx = ((start.elapsed().as_millis() / 200) % frames.len() as u128) as usize;
                                         frames[idx]
                                     } else {
                                         frames[0]
+                                    };
+                                    #[cfg(target_arch = "wasm32")]
+                                    let frame = {
+                                        let idx = ((self.login_frame_count / 12) as usize) % frames.len();  // ~12 frames per second animation
+                                        frames[idx]
                                     };
                                     ui.horizontal(|ui| {
                                         ui.add(egui::Spinner::new());
