@@ -270,8 +270,30 @@ struct SearchResult {
 }
 
 impl AolApp {
+    /// Sanitize and validate user input to prevent injection and external manipulation
+    fn sanitize_input(input: &str) -> String {
+        input
+            .trim()
+            .replace('\0', "")  // Remove null bytes
+            .chars()
+            .filter(|c| !c.is_control() || c.is_whitespace())  // Remove control chars except whitespace
+            .take(1024)  // Limit length
+            .collect()
+    }
+    
+    /// Sanitize username/email input
+    fn sanitize_username(input: &str) -> String {
+        input
+            .trim()
+            .replace('\0', "")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')  // Only safe chars
+            .take(32)  // Limit length
+            .collect()
+    }
+    
     fn send_add_friend(&mut self) {
-        let name = self.add_friend_name.trim().to_string();
+        let name = Self::sanitize_username(&self.add_friend_name);
         if !name.is_empty() {
             let _ = self.network.tx.send(UiToNet::AddFriend { username: name.clone() });
             self.add_friend_name.clear();
@@ -559,7 +581,8 @@ impl AolApp {
             self.login_started_at = Some(0);  // Start frame count at 0
             self.login_frame_count = 0;
         }
-        self.status = format!("Logging in as {}...", self.username.trim());
+        let safe_username = Self::sanitize_username(&self.username);
+        self.status = format!("Logging in as {}...", safe_username);
         let mut url = self.server_url.trim().to_string();
         if let Some(stripped) = url.strip_prefix("https://") {
             url = format!("wss://{stripped}");
@@ -571,14 +594,14 @@ impl AolApp {
         self.server_url = url.clone();
         let _ = self.network.tx.send(UiToNet::Connect {
             url,
-            username: self.username.trim().to_string(),
-            password: self.password.clone(),
+            username: safe_username,
+            password: Self::sanitize_input(&self.password),
             mode: self.auth_mode,
         });
     }
 
     fn send_chat(&mut self) {
-        let body = self.chat_input.trim();
+        let body = Self::sanitize_input(&self.chat_input);
         if body.is_empty() {
             return;
         }
@@ -587,12 +610,12 @@ impl AolApp {
                 let _ = self
                     .network
                     .tx
-                    .send(UiToNet::SendChat { body: body.to_string() });
+                    .send(UiToNet::SendChat { body: body.clone() });
             }
             ChatTarget::Direct(target) => {
                 let _ = self.network.tx.send(UiToNet::SendDirect {
                     to: target.clone(),
-                    body: body.to_string(),
+                    body: body.clone(),
                 });
                 let entry = self
                     .messages
@@ -603,7 +626,7 @@ impl AolApp {
                         .logged_in_user
                         .clone()
                         .unwrap_or_else(|| "Me".to_string()),
-                    body: body.to_string(),
+                    body,
                     at: Utc::now().to_rfc3339(),
                 });
             }
@@ -616,7 +639,7 @@ impl AolApp {
         let away = if self.away_text.trim().is_empty() {
             None
         } else {
-            Some(self.away_text.trim().to_string())
+            Some(Self::sanitize_input(&self.away_text))
         };
         let _ = self.network.tx.send(UiToNet::SetAway { away });
     }
