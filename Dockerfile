@@ -13,11 +13,13 @@ RUN apt-get update && apt-get install -y \
 # Copy manifest files
 COPY Cargo.toml Cargo.lock ./
 
-# Copy source code
+# Copy source code  
 COPY src ./src
 
-# Build the binary with all features
-RUN cargo build --release --bin server --features server
+# Verify features are available
+RUN echo "Building server binary with --features server" && \
+    cargo build --release --bin server --features server && \
+    ls -lh target/release/server
 
 # Runtime stage - minimal image
 FROM debian:bookworm-slim
@@ -31,6 +33,9 @@ WORKDIR /app
 
 # Copy only the binary from builder
 COPY --from=builder /app/target/release/server ./server
+
+# Verify binary was copied
+RUN ls -lh ./server
 
 # Expose the port
 EXPOSE 9001
