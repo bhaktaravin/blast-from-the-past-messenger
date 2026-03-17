@@ -10,21 +10,13 @@ RUN apt-get update && apt-get install -y \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifest files first (these change less frequently)
+# Copy manifest files
 COPY Cargo.toml Cargo.lock ./
 
-# Create a dummy main.rs to cache dependencies
-RUN mkdir -p src/bin && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "fn main() {}" > src/bin/server.rs
-
-# Build dependencies only (this layer will be cached)
-RUN cargo build --release --features server 2>&1 | grep -v "warning:" || true
-
-# Now copy the actual source code
+# Copy source code
 COPY src ./src
 
-# Build the actual binary
+# Build the binary with all features
 RUN cargo build --release --bin server --features server
 
 # Runtime stage - minimal image
