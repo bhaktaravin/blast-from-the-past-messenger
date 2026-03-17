@@ -132,6 +132,8 @@ struct ChatMessage {
     from: String,
     body: String,
     at: String,
+    id: Option<i64>,
+    read_count: Option<i32>,
 }
 
 struct Toast {
@@ -161,6 +163,7 @@ enum AuthMode {
 enum ChatTarget {
     Lobby,
     Direct(String),
+    Room(String),
 }
 
 enum UiToNet {
@@ -185,6 +188,15 @@ enum UiToNet {
     AddFriend { username: String },
     AcceptFriendRequest { username: String },
     DeclineFriendRequest { username: String },
+    CreateChatRoom { name: String },
+    JoinChatRoom { room_id: String },
+    LeaveChatRoom { room_id: String },
+    SendRoomMessage { room_id: String, body: String },
+    FetchChatRooms,
+    FetchRoomMembers { room_id: String },
+    StartTyping { room_id: String },
+    StopTyping { room_id: String },
+    MarkMessageAsRead { message_id: i64 },
 }
 
 enum NetToUi {
@@ -207,6 +219,15 @@ enum NetToUi {
     AddFriendResult { _username: String, success: bool, message: String },
     FriendRequest { from: String },
     FriendRequestResult { username: String, accepted: bool },
+    ChatRoomCreated { room_id: String, name: String },
+    ChatRoomList { rooms: Vec<(String, String, i32)> }, // (id, name, member_count)
+    RoomMessage { room_id: String, from: String, body: String, message_id: i64 },
+    UserJoinedRoom { room_id: String, username: String },
+    UserLeftRoom { room_id: String, username: String },
+    RoomMembers { room_id: String, members: Vec<String> },
+    UserTyping { room_id: String, username: String },
+    UserStoppedTyping { room_id: String, username: String },
+    ReadReceipt { message_id: i64, read_by: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +283,15 @@ struct AolApp {
     audio_manager: AudioManager,
     sound_enabled: bool,
     sound_volume: f32,
+    // Chat rooms
+    chat_rooms: Vec<(String, String, i32)>, // (id, name, member_count)
+    show_room_creation_modal: bool,
+    new_room_name: String,
+    // Typing indicators
+    typing_users: std::collections::HashMap<String, Vec<String>>, // room_id -> list of users typing
+    typing_timeout: std::collections::HashMap<String, std::time::Instant>, // user -> when they stop typing
+    // Read receipts
+    message_read_status: std::collections::HashMap<i64, Vec<String>>, // message_id -> list of users who read
 }
 
 struct SearchResult {
@@ -365,6 +395,12 @@ impl AolApp {
             sound_volume: 0.8,
             pending_friend_requests: Vec::new(),
             show_friend_requests_modal: false,
+            chat_rooms: Vec::new(),
+            show_room_creation_modal: false,
+            new_room_name: String::new(),
+            typing_users: HashMap::new(),
+            typing_timeout: HashMap::new(),
+            message_read_status: HashMap::new(),
         }
     }
 
@@ -464,6 +500,8 @@ impl AolApp {
                         from,
                         body,
                         at: Utc::now().to_rfc3339(),
+                        id: None,
+                        read_count: None,
                     });
                     self.audio_manager.play(SoundEffect::MessageReceived);
                 }
@@ -474,6 +512,8 @@ impl AolApp {
                         from,
                         body,
                         at: Utc::now().to_rfc3339(),
+                        id: None,
+                        read_count: None,
                     });
                     self.audio_manager.play(SoundEffect::MessageReceived);
                 }
@@ -534,6 +574,8 @@ impl AolApp {
                         from: "System".to_string(),
                         body: message,
                         at: Utc::now().to_rfc3339(),
+                        id: None,
+                        read_count: None,
                     });
                     self.show_toast("System message received".to_string(), ToastKind::Info);
                 }
@@ -560,6 +602,45 @@ impl AolApp {
                     };
                     self.show_toast(msg, ToastKind::Success);
                     self.pending_friend_requests.retain(|u| u != &username);
+                }
+                NetToUi::ChatRoomCreated { room_id, name } => {
+                    self.show_toast(format!("Created room: {}", name), ToastKind::Success);
+                    self.selected_target = ChatTarget::Room(room_id);
+                }
+                NetToUi::ChatRoomList { rooms } => {
+                    self.chat_rooms = rooms;
+                }
+                NetToUi::RoomMessage { room_id, from, body, message_id } => {
+                    let target = ChatTarget::Room(room_id);
+                    let entry = self.messages.entry(target).or_default();
+                    entry.push(ChatMessage {
+                        from,
+                        body,
+                        at: Utc::now().to_rfc3339(),
+                        id: Some(message_id),
+                        read_count: Some(0),
+                    });
+                    self.audio_manager.play(SoundEffect::MessageReceived);
+                }
+                NetToUi::UserJoinedRoom { room_id, username } => {
+                    self.show_toast(format!("{} joined the room", username), ToastKind::Info);
+                }
+                NetToUi::UserLeftRoom { room_id, username } => {
+                    self.show_toast(format!("{} left the room", username), ToastKind::Info);
+                }
+                NetToUi::RoomMembers { room_id, members } => {
+                    // Store member list - could be used for UI display
+                }
+                NetToUi::UserTyping { room_id, username } => {
+                    self.typing_users.entry(room_id.clone()).or_default().push(username);
+                }
+                NetToUi::UserStoppedTyping { room_id, username } => {
+                    if let Some(users) = self.typing_users.get_mut(&room_id) {
+                        users.retain(|u| u != &username);
+                    }
+                }
+                NetToUi::ReadReceipt { message_id, read_by } => {
+                    self.message_read_status.entry(message_id).or_default().push(read_by);
                 }
             }
         }
@@ -628,6 +709,25 @@ impl AolApp {
                         .unwrap_or_else(|| "Me".to_string()),
                     body,
                     at: Utc::now().to_rfc3339(),
+                    id: None,
+                    read_count: None,
+                });
+            }
+            ChatTarget::Room(room_id) => {
+                let _ = self.network.tx.send(UiToNet::SendRoomMessage {
+                    room_id: room_id.clone(),
+                    body: body.clone(),
+                });
+                let entry = self.messages.entry(ChatTarget::Room(room_id.clone())).or_default();
+                entry.push(ChatMessage {
+                    from: self
+                        .logged_in_user
+                        .clone()
+                        .unwrap_or_else(|| "Me".to_string()),
+                    body,
+                    at: Utc::now().to_rfc3339(),
+                    id: None,
+                    read_count: None,
                 });
             }
         }
@@ -1147,6 +1247,7 @@ impl eframe::App for AolApp {
                     let heading = match &self.selected_target {
                         ChatTarget::Lobby => "Chat Log - Lobby".to_string(),
                         ChatTarget::Direct(name) => format!("Chat Log - {name}"),
+                        ChatTarget::Room(room_id) => format!("Chat Log - Room {}", room_id),
                     };
                     ui.heading(heading);
                     ui.separator();
@@ -1576,6 +1677,7 @@ async fn run_connection(
                                     let mapped_target = match target {
                                         HistoryTarget::Lobby => ChatTarget::Lobby,
                                         HistoryTarget::Direct { username } => ChatTarget::Direct(username),
+                                        HistoryTarget::Room { room_id } => ChatTarget::Room(room_id),
                                     };
                                     let mapped_messages = messages
                                         .into_iter()
@@ -1583,6 +1685,8 @@ async fn run_connection(
                                             from: record.from,
                                             body: record.body,
                                             at: record.at,
+                                            id: record.id,
+                                            read_count: record.read_count,
                                         })
                                         .collect::<Vec<_>>();
                                     let _ = net_tx.send(NetToUi::History {
@@ -1594,6 +1698,7 @@ async fn run_connection(
                                     let mapped_target = match target {
                                         HistoryTarget::Lobby => ChatTarget::Lobby,
                                         HistoryTarget::Direct { username } => ChatTarget::Direct(username),
+                                        HistoryTarget::Room { room_id } => ChatTarget::Room(room_id),
                                     };
                                     let mapped_messages = messages
                                         .into_iter()
@@ -1601,6 +1706,8 @@ async fn run_connection(
                                             from: record.from,
                                             body: record.body,
                                             at: record.at,
+                                            id: record.id,
+                                            read_count: record.read_count,
                                         })
                                         .collect::<Vec<_>>();
                                     let _ = net_tx.send(NetToUi::SearchResults {
@@ -1620,6 +1727,36 @@ async fn run_connection(
                                 }
                                 ServerToClient::FriendRequestResult { username, accepted } => {
                                     let _ = net_tx.send(NetToUi::FriendRequestResult { username, accepted });
+                                }
+                                ServerToClient::ChatRoomCreated { room_id, name } => {
+                                    let _ = net_tx.send(NetToUi::ChatRoomCreated { room_id, name });
+                                }
+                                ServerToClient::ChatRoomList { rooms } => {
+                                    let rooms_vec = rooms.into_iter()
+                                        .map(|r| (r.id, r.name, r.member_count))
+                                        .collect();
+                                    let _ = net_tx.send(NetToUi::ChatRoomList { rooms: rooms_vec });
+                                }
+                                ServerToClient::RoomMessage { room_id, from, body, message_id } => {
+                                    let _ = net_tx.send(NetToUi::RoomMessage { room_id, from, body, message_id });
+                                }
+                                ServerToClient::UserJoinedRoom { room_id, username } => {
+                                    let _ = net_tx.send(NetToUi::UserJoinedRoom { room_id, username });
+                                }
+                                ServerToClient::UserLeftRoom { room_id, username } => {
+                                    let _ = net_tx.send(NetToUi::UserLeftRoom { room_id, username });
+                                }
+                                ServerToClient::RoomMembers { room_id, members } => {
+                                    let _ = net_tx.send(NetToUi::RoomMembers { room_id, members });
+                                }
+                                ServerToClient::UserTyping { room_id, username } => {
+                                    let _ = net_tx.send(NetToUi::UserTyping { room_id, username });
+                                }
+                                ServerToClient::UserStoppedTyping { room_id, username } => {
+                                    let _ = net_tx.send(NetToUi::UserStoppedTyping { room_id, username });
+                                }
+                                ServerToClient::ReadReceipt { message_id, read_by } => {
+                                    let _ = net_tx.send(NetToUi::ReadReceipt { message_id, read_by });
                                 }
                             }
                         }
@@ -1642,6 +1779,7 @@ async fn run_connection(
                         let target = match target {
                             ChatTarget::Lobby => HistoryTarget::Lobby,
                             ChatTarget::Direct(username) => HistoryTarget::Direct { username },
+                            ChatTarget::Room(room_id) => HistoryTarget::Room { room_id },
                         };
                         send_json(&mut ws_tx, ClientToServer::FetchHistory { target }).await?;
                     }
@@ -1652,6 +1790,7 @@ async fn run_connection(
                         let target = match target {
                             ChatTarget::Lobby => HistoryTarget::Lobby,
                             ChatTarget::Direct(username) => HistoryTarget::Direct { username },
+                            ChatTarget::Room(room_id) => HistoryTarget::Room { room_id },
                         };
                         send_json(&mut ws_tx, ClientToServer::Search { target, query }).await?;
                     }
@@ -1681,6 +1820,33 @@ async fn run_connection(
                     }
                     UiToNet::DeclineFriendRequest { username } => {
                         send_json(&mut ws_tx, ClientToServer::DeclineFriendRequest { username }).await?;
+                    }
+                    UiToNet::CreateChatRoom { name } => {
+                        send_json(&mut ws_tx, ClientToServer::CreateChatRoom { name }).await?;
+                    }
+                    UiToNet::JoinChatRoom { room_id } => {
+                        send_json(&mut ws_tx, ClientToServer::JoinChatRoom { room_id }).await?;
+                    }
+                    UiToNet::LeaveChatRoom { room_id } => {
+                        send_json(&mut ws_tx, ClientToServer::LeaveChatRoom { room_id }).await?;
+                    }
+                    UiToNet::SendRoomMessage { room_id, body } => {
+                        send_json(&mut ws_tx, ClientToServer::SendRoomMessage { room_id, body }).await?;
+                    }
+                    UiToNet::FetchChatRooms => {
+                        send_json(&mut ws_tx, ClientToServer::FetchChatRooms).await?;
+                    }
+                    UiToNet::FetchRoomMembers { room_id } => {
+                        send_json(&mut ws_tx, ClientToServer::FetchRoomMembers { room_id }).await?;
+                    }
+                    UiToNet::StartTyping { room_id } => {
+                        send_json(&mut ws_tx, ClientToServer::StartTyping { room_id }).await?;
+                    }
+                    UiToNet::StopTyping { room_id } => {
+                        send_json(&mut ws_tx, ClientToServer::StopTyping { room_id }).await?;
+                    }
+                    UiToNet::MarkMessageAsRead { message_id } => {
+                        send_json(&mut ws_tx, ClientToServer::MarkMessageAsRead { message_id }).await?;
                     }
                     UiToNet::Disconnect => {
                         let _ = ws_tx.send(Message::Close(None)).await;

@@ -25,6 +25,7 @@ struct Peer {
     username: String,
     away: Option<String>,
     tx: mpsc::UnboundedSender<Message>,
+    current_room: Option<String>, // Track which chat room user is in
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +107,7 @@ async fn handle_connection(
                 username: guest_name,
                 away: None,
                 tx: out_tx.clone(),
+                current_room: None,
             },
         );
     }
@@ -352,6 +354,18 @@ async fn handle_client_event(
                         );
                     }
                 }
+                HistoryTarget::Room { room_id } => {
+                    if let Ok(messages) = fetch_room_history(db, &room_id, 50).await {
+                        send_to_peer(
+                            peers,
+                            id,
+                            ServerToClient::History {
+                                target: HistoryTarget::Room { room_id },
+                                messages,
+                            },
+                        );
+                    }
+                }
             }
         }
         ClientToServer::Search { target, query } => {
@@ -399,6 +413,19 @@ async fn handle_client_event(
                                 },
                             );
                         }
+                    }
+                }
+                HistoryTarget::Room { room_id } => {
+                    if let Ok(messages) = search_room(db, &room_id, trimmed, 50).await {
+                        send_to_peer(
+                            peers,
+                            id,
+                            ServerToClient::SearchResults {
+                                target: HistoryTarget::Room { room_id },
+                                query: trimmed.to_string(),
+                                messages,
+                            },
+                        );
                     }
                 }
             }
@@ -489,7 +516,7 @@ async fn handle_client_event(
                                 if let Some((peer_id, _)) = get_peer_by_user_id(peers, target_id) {
                                     if let Some((requester, _)) = get_peer_identity(peers, id) {
                                         send_to_peer(peers, peer_id, ServerToClient::FriendRequest {
-                                            from: requester.username.clone(),
+                                            from: requester,
                                         });
                                     }
                                 }
@@ -542,6 +569,206 @@ async fn handle_client_event(
                 username: username.clone(),
                 accepted: false,
             });
+        }
+        ClientToServer::CreateChatRoom { name } => {
+            let (_, user_id) = match get_peer_identity(peers, id) {
+                Some(info) => info,
+                None => {
+                    send_to_peer(
+                        peers,
+                        id,
+                        ServerToClient::AuthError {
+                            message: "Please log in first.".to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+            let room_id = uuid::Uuid::new_v4().to_string();
+            match create_chat_room(db, &room_id, &name, user_id).await {
+                Ok(_) => {
+                    join_chat_room(peers, id, &room_id);
+                    send_to_peer(
+                        peers,
+                        id,
+                        ServerToClient::ChatRoomCreated {
+                            room_id: room_id.clone(),
+                            name,
+                        },
+                    );
+                }
+                Err(e) => {
+                    send_to_peer(
+                        peers,
+                        id,
+                        ServerToClient::System {
+                            message: format!("Failed to create room: {e}"),
+                        },
+                    );
+                }
+            }
+        }
+        ClientToServer::FetchChatRooms => {
+            if let Ok(rooms) = fetch_all_chat_rooms(db).await {
+                send_to_peer(peers, id, ServerToClient::ChatRoomList { rooms });
+            }
+        }
+        ClientToServer::JoinChatRoom { room_id } => {
+            let (username, user_id) = match get_peer_identity(peers, id) {
+                Some(info) => info,
+                None => {
+                    send_to_peer(
+                        peers,
+                        id,
+                        ServerToClient::AuthError {
+                            message: "Please log in first.".to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+            match add_room_member(db, &room_id, user_id).await {
+                Ok(_) => {
+                    join_chat_room(peers, id, &room_id);
+                    broadcast_to_room(
+                        peers,
+                        &room_id,
+                        ServerToClient::UserJoinedRoom {
+                            room_id: room_id.clone(),
+                            username,
+                        },
+                    );
+                    if let Ok(members) = fetch_room_members(db, &room_id).await {
+                        send_to_peer(
+                            peers,
+                            id,
+                            ServerToClient::RoomMembers {
+                                room_id,
+                                members,
+                            },
+                        );
+                    }
+                }
+                Err(e) => {
+                    send_to_peer(
+                        peers,
+                        id,
+                        ServerToClient::System {
+                            message: format!("Failed to join room: {e}"),
+                        },
+                    );
+                }
+            }
+        }
+        ClientToServer::SendRoomMessage { room_id, body } => {
+            let (from, user_id) = match get_peer_identity(peers, id) {
+                Some(info) => info,
+                None => {
+                    send_to_peer(
+                        peers,
+                        id,
+                        ServerToClient::AuthError {
+                            message: "Please log in first.".to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+            if !allow_rate(rate_limits, user_id) {
+                send_to_peer(
+                    peers,
+                    id,
+                    ServerToClient::System {
+                        message: "Rate limit exceeded.".to_string(),
+                    },
+                );
+                return;
+            }
+            match insert_room_message(db, user_id, &room_id, &body).await {
+                Ok(message_id) => {
+                    broadcast_to_room(
+                        peers,
+                        &room_id,
+                        ServerToClient::RoomMessage {
+                            room_id: room_id.clone(),
+                            from,
+                            body,
+                            message_id,
+                        },
+                    );
+                }
+                Err(e) => {
+                    send_to_peer(
+                        peers,
+                        id,
+                        ServerToClient::System {
+                            message: format!("Failed to send message: {e}"),
+                        },
+                    );
+                }
+            }
+        }
+        ClientToServer::LeaveChatRoom { room_id } => {
+            if let Some((username, _)) = get_peer_identity(peers, id) {
+                leave_chat_room(peers, id, &room_id);
+                broadcast_to_room(
+                    peers,
+                    &room_id,
+                    ServerToClient::UserLeftRoom {
+                        room_id: room_id.clone(),
+                        username,
+                    },
+                );
+            }
+        }
+        ClientToServer::FetchRoomMembers { room_id } => {
+            if let Ok(members) = fetch_room_members(db, &room_id).await {
+                send_to_peer(
+                    peers,
+                    id,
+                    ServerToClient::RoomMembers {
+                        room_id: room_id.clone(),
+                        members,
+                    },
+                );
+            }
+        }
+        ClientToServer::StartTyping { room_id } => {
+            if let Some((username, _)) = get_peer_identity(peers, id) {
+                broadcast_to_room(
+                    peers,
+                    &room_id,
+                    ServerToClient::UserTyping {
+                        room_id: room_id.clone(),
+                        username,
+                    },
+                );
+            }
+        }
+        ClientToServer::StopTyping { room_id } => {
+            if let Some((username, _)) = get_peer_identity(peers, id) {
+                broadcast_to_room(
+                    peers,
+                    &room_id,
+                    ServerToClient::UserStoppedTyping {
+                        room_id: room_id.clone(),
+                        username,
+                    },
+                );
+            }
+        }
+        ClientToServer::MarkMessageAsRead { message_id } => {
+            if let Some((from, _)) = get_peer_identity(peers, id) {
+                let _ = mark_message_read(db, message_id).await;
+                // Broadcast read receipt to all peers
+                send_to_all(
+                    peers,
+                    ServerToClient::ReadReceipt {
+                        message_id,
+                        read_by: from,
+                    },
+                );
+            }
         }
     }
 }
@@ -762,16 +989,6 @@ async fn send_threads_to_user_id(
 }
 
 async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS friends (\
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\
-                friend_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\
-                UNIQUE(user_id, friend_user_id)\
-            )"
-        )
-        .execute(db)
-        .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS users (\
             id SERIAL PRIMARY KEY,\
@@ -779,6 +996,39 @@ async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
             password_hash TEXT NOT NULL,\
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\
         )",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS chat_rooms (\
+            id TEXT PRIMARY KEY,\
+            name TEXT NOT NULL,\
+            creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\
+        )",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS chat_room_members (\
+            room_id TEXT NOT NULL REFERENCES chat_rooms(id) ON DELETE CASCADE,\
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\
+            joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\
+            UNIQUE(room_id, user_id)\
+        )",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS friends (\
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\
+            friend_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\
+            UNIQUE(user_id, friend_user_id)\
+        )"
     )
     .execute(db)
     .await?;
@@ -822,7 +1072,9 @@ async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
             id SERIAL PRIMARY KEY,\
             sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\
             recipient_id INTEGER REFERENCES users(id) ON DELETE CASCADE,\
+            room_id TEXT REFERENCES chat_rooms(id) ON DELETE CASCADE,\
             body TEXT NOT NULL,\
+            read_at TIMESTAMPTZ,\
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\
         )",
     )
@@ -875,6 +1127,8 @@ async fn fetch_lobby_history(db: &PgPool, limit: i64) -> Result<Vec<MessageRecor
             at: row
                 .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
                 .to_rfc3339(),
+            id: None,
+            read_count: None,
         })
         .collect::<Vec<_>>();
     messages.reverse();
@@ -910,6 +1164,8 @@ async fn fetch_dm_history(
             at: row
                 .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
                 .to_rfc3339(),
+            id: None,
+            read_count: None,
         })
         .collect::<Vec<_>>();
     messages.reverse();
@@ -949,6 +1205,36 @@ async fn fetch_recent_threads(
         .collect())
 }
 
+async fn fetch_room_history(db: &PgPool, room_id: &str, limit: i64) -> Result<Vec<MessageRecord>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT u.username, m.body, m.created_at\
+         FROM messages m\
+         JOIN users u ON u.id = m.sender_id\
+         WHERE m.room_id = $1\
+         ORDER BY m.created_at DESC\
+         LIMIT $2",
+    )
+    .bind(room_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+
+    let mut messages = rows
+        .into_iter()
+        .map(|row| MessageRecord {
+            from: row.get::<String, _>("username"),
+            body: row.get::<String, _>("body"),
+            at: row
+                .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                .to_rfc3339(),
+            id: None,
+            read_count: None,
+        })
+        .collect::<Vec<_>>();
+    messages.reverse();
+    Ok(messages)
+}
+
 async fn search_lobby(
     db: &PgPool,
     query: &str,
@@ -976,6 +1262,8 @@ async fn search_lobby(
             at: row
                 .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
                 .to_rfc3339(),
+            id: None,
+            read_count: None,
         })
         .collect::<Vec<_>>();
     messages.reverse();
@@ -1014,6 +1302,45 @@ async fn search_dm(
             at: row
                 .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
                 .to_rfc3339(),
+            id: None,
+            read_count: None,
+        })
+        .collect::<Vec<_>>();
+    messages.reverse();
+    Ok(messages)
+}
+
+async fn search_room(
+    db: &PgPool,
+    room_id: &str,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<MessageRecord>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT u.username, m.body, m.created_at\
+         FROM messages m\
+         JOIN users u ON u.id = m.sender_id\
+         WHERE m.room_id = $1\
+           AND to_tsvector('english', m.body) @@ plainto_tsquery('english', $2)\
+         ORDER BY m.created_at DESC\
+         LIMIT $3",
+    )
+    .bind(room_id)
+    .bind(query)
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+
+    let mut messages = rows
+        .into_iter()
+        .map(|row| MessageRecord {
+            from: row.get::<String, _>("username"),
+            body: row.get::<String, _>("body"),
+            at: row
+                .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                .to_rfc3339(),
+            id: None,
+            read_count: None,
         })
         .collect::<Vec<_>>();
     messages.reverse();
@@ -1174,4 +1501,120 @@ async fn is_blocked_or_muted(db: &PgPool, recipient_id: i64, sender_id: i64) -> 
     .ok()
     .flatten()
     .is_some()
+}
+
+// Chat room functions
+async fn create_chat_room(db: &PgPool, room_id: &str, name: &str, creator_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO chat_rooms (id, name, creator_id) VALUES ($1, $2, $3)")
+        .bind(room_id)
+        .bind(name)
+        .bind(creator_id)
+        .execute(db)
+        .await?;
+    sqlx::query("INSERT INTO chat_room_members (room_id, user_id) VALUES ($1, $2)")
+        .bind(room_id)
+        .bind(creator_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn fetch_all_chat_rooms(db: &PgPool) -> Result<Vec<chatmessagediscordclone::protocol::ChatRoom>, sqlx::Error> {
+    use chatmessagediscordclone::protocol::ChatRoom;
+    let rows = sqlx::query(
+        "SELECT cr.id, cr.name, COUNT(crm.user_id)::int as member_count \
+         FROM chat_rooms cr \
+         LEFT JOIN chat_room_members crm ON cr.id = crm.room_id \
+         GROUP BY cr.id, cr.name"
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ChatRoom {
+            id: row.get::<String, _>("id"),
+            name: row.get::<String, _>("name"),
+            member_count: row.get::<i32, _>("member_count"),
+        })
+        .collect())
+}
+
+async fn add_room_member(db: &PgPool, room_id: &str, user_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO chat_room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(room_id)
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn fetch_room_members(db: &PgPool, room_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT u.username \
+         FROM chat_room_members crm \
+         JOIN users u ON crm.user_id = u.id \
+         WHERE crm.room_id = $1"
+    )
+    .bind(room_id)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("username"))
+        .collect())
+}
+
+async fn insert_room_message(db: &PgPool, sender_id: i64, room_id: &str, body: &str) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query("INSERT INTO messages (sender_id, room_id, body) VALUES ($1, $2, $3) RETURNING id")
+        .bind(sender_id)
+        .bind(room_id)
+        .bind(body)
+        .fetch_one(db)
+        .await?;
+    Ok(row.get::<i64, _>("id"))
+}
+
+async fn mark_message_read(db: &PgPool, message_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE messages SET read_at = NOW() WHERE id = $1 AND read_at IS NULL")
+        .bind(message_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+fn join_chat_room(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize, room_id: &str) {
+    if let Ok(mut guard) = peers.lock() {
+        if let Some(peer) = guard.get_mut(&id) {
+            peer.current_room = Some(room_id.to_string());
+        }
+    }
+}
+
+fn leave_chat_room(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize, _room_id: &str) {
+    if let Ok(mut guard) = peers.lock() {
+        if let Some(peer) = guard.get_mut(&id) {
+            peer.current_room = None;
+        }
+    }
+}
+
+fn broadcast_to_room(peers: &Arc<Mutex<HashMap<usize, Peer>>>, room_id: &str, payload: ServerToClient) {
+    let text = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    let targets = {
+        if let Ok(guard) = peers.lock() {
+            guard
+                .values()
+                .filter(|peer| peer.current_room.as_ref().map_or(false, |r| r == room_id))
+                .map(|peer| peer.tx.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
+    };
+
+    for tx in targets {
+        let _ = tx.send(Message::Text(text.clone()));
+    }
 }
