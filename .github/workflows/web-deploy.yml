@@ -17,6 +17,12 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          cache-targets: "true"
+
       - name: Install Trunk
         run: cargo install --locked trunk
 
