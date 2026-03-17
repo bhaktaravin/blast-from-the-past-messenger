@@ -2,6 +2,3 @@
 startCommand = "./server"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
-
-[[services]]
-name = "messenger-server"
