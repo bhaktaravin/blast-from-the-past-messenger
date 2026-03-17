@@ -1,6 +1,5 @@
 [build]
 builder = "nixpacks"
-buildCommand = "cargo build --release --bin server --features server"
 
 [deploy]
 startCommand = "./target/release/server"
