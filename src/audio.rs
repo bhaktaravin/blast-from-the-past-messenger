@@ -33,7 +33,7 @@ impl AudioManager {
         }
 
         let volume = self.volume;
-        tokio::task::spawn_blocking(move || {
+        std::thread::spawn(move || {
             let filename = match effect {
                 SoundEffect::BuddySignOn => "buddy-in.wav",
                 SoundEffect::BuddySignOff => "buddy-out.wav",
@@ -42,14 +42,10 @@ impl AudioManager {
             };
 
             if let Some(sound_data) = SoundAssets::get(filename) {
-                // Clone the data to move it into the closure
                 let data = sound_data.data.to_vec();
-
-                // Try to get default output stream
                 if let Ok((_stream, stream_handle)) = OutputStream::try_default() {
                     let cursor = Cursor::new(data);
                     if let Ok(source) = Decoder::new(cursor) {
-                        // Create sink and play sound
                         if let Ok(sink) = Sink::try_new(&stream_handle) {
                             sink.set_volume(volume);
                             sink.append(source);
