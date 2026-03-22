@@ -7,6 +7,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use futures_util::{SinkExt, StreamExt};
 use rand::rngs::OsRng;
+use redis::AsyncCommands;
 use sqlx::{PgPool, Row};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -19,13 +20,15 @@ use chatmessagediscordclone::protocol::{
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
+type RedisPool = Arc<redis::Client>;
+
 #[derive(Clone)]
 struct Peer {
     user_id: Option<i64>,
     username: String,
     away: Option<String>,
     tx: mpsc::UnboundedSender<Message>,
-    current_room: Option<String>, // Track which chat room user is in
+    current_room: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -37,19 +40,23 @@ struct RateState {
 #[tokio::main]
 async fn main() {
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
-    let database_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL is required");
-    // DEBUG: Print the database URL (remove after debugging!)
-    println!("[DEBUG] DATABASE_URL: {}", database_url);
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+    let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL is required");
+
     let db = PgPool::connect(&database_url)
         .await
         .expect("failed to connect to database");
     init_db(&db).await.expect("failed to init database");
 
-    let listener = TcpListener::bind(&addr)
-        .await
-        .expect("failed to bind address");
+    let redis = Arc::new(redis::Client::open(redis_url).expect("Invalid REDIS_URL"));
+    // Verify Redis connection on startup
+    {
+        let mut conn = redis.get_async_connection().await.expect("Failed to connect to Redis");
+        let _: () = redis::cmd("PING").query_async(&mut conn).await.expect("Redis PING failed");
+        println!("Connected to Redis");
+    }
 
+    let listener = TcpListener::bind(&addr).await.expect("failed to bind address");
     println!("AOL-style chat server running on ws://{addr}");
 
     let peers: Arc<Mutex<HashMap<usize, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -66,9 +73,10 @@ async fn main() {
 
         let peer_map = Arc::clone(&peers);
         let db = db.clone();
+        let redis = Arc::clone(&redis);
         let rate_limits = Arc::clone(&rate_limits);
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, peer_map, db, rate_limits).await {
+            if let Err(err) = handle_connection(stream, peer_map, db, redis, rate_limits).await {
                 eprintln!("connection error: {err}");
             }
         });
@@ -79,6 +87,7 @@ async fn handle_connection(
     stream: tokio::net::TcpStream,
     peers: Arc<Mutex<HashMap<usize, Peer>>>,
     db: PgPool,
+    redis: RedisPool,
     rate_limits: Arc<Mutex<HashMap<i64, RateState>>>,
 ) -> Result<(), String> {
     let ws_stream = accept_async(stream)
@@ -130,7 +139,7 @@ async fn handle_connection(
         match message {
             Ok(Message::Text(text)) => {
                 if let Ok(event) = serde_json::from_str::<ClientToServer>(&text) {
-                    handle_client_event(id, event, &peers, &db, &rate_limits).await;
+                    handle_client_event(id, event, &peers, &db, &redis, &rate_limits).await;
                 }
             }
             Ok(Message::Close(_)) => break,
@@ -155,6 +164,7 @@ async fn handle_client_event(
     event: ClientToServer,
     peers: &Arc<Mutex<HashMap<usize, Peer>>>,
     db: &PgPool,
+    redis: &RedisPool,
     rate_limits: &Arc<Mutex<HashMap<i64, RateState>>>,
 ) {
     match event {
@@ -162,6 +172,7 @@ async fn handle_client_event(
             match create_user(db, &username, &password).await {
                 Ok(user_id) => {
                     set_peer_auth(peers, id, user_id, username.clone());
+                    save_session(redis, user_id, &username).await;
                     send_to_peer(peers, id, ServerToClient::AuthOk { username });
                     broadcast_presence(peers);
                     send_threads_to_peer(db, peers, id, user_id).await;
@@ -175,6 +186,7 @@ async fn handle_client_event(
             match verify_user(db, &username, &password).await {
                 Ok(user_id) => {
                     set_peer_auth(peers, id, user_id, username.clone());
+                    save_session(redis, user_id, &username).await;
                     send_to_peer(peers, id, ServerToClient::AuthOk { username });
                     broadcast_presence(peers);
                     send_threads_to_peer(db, peers, id, user_id).await;
@@ -779,6 +791,31 @@ fn set_peer_auth(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize, user_id: i
             peer.user_id = Some(user_id);
             peer.username = username;
         }
+    }
+}
+
+// Store session in Redis: key = "session:{user_id}", value = username, TTL = 24h
+async fn save_session(redis: &RedisPool, user_id: i64, username: &str) {
+    match redis.get_async_connection().await {
+        Ok(mut conn) => {
+            let key = format!("session:{user_id}");
+            let _: Result<(), _> = conn.set_ex(&key, username, 86400).await;
+        }
+        Err(e) => eprintln!("Redis session save failed: {e}"),
+    }
+}
+
+// Look up a session from Redis by user_id, returns username if found
+async fn get_session(redis: &RedisPool, user_id: i64) -> Option<String> {
+    let mut conn = redis.get_async_connection().await.ok()?;
+    conn.get(format!("session:{user_id}")).await.ok()
+}
+
+// Remove session from Redis on explicit logout (future use)
+#[allow(dead_code)]
+async fn delete_session(redis: &RedisPool, user_id: i64) {
+    if let Ok(mut conn) = redis.get_async_connection().await {
+        let _: Result<(), _> = conn.del(format!("session:{user_id}")).await;
     }
 }
 
