@@ -51,7 +51,7 @@ jobs:
       - name: Set DATABASE_URL
         run: echo "DATABASE_URL=postgres://postgres:[YOUR-PASSWORD]@wcllqcbmnnxkllkmdkid.db.us-west-2.nhost.run:5432/wcllqcbmnnxkllkmdkid" >> $GITHUB_ENV
       - name: Build
-        run: cargo build --release --bin chatmessagediscordclone
+        run: cargo build --release --bin chatmessagediscordclone --features client
 
       - name: Create DMG
         run: |
@@ -113,7 +113,7 @@ jobs:
       - name: Set DATABASE_URL
         run: echo "DATABASE_URL=postgres://postgres:[YOUR-PASSWORD]@wcllqcbmnnxkllkmdkid.db.us-west-2.nhost.run:5432/wcllqcbmnnxkllkmdkid" >> $GITHUB_ENV
       - name: Build
-        run: cargo build --release --bin chatmessagediscordclone
+        run: cargo build --release --bin chatmessagediscordclone --features client
 
       - name: Create Zip
         shell: powershell
@@ -159,7 +159,7 @@ jobs:
       - name: Set DATABASE_URL
         run: echo "DATABASE_URL=postgres://postgres:[YOUR-PASSWORD]@wcllqcbmnnxkllkmdkid.db.us-west-2.nhost.run:5432/wcllqcbmnnxkllkmdkid" >> $GITHUB_ENV
       - name: Build
-        run: cargo build --release --bin chatmessagediscordclone
+        run: cargo build --release --bin chatmessagediscordclone --features client
 
       - name: Create tarball
         run: |

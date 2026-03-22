@@ -26,8 +26,11 @@ jobs:
       - name: Install Trunk
         run: cargo install --locked trunk
 
+      - name: Install wasm-opt
+        run: cargo install wasm-opt --locked
+
       - name: Build Web
-        run: trunk build --release --public-url /blast-from-the-past-messenger/
+        run: trunk build --release --public-url /blast-from-the-past-messenger/ -- --features client
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
