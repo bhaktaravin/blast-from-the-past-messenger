@@ -2,6 +2,6 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "./target/release/server"
+startCommand = "/app/target/release/server"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
