@@ -39,6 +39,8 @@ async fn main() {
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL is required");
+    // DEBUG: Print the database URL (remove after debugging!)
+    println!("[DEBUG] DATABASE_URL: {}", database_url);
     let db = PgPool::connect(&database_url)
         .await
         .expect("failed to connect to database");
