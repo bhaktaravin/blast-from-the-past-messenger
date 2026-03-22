@@ -1,7 +1,8 @@
 [build]
-builder = "nixpacks"
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.server"
 
 [deploy]
-startCommand = "/app/target/release/server"
+startCommand = "/app/server"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
