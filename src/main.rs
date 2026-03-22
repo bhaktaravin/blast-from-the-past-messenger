@@ -80,7 +80,7 @@ mod mpsc {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "client"))]
 use chatmessagediscordclone::audio::{AudioManager, SoundEffect};
 use chatmessagediscordclone::protocol::{
     ClientToServer, HistoryTarget, ServerToClient, UserStatus,
