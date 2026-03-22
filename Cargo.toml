@@ -19,6 +19,7 @@ server = []  # Feature to enable server binary (native only)
 client = ["eframe", "egui", "rodio"]  # Feature to enable audio/client deps
 
 [dependencies]
+eframe = "0.27"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
