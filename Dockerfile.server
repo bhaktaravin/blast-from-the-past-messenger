@@ -1,4 +1,4 @@
-FROM rust:latest AS build
+FROM rust:bookworm AS build
 
 WORKDIR /app
 RUN apt-get update && apt-get install -y \
