@@ -38,9 +38,7 @@ struct RateState {
 async fn main() {
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
     let database_url = std::env::var("DATABASE_URL")
-        .or_else(|_| std::env::var("SUPABASE_DB_URL"))
-        .or_else(|_| std::env::var("SUPABASE_URL"))
-        .expect("DATABASE_URL, SUPABASE_DB_URL, or SUPABASE_URL is required");
+        .expect("DATABASE_URL is required");
     let db = PgPool::connect(&database_url)
         .await
         .expect("failed to connect to database");
