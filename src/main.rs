@@ -825,6 +825,19 @@ impl eframe::App for AolApp {
         }
         self.process_net_events();
         
+        // On native, timeout login after 15 seconds
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.logging_in {
+            if let Some(start) = self.login_started_at {
+                if start.elapsed().as_secs() >= 15 {
+                    self.logging_in = false;
+                    self.login_started_at = None;
+                    self.status = "Connection timed out. Check the server URL.".to_string();
+                    self.show_toast(self.status.clone(), ToastKind::Error);
+                }
+            }
+        }
+
         // On web, timeout login after 3 seconds (web networking is stubbed)
         #[cfg(target_arch = "wasm32")]
         if self.logging_in && self.screen == Screen::SignIn {
@@ -1632,7 +1645,14 @@ async fn run_connection(
     ui_rx: &mut mpsc::UnboundedReceiver<UiToNet>,
     net_tx: &std_mpsc::Sender<NetToUi>,
 ) -> Result<(), String> {
-    let (ws_stream, _) = connect_async(&url).await.map_err(|err| err.to_string())?;
+    let connect_future = connect_async(&url);
+    let (ws_stream, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        connect_future,
+    )
+    .await
+    .map_err(|_| format!("Connection timed out after 10s — is the server running?"))?
+    .map_err(|err| err.to_string())?;
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
     match mode {
