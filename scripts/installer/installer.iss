@@ -1,12 +1,12 @@
 #define AppName "Blast From The Past Messenger"
-#define AppVersion "0.1.0"
+#define AppVersion "0.1.6"
 #define AppExe "chatmessagediscordclone.exe"
 
 #define EnvRoot GetEnv("GITHUB_WORKSPACE")
 #if EnvRoot != ""
-	#define RootDir EnvRoot + "\\"
+  #define RootDir EnvRoot + "\\"
 #else
-	#define RootDir SourcePath + "..\\..\\"
+  #define RootDir SourcePath + "..\\..\\"
 #endif
 
 [Setup]
@@ -21,9 +21,12 @@ OutputDir={#RootDir}dist
 OutputBaseFilename=blast-from-the-past-messenger-setup
 Compression=lzma
 SolidCompression=yes
+SetupIconFile=
+UninstallDisplayIcon={app}\{#AppExe}
 
 [Files]
 Source: "{#RootDir}target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RootDir}assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"

@@ -30,7 +30,7 @@ jobs:
         run: cargo install wasm-opt --locked
 
       - name: Build Web
-        run: trunk build --release --public-url /blast-from-the-past-messenger/ -- --features client
+        run: trunk build --release --public-url /blast-from-the-past-messenger/
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3

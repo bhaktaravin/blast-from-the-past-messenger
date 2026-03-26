@@ -7,6 +7,7 @@ command_arguments = ["Building Blast From The Past Messenger for Web..."]
 target = "index.html"
 dist = "dist"
 public-url = "/"
+features = "client"
 
 [watch]
 ignore = ["dist", "target", "src/bin"]

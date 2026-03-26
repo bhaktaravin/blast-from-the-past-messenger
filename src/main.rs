@@ -632,9 +632,16 @@ impl AolApp {
                     // Store member list - could be used for UI display
                 }
                 NetToUi::UserTyping { room_id, username } => {
-                    self.typing_users.entry(room_id.clone()).or_default().push(username);
+                    let key = format!("{}:{}", room_id, username);
+                    self.typing_timeout.insert(key, std::time::Instant::now());
+                    let users = self.typing_users.entry(room_id).or_default();
+                    if !users.contains(&username) {
+                        users.push(username);
+                    }
                 }
                 NetToUi::UserStoppedTyping { room_id, username } => {
+                    let key = format!("{}:{}", room_id, username);
+                    self.typing_timeout.remove(&key);
                     if let Some(users) = self.typing_users.get_mut(&room_id) {
                         users.retain(|u| u != &username);
                     }
@@ -1415,28 +1422,75 @@ impl eframe::App for AolApp {
                             ui.label("Say hi to start a conversation.");
                         }
                     });
-                    ui.add_space(6.0);
+                    // Typing indicator
+                    let typing_key = match &self.selected_target {
+                        ChatTarget::Lobby => "lobby".to_string(),
+                        ChatTarget::Room(id) => id.clone(),
+                        ChatTarget::Direct(name) => name.clone(),
+                    };
+                    // Clear stale typing indicators (older than 5 seconds)
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let now = std::time::Instant::now();
+                        let stale: Vec<String> = self.typing_timeout.iter()
+                            .filter(|(_, t)| now.duration_since(**t).as_secs() >= 5)
+                            .map(|(k, _)| k.clone())
+                            .collect();
+                        for key in stale {
+                            if let Some((room, user)) = key.split_once(':') {
+                                if let Some(users) = self.typing_users.get_mut(room) {
+                                    users.retain(|u| u != user);
+                                }
+                                self.typing_timeout.remove(&key);
+                            }
+                        }
+                    }
+                    if let Some(typers) = self.typing_users.get(&typing_key) {
+                        let typers: Vec<_> = typers.iter()
+                            .filter(|u| Some(*u) != self.logged_in_user.as_ref())
+                            .collect();
+                        if !typers.is_empty() {
+                            let text = if typers.len() == 1 {
+                                format!("{} is typing...", typers[0])
+                            } else {
+                                format!("{} people are typing...", typers.len())
+                            };
+                            ui.label(egui::RichText::new(text).small().italics().color(egui::Color32::GRAY));
+                        }
+                    }
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.chat_input)
-                                .hint_text("Type your message... (Ctrl+Enter to send)")
+                                .hint_text("Type a message and press Enter to send")
                                 .desired_width(f32::INFINITY),
                         );
 
-                        // Multiple ways to send:
-                        // 1. Click Send button
-                        // 2. Press Enter when not focused (lost focus)
-                        // 3. Press Ctrl/Cmd+Enter while typing
+                        // Send on Enter (no modifier needed), or clicking Send
                         let should_send = ui.button("Send").clicked()
-                            || (response.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                             || (response.has_focus()
-                                && ui.input(|i| {
-                                    i.key_pressed(egui::Key::Enter)
-                                        && (i.modifiers.command || i.modifiers.ctrl)
-                                }));
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+
+                        // Typing indicators — notify server when input changes
+                        if response.has_focus() && response.changed() {
+                            let room_key = match &self.selected_target {
+                                ChatTarget::Room(id) => Some(id.clone()),
+                                _ => None,
+                            };
+                            if let Some(room_id) = room_key {
+                                if self.chat_input.is_empty() {
+                                    let _ = self.network.tx.send(UiToNet::StopTyping { room_id });
+                                } else {
+                                    let _ = self.network.tx.send(UiToNet::StartTyping { room_id });
+                                }
+                            }
+                        }
 
                         if should_send {
+                            // Stop typing indicator when message is sent
+                            if let ChatTarget::Room(room_id) = &self.selected_target.clone() {
+                                let _ = self.network.tx.send(UiToNet::StopTyping { room_id: room_id.clone() });
+                            }
                             self.send_chat();
                             response.request_focus();
                         }
