@@ -2158,37 +2158,59 @@ async fn run_connection(
 ) -> Result<(), String> {
     eprintln!("[DEBUG] Connecting to: {}", url);
 
-    // Use raw TCP + client_async to avoid rustls interfering with plain ws://
-    let host_port = url
-        .trim_start_matches("wss://")
-        .trim_start_matches("ws://")
-        .split('/')
-        .next()
-        .unwrap_or("localhost:9001");
-    eprintln!("[DEBUG] TCP connecting to: {}", host_port);
-    let tcp = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::net::TcpStream::connect(host_port),
-    )
-    .await
-    .map_err(|_| "Connection timed out — is the server running?".to_string())?
-    .map_err(|e| { eprintln!("[DEBUG] TCP error: {}", e); e.to_string() })?;
-    eprintln!("[DEBUG] TCP connected, upgrading to WebSocket...");
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut req = url.as_str().into_client_request().map_err(|e| e.to_string())?;
-    req.headers_mut().insert(
-        "Host",
-        host_port.parse().map_err(|e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| e.to_string())?,
-    );
-    let (ws_stream, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio_tungstenite::client_async(req, tcp),
-    )
-    .await
-    .map_err(|_| "WebSocket handshake timed out".to_string())?
-    .map_err(|e| { eprintln!("[DEBUG] WS handshake error: {}", e); e.to_string() })?;
-    eprintln!("[DEBUG] WebSocket connected!");
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+    // ws:// — plain TCP to avoid rustls interference
+    // wss:// — connect_async with TLS
+    if url.starts_with("ws://") {
+        let host_port = url.trim_start_matches("ws://").split('/').next()
+            .unwrap_or("localhost:9001");
+        eprintln!("[DEBUG] TCP connecting to: {}", host_port);
+        let tcp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::net::TcpStream::connect(host_port),
+        )
+        .await
+        .map_err(|_| "Connection timed out — is the server running?".to_string())?
+        .map_err(|e| e.to_string())?;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = url.as_str().into_client_request().map_err(|e| e.to_string())?;
+        req.headers_mut().insert("Host",
+            host_port.parse().map_err(|e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| e.to_string())?);
+        let (ws, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio_tungstenite::client_async(req, tcp),
+        )
+        .await
+        .map_err(|_| "WebSocket handshake timed out".to_string())?
+        .map_err(|e| e.to_string())?;
+        eprintln!("[DEBUG] WebSocket connected!");
+        run_ws(ws, username, password, mode, ui_rx, net_tx).await
+    } else {
+        eprintln!("[DEBUG] TLS connecting...");
+        let (ws, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            connect_async(&url),
+        )
+        .await
+        .map_err(|_| "Connection timed out — is the server running?".to_string())?
+        .map_err(|e| e.to_string())?;
+        eprintln!("[DEBUG] TLS WebSocket connected!");
+        run_ws(ws, username, password, mode, ui_rx, net_tx).await
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_ws<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    username: String,
+    password: String,
+    mode: AuthMode,
+    ui_rx: &mut mpsc::UnboundedReceiver<UiToNet>,
+    net_tx: &std_mpsc::Sender<NetToUi>,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut ws_tx, mut ws_rx) = ws.split();
 
     match mode {
         AuthMode::Login => {

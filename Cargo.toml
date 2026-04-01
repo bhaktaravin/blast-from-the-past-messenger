@@ -34,7 +34,7 @@ base64 = "0.22"
 eframe = { version = "0.31", optional = true }
 egui = { version = "0.31", optional = true }
 tokio = { version = "1.36", features = ["macros", "rt-multi-thread", "sync", "net", "time"] }
-tokio-tungstenite = { version = "0.21" }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 argon2 = "0.5"
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
 rodio = { version = "0.19", optional = true }
