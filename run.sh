@@ -1,44 +1,40 @@
 #!/bin/bash
 set -e
 
-# Load .env
-if [ ! -f .env ]; then
-  echo "ERROR: .env file not found"
-  exit 1
+# Load .env if present (only needed for running a local server)
+if [ -f .env ]; then
+  set -a
+  source .env
+  set +a
 fi
 
-set -a
-source .env
-set +a
-
-if [ -z "$DATABASE_URL" ] || [ -z "$REDIS_URL" ]; then
-  echo "ERROR: DATABASE_URL and REDIS_URL must be set in .env"
-  exit 1
-fi
-
-echo "Building..."
-cargo build --bin server --features server
+echo "Building client..."
 cargo build --bin chatmessagediscordclone --features client
 
-echo "Starting server..."
-if nc -z localhost 9001 2>/dev/null; then
-  echo "Server already running on port 9001, skipping..."
-else
-  DATABASE_URL="$DATABASE_URL" REDIS_URL="$REDIS_URL" BIND_ADDR="$BIND_ADDR" \
-    ./target/debug/server &
-  SERVER_PID=$!
+# Only start a local server if DATABASE_URL and REDIS_URL are set
+if [ -n "$DATABASE_URL" ] && [ -n "$REDIS_URL" ]; then
+  if nc -z localhost 9001 2>/dev/null; then
+    echo "Server already running on port 9001, skipping..."
+  else
+    echo "Starting local server..."
+    cargo build --bin server --features server
+    BIND_ADDR="${BIND_ADDR:-0.0.0.0:9001}" ./target/debug/server &
+    SERVER_PID=$!
 
-  echo "Waiting for server on port 9001..."
-  for i in $(seq 1 30); do
-    if nc -z localhost 9001 2>/dev/null; then
-      echo "Server ready!"
-      break
-    fi
-    sleep 0.5
-  done
+    echo "Waiting for server on port 9001..."
+    for i in $(seq 1 30); do
+      if nc -z localhost 9001 2>/dev/null; then
+        echo "Server ready!"
+        break
+      fi
+      sleep 0.5
+    done
+  fi
+else
+  echo "No .env found — connecting to Railway server..."
 fi
 
 echo "Starting client..."
 ./target/debug/chatmessagediscordclone
 
-kill $SERVER_PID 2>/dev/null
+[ -n "$SERVER_PID" ] && kill $SERVER_PID 2>/dev/null
