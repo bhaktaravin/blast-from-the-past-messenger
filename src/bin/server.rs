@@ -196,6 +196,44 @@ async fn handle_client_event(
                 }
             }
         }
+        // E2E key exchange: relay public key to the target peer
+        ClientToServer::ExchangeKey { to, public_key } => {
+            let from = match get_peer_identity(peers, id) {
+                Some((name, _)) => name,
+                None => return,
+            };
+            if let Ok(Some(target_id)) = get_user_id_by_name(db, &to).await {
+                if let Some((target_peer_id, _)) = get_peer_by_user_id(peers, target_id) {
+                    send_to_peer(peers, target_peer_id, ServerToClient::KeyExchange { from, public_key });
+                }
+            }
+        }
+        // E2E encrypted DM: relay opaque ciphertext to target peer, store encrypted blob
+        ClientToServer::EncryptedDirectMessage { to, encrypted_body } => {
+            let (from, user_id) = match get_peer_identity(peers, id) {
+                Some(info) => info,
+                None => return,
+            };
+            if !allow_rate(rate_limits, user_id) {
+                send_to_peer(peers, id, ServerToClient::System { message: "Rate limit exceeded.".to_string() });
+                return;
+            }
+            if let Ok(Some(target_id)) = get_user_id_by_name(db, &to).await {
+                if is_blocked_or_muted(db, target_id, user_id).await {
+                    send_to_peer(peers, id, ServerToClient::System { message: "User is not accepting messages.".to_string() });
+                    return;
+                }
+                // Store the encrypted blob as-is (server cannot read it)
+                let _ = insert_message(db, user_id, Some(target_id), &format!("[e2e]{}", encrypted_body)).await;
+                if let Some((target_peer_id, _)) = get_peer_by_user_id(peers, target_id) {
+                    send_to_peer(peers, target_peer_id, ServerToClient::EncryptedDirectMessage {
+                        from: from.clone(),
+                        encrypted_body: encrypted_body.clone(),
+                    });
+                }
+                send_threads_to_peer(db, peers, id, user_id).await;
+            }
+        }
         ClientToServer::SetAway { away } => {
             if !is_authed(peers, id) {
                 send_to_peer(

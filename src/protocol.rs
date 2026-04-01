@@ -35,6 +35,10 @@ pub struct ChatRoom {
 pub enum ClientToServer {
     Register { username: String, password: String },
     Login { username: String, password: String },
+    /// E2E key exchange: send our public key to a peer via the server
+    ExchangeKey { to: String, public_key: String },
+    /// E2E encrypted DM — body is base64(nonce + ciphertext), opaque to server
+    EncryptedDirectMessage { to: String, encrypted_body: String },
     SetAway { away: Option<String> },
     Chat { body: String },
     DirectMessage { to: String, body: String },
@@ -66,6 +70,10 @@ pub enum ServerToClient {
     Welcome { message: String },
     AuthOk { username: String },
     AuthError { message: String },
+    /// Relay a peer's public key to us for E2E key exchange
+    KeyExchange { from: String, public_key: String },
+    /// Relay an encrypted DM — body is opaque to the server
+    EncryptedDirectMessage { from: String, encrypted_body: String },
     Presence { users: Vec<UserStatus> },
     Chat { from: String, body: String },
     DirectMessage { from: String, body: String },

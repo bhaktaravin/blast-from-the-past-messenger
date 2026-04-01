@@ -4,6 +4,16 @@ use std::sync::mpsc as std_mpsc;
 use chrono::Utc;
 use eframe::egui;
 
+// E2E encryption (native only — x25519 + chacha20poly1305)
+#[cfg(not(target_arch = "wasm32"))]
+use x25519_dalek::{PublicKey, StaticSecret};
+#[cfg(not(target_arch = "wasm32"))]
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+#[cfg(not(target_arch = "wasm32"))]
+use chacha20poly1305::aead::{Aead, KeyInit};
+#[cfg(not(target_arch = "wasm32"))]
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
 // Platform-specific timing
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -175,6 +185,10 @@ enum UiToNet {
     },
     SendChat { body: String },
     SendDirect { to: String, body: String },
+    /// Send our X25519 public key to a peer to initiate E2E
+    ExchangeKey { to: String, public_key: String },
+    /// Send an E2E encrypted DM (body is base64 nonce+ciphertext)
+    SendEncryptedDirect { to: String, encrypted_body: String },
     FetchHistory { target: ChatTarget },
     FetchThreads,
     Search { target: ChatTarget, query: String },
@@ -205,6 +219,10 @@ enum NetToUi {
     Presence(Vec<UserStatus>),
     Chat { from: String, body: String },
     DirectMessage { from: String, body: String },
+    /// Peer sent us their public key for E2E key exchange
+    KeyExchange { from: String, public_key: String },
+    /// Received an E2E encrypted DM
+    EncryptedDirectMessage { from: String, encrypted_body: String },
     Threads(Vec<String>),
     History { target: ChatTarget, messages: Vec<ChatMessage> },
     SearchResults {
@@ -292,11 +310,43 @@ struct AolApp {
     typing_timeout: std::collections::HashMap<String, std::time::Instant>, // user -> when they stop typing
     // Read receipts
     message_read_status: std::collections::HashMap<i64, Vec<String>>, // message_id -> list of users who read
+    // E2E encryption: shared secrets keyed by peer username (native only)
+    // Stored as raw 32-byte arrays to avoid lifetime issues with x25519_dalek types
+    #[cfg(not(target_arch = "wasm32"))]
+    e2e_shared_secrets: HashMap<String, [u8; 32]>,
+    // Pending outbound secret (waiting for peer's public key ack)
+    #[cfg(not(target_arch = "wasm32"))]
+    e2e_pending_secret: Option<(String, [u8; 32])>,
+    // Login screen animation state
+    login_anim_time: f32,
+    login_typewriter_pos: usize,
+    login_scanline_offset: f32,
+    // Boot sequence
+    boot_done: bool,
+    boot_line: usize,
+    boot_line_timer: f32,
+    // Matrix rain
+    matrix_cols: Vec<MatrixCol>,
+    matrix_initialized: bool,
+    // Dial-up modem animation
+    modem_line: usize,
+    modem_line_timer: f32,
+    modem_char_pos: usize,
 }
 
 struct SearchResult {
     query: String,
     messages: Vec<ChatMessage>,
+}
+
+/// One column of falling characters in the matrix rain background
+struct MatrixCol {
+    x: f32,
+    y: f32,
+    speed: f32,
+    chars: Vec<char>,
+    head: usize,
+    length: usize,
 }
 
 impl AolApp {
@@ -401,6 +451,21 @@ impl AolApp {
             typing_users: HashMap::new(),
             typing_timeout: HashMap::new(),
             message_read_status: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            e2e_shared_secrets: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            e2e_pending_secret: None,
+            login_anim_time: 0.0,
+            login_typewriter_pos: 0,
+            login_scanline_offset: 0.0,
+            boot_done: false,
+            boot_line: 0,
+            boot_line_timer: 0.0,
+            matrix_cols: Vec::new(),
+            matrix_initialized: false,
+            modem_line: 0,
+            modem_line_timer: 0.0,
+            modem_char_pos: 0,
         }
     }
 
@@ -517,7 +582,27 @@ impl AolApp {
                     });
                     self.audio_manager.play(SoundEffect::MessageReceived);
                 }
-                NetToUi::Threads(users) => {
+                NetToUi::KeyExchange { from, public_key } => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    self.complete_e2e(&from.clone(), &public_key.clone());
+                }
+                NetToUi::EncryptedDirectMessage { from, encrypted_body } => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let body = self.decrypt_dm(&from, &encrypted_body)
+                        .unwrap_or_else(|| "🔒 [encrypted — could not decrypt]".to_string());
+                    #[cfg(target_arch = "wasm32")]
+                    let body = "🔒 [encrypted]".to_string();
+                    let target = ChatTarget::Direct(from.clone());
+                    let entry = self.messages.entry(target).or_default();
+                    entry.push(ChatMessage {
+                        from,
+                        body,
+                        at: Utc::now().to_rfc3339(),
+                        id: None,
+                        read_count: None,
+                    });
+                    self.audio_manager.play(SoundEffect::MessageReceived);
+                }                NetToUi::Threads(users) => {
                     self.recent_threads = users;
                 }
                 NetToUi::History { target, messages } => {
@@ -677,7 +762,13 @@ impl AolApp {
         } else if let Some(stripped) = url.strip_prefix("http://") {
             url = format!("ws://{stripped}");
         } else if !url.starts_with("ws://") && !url.starts_with("wss://") {
-            url = format!("wss://{url}");
+            // Default to ws:// for localhost, wss:// for everything else
+            let is_local = url.starts_with("localhost") || url.starts_with("127.0.0.1") || url.starts_with("0.0.0.0");
+            if is_local {
+                url = format!("ws://{url}");
+            } else {
+                url = format!("wss://{url}");
+            }
         }
         self.server_url = url.clone();
         let _ = self.network.tx.send(UiToNet::Connect {
@@ -693,7 +784,8 @@ impl AolApp {
         if body.is_empty() {
             return;
         }
-        match &self.selected_target {
+        let selected = self.selected_target.clone();
+        match selected {
             ChatTarget::Lobby => {
                 let _ = self
                     .network
@@ -701,10 +793,22 @@ impl AolApp {
                     .send(UiToNet::SendChat { body: body.clone() });
             }
             ChatTarget::Direct(target) => {
-                let _ = self.network.tx.send(UiToNet::SendDirect {
-                    to: target.clone(),
-                    body: body.clone(),
-                });
+                #[cfg(not(target_arch = "wasm32"))]
+                let sent_encrypted = self.send_encrypted_dm(&target, &body);
+                #[cfg(target_arch = "wasm32")]
+                let sent_encrypted = false;
+
+                if !sent_encrypted {
+                    let _ = self.network.tx.send(UiToNet::SendDirect {
+                        to: target.clone(),
+                        body: body.clone(),
+                    });
+                }
+                let display_body = if sent_encrypted {
+                    format!("🔒 {}", body)
+                } else {
+                    body.clone()
+                };
                 let entry = self
                     .messages
                     .entry(ChatTarget::Direct(target.clone()))
@@ -714,7 +818,7 @@ impl AolApp {
                         .logged_in_user
                         .clone()
                         .unwrap_or_else(|| "Me".to_string()),
-                    body,
+                    body: display_body,
                     at: Utc::now().to_rfc3339(),
                     id: None,
                     read_count: None,
@@ -749,6 +853,113 @@ impl AolApp {
             Some(Self::sanitize_input(&self.away_text))
         };
         let _ = self.network.tx.send(UiToNet::SetAway { away });
+    }
+
+    /// Initiate E2E key exchange with a DM peer (native only)
+    #[cfg(not(target_arch = "wasm32"))]
+    fn initiate_e2e_static(&mut self, peer: &str) {
+        use rand::rngs::OsRng;
+        let our_secret = StaticSecret::random_from_rng(OsRng);
+        let our_public = PublicKey::from(&our_secret);
+        let pub_encoded = BASE64.encode(our_public.to_bytes());
+        let secret_bytes: [u8; 32] = our_secret.to_bytes();
+        self.e2e_pending_secret = Some((peer.to_string(), secret_bytes));
+        let _ = self.network.tx.send(UiToNet::ExchangeKey {
+            to: peer.to_string(),
+            public_key: pub_encoded,
+        });
+        self.show_toast(format!("🔐 Initiating E2E with {}...", peer), ToastKind::Info);
+    }
+
+    /// Complete E2E key exchange when we receive a peer's public key
+    #[cfg(not(target_arch = "wasm32"))]
+    fn complete_e2e(&mut self, from: &str, their_pub_b64: &str) {
+        use rand::rngs::OsRng;
+
+        // If we have a pending secret for this peer, complete the DH
+        if let Some((pending_peer, our_secret_bytes)) = self.e2e_pending_secret.take() {
+            if pending_peer == from {
+                if let Ok(their_pub_bytes) = BASE64.decode(their_pub_b64) {
+                    if their_pub_bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&their_pub_bytes);
+                        let their_public = PublicKey::from(arr);
+                        let our_secret = StaticSecret::from(our_secret_bytes);
+                        let shared = our_secret.diffie_hellman(&their_public);
+                        self.e2e_shared_secrets.insert(from.to_string(), *shared.as_bytes());
+                        self.show_toast(format!("🔒 E2E enabled with {}", from), ToastKind::Success);
+                        return;
+                    }
+                }
+            } else {
+                // Put it back if it was for a different peer
+                self.e2e_pending_secret = Some((pending_peer, our_secret_bytes));
+            }
+        }
+
+        // They initiated — respond with our public key and compute shared secret
+        if let Ok(their_pub_bytes) = BASE64.decode(their_pub_b64) {
+            if their_pub_bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&their_pub_bytes);
+                let their_public = PublicKey::from(arr);
+                let our_secret = StaticSecret::random_from_rng(OsRng);
+                let our_public = PublicKey::from(&our_secret);
+                let shared = our_secret.diffie_hellman(&their_public);
+                self.e2e_shared_secrets.insert(from.to_string(), *shared.as_bytes());
+                // Send our public key back
+                let pub_encoded = BASE64.encode(our_public.to_bytes());
+                let _ = self.network.tx.send(UiToNet::ExchangeKey {
+                    to: from.to_string(),
+                    public_key: pub_encoded,
+                });
+                self.show_toast(format!("🔒 E2E enabled with {}", from), ToastKind::Success);
+            }
+        }
+    }
+
+    /// Encrypt and send a DM using E2E if a shared secret exists
+    #[cfg(not(target_arch = "wasm32"))]
+    fn send_encrypted_dm(&mut self, to: &str, body: &str) -> bool {
+        use rand::RngCore;
+        let secret_bytes = match self.e2e_shared_secrets.get(to) {
+            Some(b) => *b,
+            None => return false,
+        };
+        let key = Key::from_slice(&secret_bytes);
+        let cipher = ChaCha20Poly1305::new(key);
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        match cipher.encrypt(nonce, body.as_bytes()) {
+            Ok(ciphertext) => {
+                let mut payload = nonce_bytes.to_vec();
+                payload.extend_from_slice(&ciphertext);
+                let encoded = BASE64.encode(&payload);
+                let _ = self.network.tx.send(UiToNet::SendEncryptedDirect {
+                    to: to.to_string(),
+                    encrypted_body: encoded,
+                });
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Decrypt an incoming E2E DM
+    #[cfg(not(target_arch = "wasm32"))]
+    fn decrypt_dm(&self, from: &str, encrypted_body: &str) -> Option<String> {
+        let secret_bytes = self.e2e_shared_secrets.get(from)?;
+        let payload = BASE64.decode(encrypted_body).ok()?;
+        if payload.len() < 12 {
+            return None;
+        }
+        let (nonce_bytes, ciphertext) = payload.split_at(12);
+        let key = Key::from_slice(secret_bytes);
+        let cipher = ChaCha20Poly1305::new(key);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let plaintext = cipher.decrypt(nonce, ciphertext).ok()?;
+        String::from_utf8(plaintext).ok()
     }
 
     fn send_moderation(&mut self, action: UiToNet) {
@@ -812,10 +1023,10 @@ impl AolApp {
         egui::TopBottomPanel::top("toast_bar")
             .exact_height(32.0)
             .show(ctx, |ui| {
-                let frame = egui::Frame::none()
+                let frame = egui::Frame::new()
                     .fill(fill)
                     .stroke(stroke)
-                    .inner_margin(egui::Margin::symmetric(10.0, 6.0));
+                    .inner_margin(egui::Margin::symmetric(10.0 as i8, 6.0 as i8));
                 frame.show(ui, |ui| {
                     ui.label(toast.text.clone());
                 });
@@ -878,68 +1089,252 @@ impl eframe::App for AolApp {
 
         match self.screen {
             Screen::SignIn => {
+                // Advance animation timers
+                let dt = ctx.input(|i| i.stable_dt).min(0.05);
+                self.login_anim_time += dt;
+                self.login_scanline_offset = (self.login_scanline_offset + dt * 60.0) % 8.0;
+                ctx.request_repaint();
+
+                let amber       = egui::Color32::from_rgb(240, 168,  58);
+                let amber_dim   = egui::Color32::from_rgb( 90,  55,  10);
+                let amber_bright= egui::Color32::from_rgb(255, 210, 100);
+                let green_matrix= egui::Color32::from_rgb(  0, 200,  80);
+
                 let (card_fill, card_stroke, text_color) = match self.theme {
                     Theme::Light => (
                         egui::Color32::from_rgb(255, 250, 235),
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 200, 175)),
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(210, 200, 175)),
                         egui::Color32::from_rgb(35, 30, 25),
                     ),
                     Theme::Dark => (
-                        egui::Color32::from_rgb(40, 38, 36),
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 85, 80)),
+                        egui::Color32::from_rgb(28, 26, 24),
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 85, 80)),
                         egui::Color32::from_rgb(235, 225, 210),
                     ),
                     Theme::MidnightAmber => (
-                        egui::Color32::from_rgb(36, 33, 28),
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(92, 70, 48)),
+                        egui::Color32::from_rgba_unmultiplied(28, 22, 12, 230),
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 80, 20)),
                         egui::Color32::from_rgb(231, 220, 198),
                     ),
                 };
+
+                // ── top bar ──────────────────────────────────────────────
                 egui::TopBottomPanel::top("signin_top").show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.colored_label(text_color, "AOL-Style Messenger");
+                        ui.colored_label(amber, "◈ AOL-Style Messenger");
                         ui.separator();
                         let bg_label = if self.show_background { "BG: On" } else { "BG: Off" };
-                        if ui.button(bg_label).clicked() {
-                            self.show_background = !self.show_background;
-                        }
+                        if ui.button(bg_label).clicked() { self.show_background = !self.show_background; }
                         let label = match self.theme {
                             Theme::Light => "Dark Mode",
-                            Theme::Dark => "Midnight Amber",
+                            Theme::Dark  => "Midnight Amber",
                             Theme::MidnightAmber => "Light Mode",
                         };
-                        if ui.button("Refresh UI").clicked() {
-                            ctx.request_repaint();
-                        }
-                        if ui.button(label).clicked() {
-                            self.toggle_theme(ctx);
-                        }
+                        if ui.button("Refresh UI").clicked() { ctx.request_repaint(); }
+                        if ui.button(label).clicked() { self.toggle_theme(ctx); }
                     });
                 });
 
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    let panel_rect = ui.max_rect();
+
+                    // ── Matrix rain background ────────────────────────────
+                    {
+                        let matrix_chars: Vec<char> =
+                            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*<>?/\\|~^"
+                            .chars().collect();
+                        let col_w = 14.0_f32;
+                        let num_cols = (panel_rect.width() / col_w).ceil() as usize;
+
+                        if !self.matrix_initialized || self.matrix_cols.len() != num_cols {
+                            self.matrix_cols = (0..num_cols).map(|i| {
+                                let seed = (i * 7 + 3) as f32;
+                                MatrixCol {
+                                    x: panel_rect.left() + i as f32 * col_w + col_w * 0.5,
+                                    y: -(seed % 300.0),
+                                    speed: 40.0 + (seed * 13.7) % 80.0,
+                                    chars: {
+                                        let len = 6 + (i * 3 + 2) % 10;
+                                        (0..len).map(|j| matrix_chars[(i * 3 + j * 7) % matrix_chars.len()]).collect()
+                                    },
+                                    head: 0,
+                                    length: 6 + (i * 3 + 2) % 10,
+                                }
+                            }).collect();
+                            self.matrix_initialized = true;
+                        }
+
+                        let painter = ui.painter();
+                        let char_h = 14.0_f32;
+
+                        for col in &mut self.matrix_cols {
+                            col.y += col.speed * dt;
+                            let total_h = col.length as f32 * char_h;
+                            if col.y > panel_rect.bottom() + total_h {
+                                col.y = panel_rect.top() - total_h;
+                                // Shuffle chars
+                                for (j, c) in col.chars.iter_mut().enumerate() {
+                                    *c = matrix_chars[(col.head + j * 11) % matrix_chars.len()];
+                                }
+                                col.head = (col.head + 1) % matrix_chars.len();
+                            }
+
+                            for (j, ch) in col.chars.iter().enumerate() {
+                                let cy = col.y + j as f32 * char_h;
+                                if cy < panel_rect.top() - char_h || cy > panel_rect.bottom() { continue; }
+                                // Head char is bright, trail fades
+                                let alpha = if j == col.length - 1 {
+                                    255
+                                } else {
+                                    let fade = j as f32 / col.length as f32;
+                                    (fade * fade * 120.0) as u8
+                                };
+                                let color = if j == col.length - 1 {
+                                    egui::Color32::from_rgba_unmultiplied(180, 255, 180, 255)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(0, 180, 60, alpha)
+                                };
+                                painter.text(
+                                    egui::pos2(col.x, cy),
+                                    egui::Align2::CENTER_CENTER,
+                                    &ch.to_string(),
+                                    egui::FontId::monospace(11.0),
+                                    color,
+                                );
+                            }
+                        }
+
+                        // Scanlines on top of matrix
+                        let scanline_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 28);
+                        let mut sy = panel_rect.top() + self.login_scanline_offset;
+                        while sy < panel_rect.bottom() {
+                            painter.line_segment(
+                                [egui::pos2(panel_rect.left(), sy), egui::pos2(panel_rect.right(), sy)],
+                                egui::Stroke::new(1.0, scanline_color),
+                            );
+                            sy += 8.0;
+                        }
+                    }
+
                     ui.vertical_centered(|ui| {
-                        ui.add_space(24.0);
-                        egui::Frame::none()
+                        ui.add_space(12.0);
+
+                        // ── Boot sequence (shown until done) ─────────────
+                        let boot_lines = [
+                            "AOL Desktop v9.0  (c) 1998 America Online, Inc.",
+                            "Initializing TCP/IP stack................. OK",
+                            "Loading winsock.dll........................ OK",
+                            "Checking modem............................ FOUND",
+                            "Allocating screen buffers.................. OK",
+                            "Loading buddy list......................... OK",
+                            "System ready.",
+                        ];
+                        let boot_total_time = boot_lines.len() as f32 * 0.38;
+
+                        if !self.boot_done {
+                            self.boot_line_timer += dt;
+                            if self.boot_line_timer >= 0.38 {
+                                self.boot_line_timer = 0.0;
+                                self.boot_line += 1;
+                                if self.boot_line >= boot_lines.len() {
+                                    self.boot_done = true;
+                                }
+                            }
+
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210))
+                                .corner_radius(egui::CornerRadius::same(6.0 as u8))
+                                .inner_margin(egui::Margin::same(16.0 as i8))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(480.0);
+                                    ui.set_max_width(480.0);
+                                    for (i, line) in boot_lines.iter().enumerate() {
+                                        if i > self.boot_line { break; }
+                                        let color = if i == self.boot_line {
+                                            amber_bright
+                                        } else if line.ends_with("OK") {
+                                            green_matrix
+                                        } else if line.ends_with("FOUND") {
+                                            green_matrix
+                                        } else {
+                                            amber_dim
+                                        };
+                                        ui.label(egui::RichText::new(*line).monospace().size(12.0).color(color));
+                                    }
+                                    // Blinking cursor on last line
+                                    if !self.boot_done && ((self.login_anim_time * 4.0) as u32 % 2 == 0) {
+                                        ui.label(egui::RichText::new("█").monospace().size(12.0).color(amber));
+                                    }
+                                });
+                            return; // Don't show login form until boot done
+                        }
+
+                        // ── Big ASCII AOL logo ────────────────────────────
+                        let logo_lines = [
+                            r"   ___   ___  _     ",
+                            r"  / _ \ / _ \| |    ",
+                            r" | |_| | | | | |    ",
+                            r"  \__,_|\___/|_|    ",
+                            r"  Instant Messenger ",
+                        ];
+                        // Shimmer: each char gets a brightness based on wave
+                        let shimmer_t = self.login_anim_time * 3.0;
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160))
+                            .corner_radius(egui::CornerRadius::same(4.0 as u8))
+                            .inner_margin(egui::Margin::symmetric(20.0 as i8, 8.0 as i8))
+                            .show(ui, |ui| {
+                                ui.set_min_width(320.0);
+                                for (row, line) in logo_lines.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        for (col, ch) in line.chars().enumerate() {
+                                            let wave = ((shimmer_t - (col as f32 + row as f32 * 3.0) * 0.18).sin() * 0.5 + 0.5) as f32;
+                                            let r = (amber_dim.r() as f32 + (amber_bright.r() as f32 - amber_dim.r() as f32) * wave) as u8;
+                                            let g = (amber_dim.g() as f32 + (amber_bright.g() as f32 - amber_dim.g() as f32) * wave) as u8;
+                                            let b = (amber_dim.b() as f32 + (amber_bright.b() as f32 - amber_dim.b() as f32) * wave) as u8;
+                                            let color = egui::Color32::from_rgb(r, g, b);
+                                            ui.label(egui::RichText::new(ch.to_string()).monospace().size(15.0).color(color));
+                                        }
+                                    });
+                                }
+                            });
+
+                        ui.add_space(6.0);
+
+                        // ── Typewriter tagline ────────────────────────────
+                        let tagline = "\"You've Got Mail.  The world is online.\"";
+                        let tw_speed = 22.0_f32;
+                        // Only start typewriter after boot
+                        let tw_elapsed = (self.login_anim_time - boot_total_time).max(0.0);
+                        let tw_target = ((tw_elapsed * tw_speed) as usize).min(tagline.len());
+                        if self.login_typewriter_pos < tw_target {
+                            self.login_typewriter_pos = tw_target;
+                        }
+                        let visible_tag = &tagline[..self.login_typewriter_pos.min(tagline.len())];
+                        let cursor_char = if self.login_typewriter_pos < tagline.len()
+                            && ((self.login_anim_time * 3.0) as u32 % 2 == 0) { "▌" } else { " " };
+                        ui.label(
+                            egui::RichText::new(format!("{}{}", visible_tag, cursor_char))
+                                .monospace().size(13.0).color(amber),
+                        );
+
+                        ui.add_space(10.0);
+
+                        // ── Login card ────────────────────────────────────
+                        egui::Frame::new()
                             .fill(card_fill)
                             .stroke(card_stroke)
-                            .rounding(egui::Rounding::same(10.0))
-                            .inner_margin(egui::Margin::same(18.0))
+                            .corner_radius(egui::CornerRadius::same(10.0 as u8))
+                            .inner_margin(egui::Margin::same(20.0 as i8))
                             .show(ui, |ui| {
                                 ui.set_max_width(360.0);
-                                ui.colored_label(text_color, "Sign in to your retro inbox");
-                                ui.add_space(14.0);
+
                                 ui.horizontal(|ui| {
-                                    if ui
-                                        .selectable_label(self.auth_mode == AuthMode::Login, "Login")
-                                        .clicked()
-                                    {
+                                    if ui.selectable_label(self.auth_mode == AuthMode::Login, "Sign In").clicked() {
                                         self.auth_mode = AuthMode::Login;
                                     }
-                                    if ui
-                                        .selectable_label(self.auth_mode == AuthMode::Register, "Create account")
-                                        .clicked()
-                                    {
+                                    if ui.selectable_label(self.auth_mode == AuthMode::Register, "Create Account").clicked() {
                                         self.auth_mode = AuthMode::Register;
                                     }
                                 });
@@ -965,34 +1360,82 @@ impl eframe::App for AolApp {
                                 }
                                 ui.add(egui::TextEdit::singleline(&mut self.server_url).hint_text("Server URL"));
                                 ui.add_space(12.0);
+
                                 let button_label = match self.auth_mode {
-                                    AuthMode::Login => "Sign On",
+                                    AuthMode::Login    => "Sign On",
                                     AuthMode::Register => "Create Account",
                                 };
                                 if ui.button(button_label).clicked() {
                                     self.send_connect();
+                                    // Reset modem animation
+                                    self.modem_line = 0;
+                                    self.modem_line_timer = 0.0;
+                                    self.modem_char_pos = 0;
                                 }
+
                                 ui.add_space(10.0);
+
+                                // ── Dial-up modem connecting animation ────
                                 if self.logging_in {
-                                    let frames = ["[LOCKED]", "[LOCK--]", "[LOCK> ]", "[UNLOCK]"];
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    let frame = if let Some(start) = self.login_started_at {
-                                        let idx = ((start.elapsed().as_millis() / 200) % frames.len() as u128) as usize;
-                                        frames[idx]
-                                    } else {
-                                        frames[0]
-                                    };
-                                    #[cfg(target_arch = "wasm32")]
-                                    let frame = {
-                                        let idx = ((self.login_frame_count / 12) as usize) % frames.len();  // ~12 frames per second animation
-                                        frames[idx]
-                                    };
-                                    ui.horizontal(|ui| {
-                                        ui.add(egui::Spinner::new());
-                                        ui.label(format!("{frame} Logging in as {}...", self.username.trim()));
-                                    });
+                                    let modem_script = [
+                                        "ATDT 1-800-827-6364",
+                                        "CONNECT 56000",
+                                        "Verifying username...",
+                                        "Checking buddy list...",
+                                        "Loading away messages...",
+                                        "Welcome to AOL!",
+                                    ];
+
+                                    // Advance modem animation
+                                    self.modem_line_timer += dt;
+                                    let line_delay = 0.55_f32;
+                                    if self.modem_line_timer >= line_delay && self.modem_line < modem_script.len() {
+                                        let current_line = modem_script[self.modem_line];
+                                        if self.modem_char_pos < current_line.len() {
+                                            // Typewriter within line: advance a few chars per frame
+                                            self.modem_char_pos = (self.modem_char_pos + 3).min(current_line.len());
+                                        } else {
+                                            // Line done, move to next
+                                            self.modem_line += 1;
+                                            self.modem_char_pos = 0;
+                                            self.modem_line_timer = 0.0;
+                                        }
+                                    }
+
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200))
+                                        .corner_radius(egui::CornerRadius::same(4.0 as u8))
+                                        .inner_margin(egui::Margin::same(10.0 as i8))
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(320.0);
+                                            for (i, line) in modem_script.iter().enumerate() {
+                                                if i > self.modem_line { break; }
+                                                let text = if i == self.modem_line {
+                                                    // Partially typed current line
+                                                    &line[..self.modem_char_pos.min(line.len())]
+                                                } else {
+                                                    line
+                                                };
+                                                let color = if i == 0 {
+                                                    // AT command in dim white
+                                                    egui::Color32::from_rgb(200, 200, 200)
+                                                } else if i == 1 {
+                                                    green_matrix
+                                                } else if i == modem_script.len() - 1 {
+                                                    amber_bright
+                                                } else {
+                                                    amber
+                                                };
+                                                ui.label(egui::RichText::new(text).monospace().size(12.0).color(color));
+                                            }
+                                            // Blinking cursor
+                                            if (self.login_anim_time * 4.0) as u32 % 2 == 0 {
+                                                ui.label(egui::RichText::new("█").monospace().size(12.0).color(amber));
+                                            }
+                                        });
+                                } else {
+                                    ui.colored_label(text_color, format!("Status: {}", self.status));
                                 }
-                                ui.colored_label(text_color, format!("Status: {}", self.status));
                             });
                     });
                 });
@@ -1289,6 +1732,15 @@ impl eframe::App for AolApp {
                             if ui.button("Unmute").clicked() {
                                 self.send_moderation(UiToNet::Unmute { username: name.clone() });
                             }
+                            // E2E encryption toggle (native only)
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let has_e2e = self.e2e_shared_secrets.contains_key(&name);
+                                let e2e_label = if has_e2e { "🔒 E2E On" } else { "🔓 Enable E2E" };
+                                if ui.button(e2e_label).clicked() && !has_e2e {
+                                    self.initiate_e2e_static(&name.clone());
+                                }
+                            }
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.report_reason)
                                     .hint_text("Report reason")
@@ -1468,7 +1920,7 @@ impl eframe::App for AolApp {
 
                         // Send on Enter (no modifier needed), or clicking Send
                         let should_send = ui.button("Send").clicked()
-                            || (response.has_focus()
+                            || (!self.chat_input.is_empty()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter)));
 
                         // Typing indicators — notify server when input changes
@@ -1493,6 +1945,11 @@ impl eframe::App for AolApp {
                             }
                             self.send_chat();
                             response.request_focus();
+                        } else {
+                            // Keep focus on input so Enter always works
+                            if !response.has_focus() {
+                                response.request_focus();
+                            }
                         }
 
                         // Escape to clear input
@@ -1542,7 +1999,7 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
             visuals
         }
     };
-    visuals.window_rounding = egui::Rounding::same(6.0);
+    visuals.window_corner_radius = egui::CornerRadius::same(6);
     ctx.set_visuals(visuals);
 }
 
@@ -1699,14 +2156,38 @@ async fn run_connection(
     ui_rx: &mut mpsc::UnboundedReceiver<UiToNet>,
     net_tx: &std_mpsc::Sender<NetToUi>,
 ) -> Result<(), String> {
-    let connect_future = connect_async(&url);
-    let (ws_stream, _) = tokio::time::timeout(
+    eprintln!("[DEBUG] Connecting to: {}", url);
+
+    // Use raw TCP + client_async to avoid rustls interfering with plain ws://
+    let host_port = url
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .split('/')
+        .next()
+        .unwrap_or("localhost:9001");
+    eprintln!("[DEBUG] TCP connecting to: {}", host_port);
+    let tcp = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        connect_future,
+        tokio::net::TcpStream::connect(host_port),
     )
     .await
-    .map_err(|_| format!("Connection timed out after 10s — is the server running?"))?
-    .map_err(|err| err.to_string())?;
+    .map_err(|_| "Connection timed out — is the server running?".to_string())?
+    .map_err(|e| { eprintln!("[DEBUG] TCP error: {}", e); e.to_string() })?;
+    eprintln!("[DEBUG] TCP connected, upgrading to WebSocket...");
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.as_str().into_client_request().map_err(|e| e.to_string())?;
+    req.headers_mut().insert(
+        "Host",
+        host_port.parse().map_err(|e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| e.to_string())?,
+    );
+    let (ws_stream, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio_tungstenite::client_async(req, tcp),
+    )
+    .await
+    .map_err(|_| "WebSocket handshake timed out".to_string())?
+    .map_err(|e| { eprintln!("[DEBUG] WS handshake error: {}", e); e.to_string() })?;
+    eprintln!("[DEBUG] WebSocket connected!");
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
     match mode {
@@ -1802,6 +2283,12 @@ async fn run_connection(
                                 ServerToClient::FriendRequestResult { username, accepted } => {
                                     let _ = net_tx.send(NetToUi::FriendRequestResult { username, accepted });
                                 }
+                                ServerToClient::KeyExchange { from, public_key } => {
+                                    let _ = net_tx.send(NetToUi::KeyExchange { from, public_key });
+                                }
+                                ServerToClient::EncryptedDirectMessage { from, encrypted_body } => {
+                                    let _ = net_tx.send(NetToUi::EncryptedDirectMessage { from, encrypted_body });
+                                }
                                 ServerToClient::ChatRoomCreated { room_id, name } => {
                                     let _ = net_tx.send(NetToUi::ChatRoomCreated { room_id, name });
                                 }
@@ -1848,6 +2335,12 @@ async fn run_connection(
                     }
                     UiToNet::SendDirect { to, body } => {
                         send_json(&mut ws_tx, ClientToServer::DirectMessage { to, body }).await?;
+                    }
+                    UiToNet::ExchangeKey { to, public_key } => {
+                        send_json(&mut ws_tx, ClientToServer::ExchangeKey { to, public_key }).await?;
+                    }
+                    UiToNet::SendEncryptedDirect { to, encrypted_body } => {
+                        send_json(&mut ws_tx, ClientToServer::EncryptedDirectMessage { to, encrypted_body }).await?;
                     }
                     UiToNet::FetchHistory { target } => {
                         let target = match target {
@@ -1973,7 +2466,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "AOL-Style Messenger",
         options,
-        Box::new(|cc| Box::new(AolApp::new(cc))),
+        Box::new(|cc| Ok(Box::new(AolApp::new(cc)))),
     )
 }
 
@@ -1993,7 +2486,7 @@ fn main() {
             .start(
                 "the_canvas_id",
                 web_options,
-                Box::new(|cc| Box::new(AolApp::new(cc))),
+                Box::new(|cc| Ok(Box::new(AolApp::new(cc)))),
             )
             .await
             .expect("failed to start eframe");
