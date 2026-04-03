@@ -16,7 +16,7 @@ required-features = ["server"]
 [features]
 default = []
 server = []  # Feature to enable server binary (native only)
-client = ["eframe", "egui", "rodio"]  # Feature to enable audio/client deps
+client = ["eframe", "egui", "rodio", "notify-rust"]  # Feature to enable audio/client deps
 
 [dependencies]
 futures-util = "0.3"
@@ -28,6 +28,7 @@ uuid = { version = "1.7", features = ["v4", "serde", "js"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 base64 = "0.22"
+dirs = "5"
 
 # Native dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -40,6 +41,7 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chron
 rodio = { version = "0.19", optional = true }
 rust-embed = { version = "8.11", features = ["compression"] }
 redis = { version = "0.25", features = ["tokio-comp"] }
+notify-rust = { version = "4", optional = true }
 
 # Web dependencies
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -13,14 +13,21 @@ pub struct MessageRecord {
     pub from: String,
     pub body: String,
     pub at: String,
-    pub id: Option<i64>,      // Message ID for read receipts
-    pub read_count: Option<i32>, // Number of people who read this message
+    pub id: Option<i64>,
+    pub read_count: Option<i32>,
+    /// ID of the message being replied to
+    pub reply_to_id: Option<i64>,
+    /// Snippet of the replied-to message body
+    pub reply_to_body: Option<String>,
+    pub reply_to_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserStatus {
     pub username: String,
     pub away: Option<String>,
+    /// Custom status emoji + text e.g. "🎮 Playing Halo"
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +69,23 @@ pub enum ClientToServer {
     StartTyping { room_id: String },
     StopTyping { room_id: String },
     MarkMessageAsRead { message_id: i64 },
+    /// Edit a previously sent message
+    EditMessage { message_id: i64, new_body: String },
+    /// Delete a previously sent message
+    DeleteMessage { message_id: i64 },
+    /// React to a message with an emoji
+    ReactToMessage { message_id: i64, emoji: String },
+    /// Nudge a user (screen shake)
+    Nudge { to: String },
+    /// Update custom status (shown in buddy list)
+    SetStatus { status: Option<String> },
+    /// Update profile bio
+    SetBio { bio: String },
+    /// Fetch a user's profile
+    FetchProfile { username: String },
+    /// Reply to a specific message
+    ReplyToMessage { reply_to_id: i64, body: String },
+    ReplyToDirect { to: String, reply_to_id: i64, body: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +121,16 @@ pub enum ServerToClient {
     UserTyping { room_id: String, username: String },
     UserStoppedTyping { room_id: String, username: String },
     ReadReceipt { message_id: i64, read_by: String },
+    /// Broadcast an edited message to relevant peers
+    MessageEdited { message_id: i64, new_body: String, edited_by: String },
+    /// Broadcast a deleted message to relevant peers
+    MessageDeleted { message_id: i64, deleted_by: String },
+    /// A reaction was added to a message
+    MessageReaction { message_id: i64, emoji: String, from: String },
+    /// Someone nudged you
+    Nudged { from: String },
+    /// A user's profile data
+    ProfileData { username: String, bio: String, status: Option<String>, joined: String },
 }
 
 

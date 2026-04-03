@@ -27,6 +27,7 @@ struct Peer {
     user_id: Option<i64>,
     username: String,
     away: Option<String>,
+    status: Option<String>,
     tx: mpsc::UnboundedSender<Message>,
     current_room: Option<String>,
 }
@@ -115,6 +116,7 @@ async fn handle_connection(
                 user_id: None,
                 username: guest_name,
                 away: None,
+                status: None,
                 tx: out_tx.clone(),
                 current_room: None,
             },
@@ -810,14 +812,113 @@ async fn handle_client_event(
         ClientToServer::MarkMessageAsRead { message_id } => {
             if let Some((from, _)) = get_peer_identity(peers, id) {
                 let _ = mark_message_read(db, message_id).await;
-                // Broadcast read receipt to all peers
-                send_to_all(
-                    peers,
-                    ServerToClient::ReadReceipt {
+                send_to_all(peers, ServerToClient::ReadReceipt { message_id, read_by: from });
+            }
+        }
+        ClientToServer::EditMessage { message_id, new_body } => {
+            if let Some((from, user_id)) = get_peer_identity(peers, id) {
+                if let Ok(true) = edit_message(db, message_id, user_id, &new_body).await {
+                    send_to_all(peers, ServerToClient::MessageEdited {
                         message_id,
-                        read_by: from,
-                    },
-                );
+                        new_body,
+                        edited_by: from,
+                    });
+                }
+            }
+        }
+        ClientToServer::DeleteMessage { message_id } => {
+            if let Some((from, user_id)) = get_peer_identity(peers, id) {
+                if let Ok(true) = delete_message(db, message_id, user_id).await {
+                    send_to_all(peers, ServerToClient::MessageDeleted {
+                        message_id,
+                        deleted_by: from,
+                    });
+                }
+            }
+        }
+        ClientToServer::ReactToMessage { message_id, emoji } => {
+            if let Some((from, _)) = get_peer_identity(peers, id) {
+                // Broadcast reaction to all connected peers
+                send_to_all(peers, ServerToClient::MessageReaction {
+                    message_id,
+                    emoji,
+                    from,
+                });
+            }
+        }
+        ClientToServer::Nudge { to } => {
+            if let Some((from, _)) = get_peer_identity(peers, id) {
+                if let Ok(Some(target_id)) = get_user_id_by_name(db, &to).await {
+                    if let Some((target_peer_id, _)) = get_peer_by_user_id(peers, target_id) {
+                        send_to_peer(peers, target_peer_id, ServerToClient::Nudged { from });
+                    }
+                }
+            }
+        }
+        ClientToServer::SetStatus { status } => {
+            if let Ok(mut guard) = peers.lock() {
+                if let Some(peer) = guard.get_mut(&id) {
+                    peer.status = status.clone();
+                    // Also persist to DB
+                    if let Some(uid) = peer.user_id {
+                        let db = db.clone();
+                        let s = status.clone();
+                        tokio::spawn(async move {
+                            let _ = sqlx::query("UPDATE users SET status = $1 WHERE id = $2")
+                                .bind(s).bind(uid).execute(&db).await;
+                        });
+                    }
+                }
+            }
+            broadcast_presence(peers);
+        }
+        ClientToServer::SetBio { bio } => {
+            if let Some((_, user_id)) = get_peer_identity(peers, id) {
+                let _ = sqlx::query("UPDATE users SET bio = $1 WHERE id = $2")
+                    .bind(&bio).bind(user_id).execute(db).await;
+            }
+        }
+        ClientToServer::FetchProfile { username } => {
+            if let Ok(Some(row)) = sqlx::query(
+                "SELECT username, bio, status, created_at FROM users WHERE username = $1"
+            )
+            .bind(&username)
+            .fetch_optional(db)
+            .await
+            {
+                use sqlx::Row;
+                let bio: String = row.get::<Option<String>, _>("bio").unwrap_or_default();
+                let status: Option<String> = row.get("status");
+                let joined: chrono::DateTime<chrono::Utc> = row.get("created_at");
+                send_to_peer(peers, id, ServerToClient::ProfileData {
+                    username,
+                    bio,
+                    status,
+                    joined: joined.format("%B %Y").to_string(),
+                });
+            }
+        }
+        ClientToServer::ReplyToMessage { reply_to_id, body } => {
+            let (from, user_id) = match get_peer_identity(peers, id) {
+                Some(info) => info,
+                None => return,
+            };
+            if !allow_rate(rate_limits, user_id) { return; }
+            let _ = insert_message_with_reply(db, user_id, None, &body, Some(reply_to_id)).await;
+            // Fetch the original message snippet
+            let snippet = get_message_snippet(db, reply_to_id).await;
+            send_chat_to_all(db, peers, user_id, &from, &body).await;
+            let _ = snippet; // used in future for richer reply display
+        }
+        ClientToServer::ReplyToDirect { to, reply_to_id, body } => {
+            let (from, user_id) = match get_peer_identity(peers, id) {
+                Some(info) => info,
+                None => return,
+            };
+            if !allow_rate(rate_limits, user_id) { return; }
+            if let Ok(Some(target_id)) = get_user_id_by_name(db, &to).await {
+                let _ = insert_message_with_reply(db, user_id, Some(target_id), &body, Some(reply_to_id)).await;
+                send_dm_to_user(peers, target_id, &from, &body);
             }
         }
     }
@@ -988,13 +1089,13 @@ fn broadcast_presence(peers: &Arc<Mutex<HashMap<usize, Peer>>>) {
                 .map(|peer| UserStatus {
                     username: peer.username.clone(),
                     away: peer.away.clone(),
+                    status: peer.status.clone(),
                 })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         }
     };
-
     send_to_all(peers, ServerToClient::Presence { users });
 }
 
@@ -1069,6 +1170,8 @@ async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
             id SERIAL PRIMARY KEY,\
             username TEXT NOT NULL UNIQUE,\
             password_hash TEXT NOT NULL,\
+            bio TEXT NOT NULL DEFAULT '',\
+            status TEXT,\
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\
         )",
     )
@@ -1150,6 +1253,8 @@ async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
             room_id TEXT REFERENCES chat_rooms(id) ON DELETE CASCADE,\
             body TEXT NOT NULL,\
             read_at TIMESTAMPTZ,\
+            edited_at TIMESTAMPTZ,\
+            deleted_at TIMESTAMPTZ,\
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\
         )",
     )
@@ -1162,6 +1267,18 @@ async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(db)
     .await?;
+
+    // Migrations: add columns if they don't exist yet
+    let _ = sqlx::query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ")
+        .execute(db).await;
+    let _ = sqlx::query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
+        .execute(db).await;
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''")
+        .execute(db).await;
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT")
+        .execute(db).await;
+    let _ = sqlx::query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id BIGINT REFERENCES messages(id) ON DELETE SET NULL")
+        .execute(db).await;
 
     Ok(())
 }
@@ -1179,6 +1296,34 @@ async fn insert_message(
         .execute(db)
         .await?;
     Ok(())
+}
+
+async fn insert_message_with_reply(
+    db: &PgPool,
+    sender_id: i64,
+    recipient_id: Option<i64>,
+    body: &str,
+    reply_to_id: Option<i64>,
+) -> Result<i64, sqlx::Error> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "INSERT INTO messages (sender_id, recipient_id, body, reply_to_id) \
+         VALUES ($1, $2, $3, $4) RETURNING id"
+    )
+    .bind(sender_id).bind(recipient_id).bind(body).bind(reply_to_id)
+    .fetch_one(db).await?;
+    Ok(row.get("id"))
+}
+
+async fn get_message_snippet(db: &PgPool, message_id: i64) -> Option<(String, String)> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT u.username, m.body FROM messages m \
+         JOIN users u ON u.id = m.sender_id WHERE m.id = $1"
+    )
+    .bind(message_id)
+    .fetch_optional(db).await.ok()??;
+    Some((row.get("username"), row.get::<String, _>("body").chars().take(80).collect()))
 }
 
 async fn fetch_lobby_history(db: &PgPool, limit: i64) -> Result<Vec<MessageRecord>, sqlx::Error> {
@@ -1204,6 +1349,9 @@ async fn fetch_lobby_history(db: &PgPool, limit: i64) -> Result<Vec<MessageRecor
                 .to_rfc3339(),
             id: None,
             read_count: None,
+            reply_to_id: None,
+            reply_to_body: None,
+            reply_to_from: None,
         })
         .collect::<Vec<_>>();
     messages.reverse();
@@ -1241,6 +1389,9 @@ async fn fetch_dm_history(
                 .to_rfc3339(),
             id: None,
             read_count: None,
+            reply_to_id: None,
+            reply_to_body: None,
+            reply_to_from: None,
         })
         .collect::<Vec<_>>();
     messages.reverse();
@@ -1304,6 +1455,9 @@ async fn fetch_room_history(db: &PgPool, room_id: &str, limit: i64) -> Result<Ve
                 .to_rfc3339(),
             id: None,
             read_count: None,
+            reply_to_id: None,
+            reply_to_body: None,
+            reply_to_from: None,
         })
         .collect::<Vec<_>>();
     messages.reverse();
@@ -1339,6 +1493,9 @@ async fn search_lobby(
                 .to_rfc3339(),
             id: None,
             read_count: None,
+            reply_to_id: None,
+            reply_to_body: None,
+            reply_to_from: None,
         })
         .collect::<Vec<_>>();
     messages.reverse();
@@ -1379,6 +1536,9 @@ async fn search_dm(
                 .to_rfc3339(),
             id: None,
             read_count: None,
+            reply_to_id: None,
+            reply_to_body: None,
+            reply_to_from: None,
         })
         .collect::<Vec<_>>();
     messages.reverse();
@@ -1416,6 +1576,9 @@ async fn search_room(
                 .to_rfc3339(),
             id: None,
             read_count: None,
+            reply_to_id: None,
+            reply_to_body: None,
+            reply_to_from: None,
         })
         .collect::<Vec<_>>();
     messages.reverse();
@@ -1657,6 +1820,33 @@ async fn mark_message_read(db: &PgPool, message_id: i64) -> Result<(), sqlx::Err
         .execute(db)
         .await?;
     Ok(())
+}
+
+/// Returns true if the message was found and owned by user_id
+async fn edit_message(db: &PgPool, message_id: i64, user_id: i64, new_body: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE messages SET body = $1, edited_at = NOW() \
+         WHERE id = $2 AND sender_id = $3 AND deleted_at IS NULL"
+    )
+    .bind(new_body)
+    .bind(message_id)
+    .bind(user_id)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Returns true if the message was found and owned by user_id
+async fn delete_message(db: &PgPool, message_id: i64, user_id: i64) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE messages SET deleted_at = NOW(), body = '[deleted]' \
+         WHERE id = $1 AND sender_id = $2 AND deleted_at IS NULL"
+    )
+    .bind(message_id)
+    .bind(user_id)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 fn join_chat_room(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize, room_id: &str) {

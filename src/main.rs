@@ -211,6 +211,15 @@ enum UiToNet {
     StartTyping { room_id: String },
     StopTyping { room_id: String },
     MarkMessageAsRead { message_id: i64 },
+    EditMessage { message_id: i64, new_body: String },
+    DeleteMessage { message_id: i64 },
+    ReactToMessage { message_id: i64, emoji: String },
+    Nudge { to: String },
+    SetStatus { status: Option<String> },
+    SetBio { bio: String },
+    FetchProfile { username: String },
+    ReplyToMessage { reply_to_id: i64, body: String },
+    ReplyToDirect { to: String, reply_to_id: i64, body: String },
 }
 
 enum NetToUi {
@@ -246,6 +255,11 @@ enum NetToUi {
     UserTyping { room_id: String, username: String },
     UserStoppedTyping { room_id: String, username: String },
     ReadReceipt { message_id: i64, read_by: String },
+    MessageEdited { message_id: i64, new_body: String },
+    MessageDeleted { message_id: i64 },
+    MessageReaction { message_id: i64, emoji: String, from: String },
+    Nudged { from: String },
+    ProfileData { username: String, bio: String, status: Option<String>, joined: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +298,10 @@ struct AolApp {
     logging_in: bool,
     login_started_at: Option<Instant>,
     login_frame_count: u32,  // Web: tracks elapsed frames for 3-second timeout
+    login_error: bool,  // Track if login failed for red flash effect
+    login_error_time: f32,  // Time since error for fade effect
+    login_success: bool,  // Track if login succeeded for green flash effect
+    login_success_time: f32,  // Time since success for transition
     search_query: String,
     search_in_progress: bool,
     search_results: HashMap<ChatTarget, SearchResult>,
@@ -309,7 +327,14 @@ struct AolApp {
     typing_users: std::collections::HashMap<String, Vec<String>>, // room_id -> list of users typing
     typing_timeout: std::collections::HashMap<String, std::time::Instant>, // user -> when they stop typing
     // Read receipts
-    message_read_status: std::collections::HashMap<i64, Vec<String>>, // message_id -> list of users who read
+    message_read_status: std::collections::HashMap<i64, Vec<String>>,
+    // Unread message counts per chat target
+    unread_counts: HashMap<ChatTarget, usize>,
+    // Message reactions: message_id -> list of (emoji, username)
+    reactions: HashMap<i64, Vec<(String, String)>>,
+    // Nudge animation: time remaining for screen shake
+    nudge_time: f32,
+    nudge_from: Option<String>, // message_id -> list of users who read
     // E2E encryption: shared secrets keyed by peer username (native only)
     // Stored as raw 32-byte arrays to avoid lifetime issues with x25519_dalek types
     #[cfg(not(target_arch = "wasm32"))]
@@ -321,6 +346,19 @@ struct AolApp {
     login_anim_time: f32,
     login_typewriter_pos: usize,
     login_scanline_offset: f32,
+    // Message editing state
+    editing_message: Option<(i64, String)>, // (message_id, current edit text)
+    // Saved credentials path
+    credentials_path: std::path::PathBuf,
+    // Reply state: (message_id, from, body_snippet)
+    replying_to: Option<(i64, String, String)>,
+    // Custom status input
+    custom_status: String,
+    // Profile modal
+    viewing_profile: Option<String>,
+    profile_cache: HashMap<String, (String, Option<String>, String)>, // (bio, status, joined)
+    bio_edit: String,
+    bio_editing: bool,
     // Boot sequence
     boot_done: bool,
     boot_line: usize,
@@ -337,6 +375,13 @@ struct AolApp {
 struct SearchResult {
     query: String,
     messages: Vec<ChatMessage>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct SavedCredentials {
+    username: String,
+    password: String,
+    server_url: String,
 }
 
 /// One column of falling characters in the matrix rain background
@@ -431,6 +476,10 @@ impl AolApp {
             logging_in: false,
             login_started_at: None,
             login_frame_count: 0,
+            login_error: false,
+            login_error_time: 0.0,
+            login_success: false,
+            login_success_time: 0.0,
             search_query: String::new(),
             search_in_progress: false,
             search_results: HashMap::new(),
@@ -451,6 +500,10 @@ impl AolApp {
             typing_users: HashMap::new(),
             typing_timeout: HashMap::new(),
             message_read_status: HashMap::new(),
+            unread_counts: HashMap::new(),
+            reactions: HashMap::new(),
+            nudge_time: 0.0,
+            nudge_from: None,
             #[cfg(not(target_arch = "wasm32"))]
             e2e_shared_secrets: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -466,6 +519,45 @@ impl AolApp {
             modem_line: 0,
             modem_line_timer: 0.0,
             modem_char_pos: 0,
+            editing_message: None,
+            credentials_path: {
+                let mut p = dirs::config_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                p.push("blast-from-the-past");
+                p
+            },
+            replying_to: None,
+            custom_status: String::new(),
+            viewing_profile: None,
+            profile_cache: HashMap::new(),
+            bio_edit: String::new(),
+            bio_editing: false,
+        }
+    }
+
+    fn credentials_file(&self) -> std::path::PathBuf {
+        self.credentials_path.join("credentials.json")
+    }
+
+    fn save_credentials(&self) {
+        let creds = SavedCredentials {
+            username: self.username.clone(),
+            password: self.password.clone(),
+            server_url: self.server_url.clone(),
+        };
+        if let Ok(json) = serde_json::to_string(&creds) {
+            let _ = std::fs::create_dir_all(&self.credentials_path);
+            let _ = std::fs::write(self.credentials_file(), json);
+        }
+    }
+
+    fn load_credentials(&mut self) {
+        if let Ok(data) = std::fs::read_to_string(self.credentials_file()) {
+            if let Ok(creds) = serde_json::from_str::<SavedCredentials>(&data) {
+                if !creds.username.is_empty() { self.username = creds.username; }
+                if !creds.password.is_empty() { self.password = creds.password; }
+                if !creds.server_url.is_empty() { self.server_url = creds.server_url; }
+            }
         }
     }
 
@@ -569,18 +661,33 @@ impl AolApp {
                         read_count: None,
                     });
                     self.audio_manager.play(SoundEffect::MessageReceived);
+                    if self.selected_target != ChatTarget::Lobby {
+                        *self.unread_counts.entry(ChatTarget::Lobby).or_default() += 1;
+                    }
                 }
                 NetToUi::DirectMessage { from, body } => {
                     let target = ChatTarget::Direct(from.clone());
-                    let entry = self.messages.entry(target).or_default();
+                    let entry = self.messages.entry(target.clone()).or_default();
                     entry.push(ChatMessage {
-                        from,
+                        from: from.clone(),
                         body,
                         at: Utc::now().to_rfc3339(),
                         id: None,
                         read_count: None,
                     });
                     self.audio_manager.play(SoundEffect::MessageReceived);
+                    if self.selected_target != target {
+                        *self.unread_counts.entry(target).or_default() += 1;
+                    }
+                    // Desktop notification for DMs
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let _ = notify_rust::Notification::new()
+                            .summary(&format!("Message from {}", from))
+                            .body("You have a new direct message")
+                            .timeout(notify_rust::Timeout::Milliseconds(4000))
+                            .show();
+                    }
                 }
                 NetToUi::KeyExchange { from, public_key } => {
                     #[cfg(not(target_arch = "wasm32"))]
@@ -633,12 +740,12 @@ impl AolApp {
                         AuthMode::Login => "Logged in.".to_string(),
                     };
                     self.show_toast(self.status.clone(), ToastKind::Success);
-                    self.screen = Screen::Chat;
-                    self.auth_mode = AuthMode::Login;
-                    self.confirm_password.clear();
-                    self.password.clear();
+                    // Don't switch screen immediately - show success animation first
                     self.logging_in = false;
                     self.login_started_at = None;
+                    self.login_success = true;
+                    self.login_success_time = 0.0;
+                    self.save_credentials();
                     let _ = self
                         .network
                         .tx
@@ -652,6 +759,8 @@ impl AolApp {
                     self.show_toast(self.status.clone(), ToastKind::Error);
                     self.logging_in = false;
                     self.login_started_at = None;
+                    self.login_error = true;
+                    self.login_error_time = 0.0;
                 }
                 NetToUi::System(message) => {
                     let entry = self.messages.entry(ChatTarget::Lobby).or_default();
@@ -734,6 +843,47 @@ impl AolApp {
                 NetToUi::ReadReceipt { message_id, read_by } => {
                     self.message_read_status.entry(message_id).or_default().push(read_by);
                 }
+                NetToUi::MessageEdited { message_id, new_body } => {
+                    for msgs in self.messages.values_mut() {
+                        for msg in msgs.iter_mut() {
+                            if msg.id == Some(message_id) {
+                                msg.body = format!("{} ✏️", new_body);
+                                break;
+                            }
+                        }
+                    }
+                }
+                NetToUi::MessageDeleted { message_id } => {
+                    for msgs in self.messages.values_mut() {
+                        for msg in msgs.iter_mut() {
+                            if msg.id == Some(message_id) {
+                                msg.body = "[deleted]".to_string();
+                                break;
+                            }
+                        }
+                    }
+                }
+                NetToUi::MessageReaction { message_id, emoji, from } => {
+                    let list = self.reactions.entry(message_id).or_default();
+                    // Toggle: remove if same user+emoji already exists, else add
+                    if let Some(pos) = list.iter().position(|(e, u)| e == &emoji && u == &from) {
+                        list.remove(pos);
+                    } else {
+                        list.push((emoji, from));
+                    }
+                }
+                NetToUi::Nudged { from } => {
+                    self.nudge_time = 0.6; // 600ms shake
+                    self.nudge_from = Some(from.clone());
+                    self.show_toast(format!("💥 {} nudged you!", from), ToastKind::Info);
+                    self.audio_manager.play(SoundEffect::MessageReceived);
+                }
+                NetToUi::ProfileData { username, bio, status, joined } => {
+                    self.profile_cache.insert(username.clone(), (bio, status, joined));
+                    if self.viewing_profile.as_ref() == Some(&username) {
+                        // Profile modal is open, it will refresh automatically
+                    }
+                }
             }
         }
     }
@@ -745,6 +895,10 @@ impl AolApp {
             return;
         }
         self.logging_in = true;
+        self.login_error = false;
+        self.login_error_time = 0.0;
+        self.login_success = false;
+        self.login_success_time = 0.0;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.login_started_at = Some(Instant::now());
@@ -971,6 +1125,7 @@ impl AolApp {
             return;
         }
         self.selected_target = target.clone();
+        self.unread_counts.remove(&target); // clear unread on open
         self.search_query.clear();
         self.search_in_progress = false;
         self.search_results.remove(&target);
@@ -1037,6 +1192,18 @@ impl AolApp {
 impl eframe::App for AolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx, self.theme);
+
+        // Nudge screen shake
+        if self.nudge_time > 0.0 {
+            let dt = ctx.input(|i| i.stable_dt).min(0.05);
+            self.nudge_time = (self.nudge_time - dt).max(0.0);
+            let shake = (self.nudge_time * 60.0).sin() * 6.0 * (self.nudge_time / 0.6);
+            ctx.set_transform_layer(
+                egui::LayerId::new(egui::Order::Background, egui::Id::new("shake")),
+                egui::emath::TSTransform::from_translation(egui::vec2(shake, 0.0)),
+            );
+            ctx.request_repaint();
+        }
         if self.startup_repaint_left > 0 {
             self.startup_repaint_left = self.startup_repaint_left.saturating_sub(1);
             ctx.request_repaint();
@@ -1339,14 +1506,27 @@ impl eframe::App for AolApp {
                                     }
                                 });
                                 ui.add_space(10.0);
-                                ui.add(egui::TextEdit::singleline(&mut self.username).hint_text("Screen name"));
+                                let user_resp = ui.add(egui::TextEdit::singleline(&mut self.username).hint_text("Screen name"));
+                                if user_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    self.send_connect();
+                                    self.modem_line = 0;
+                                    self.modem_line_timer = 0.0;
+                                    self.modem_char_pos = 0;
+                                }
                                 ui.horizontal(|ui| {
-                                    ui.add(
+                                    let pw_resp = ui.add(
                                         egui::TextEdit::singleline(&mut self.password)
                                             .password(!self.show_password)
                                             .hint_text("Password"),
                                     );
                                     ui.checkbox(&mut self.show_password, "Show");
+                                    // Submit on Enter from password field
+                                    if pw_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        self.send_connect();
+                                        self.modem_line = 0;
+                                        self.modem_line_timer = 0.0;
+                                        self.modem_char_pos = 0;
+                                    }
                                 });
                                 if self.auth_mode == AuthMode::Register {
                                     ui.horizontal(|ui| {
@@ -1380,7 +1560,7 @@ impl eframe::App for AolApp {
                                     let modem_script = [
                                         "ATDT 1-800-827-6364",
                                         "CONNECT 56000",
-                                        "Verifying username...",
+                                        "Verifying credentials...",
                                         "Checking buddy list...",
                                         "Loading away messages...",
                                         "Welcome to AOL!",
@@ -1421,6 +1601,9 @@ impl eframe::App for AolApp {
                                                     egui::Color32::from_rgb(200, 200, 200)
                                                 } else if i == 1 {
                                                     green_matrix
+                                                } else if i == 2 && line.contains("credentials") {
+                                                    // "Verifying credentials..." in yellow/amber
+                                                    egui::Color32::from_rgb(255, 200, 80)
                                                 } else if i == modem_script.len() - 1 {
                                                     amber_bright
                                                 } else {
@@ -1433,6 +1616,79 @@ impl eframe::App for AolApp {
                                                 ui.label(egui::RichText::new("█").monospace().size(12.0).color(amber));
                                             }
                                         });
+                                } else if self.login_success {
+                                    // Success state with green flash effect
+                                    self.login_success_time += dt;
+                                    
+                                    // Flash green for 1 second
+                                    let flash_intensity = if self.login_success_time < 0.8 {
+                                        ((self.login_success_time * 10.0).sin() * 0.5 + 0.5) as f32
+                                    } else {
+                                        1.0
+                                    };
+                                    
+                                    let success_color = egui::Color32::from_rgb(
+                                        (50.0 * (1.0 - flash_intensity)) as u8,
+                                        (180.0 + 75.0 * flash_intensity) as u8,
+                                        (50.0 * (1.0 - flash_intensity)) as u8,
+                                    );
+                                    
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::from_rgba_unmultiplied(0, 40, 0, (200.0 * flash_intensity) as u8))
+                                        .stroke(egui::Stroke::new(2.0, success_color))
+                                        .corner_radius(egui::CornerRadius::same(4.0 as u8))
+                                        .inner_margin(egui::Margin::same(10.0 as i8))
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(320.0);
+                                            ui.label(egui::RichText::new("✓ AUTHENTICATION SUCCESSFUL").monospace().size(12.0).color(success_color).strong());
+                                            ui.label(egui::RichText::new("Welcome back!").monospace().size(11.0).color(success_color));
+                                            ui.add_space(4.0);
+                                            ui.label(egui::RichText::new("Loading your buddy list...").monospace().size(10.0).color(success_color));
+                                        });
+                                    
+                                    // Switch to chat screen after 1.2 seconds
+                                    if self.login_success_time > 1.2 {
+                                        self.screen = Screen::Chat;
+                                        self.auth_mode = AuthMode::Login;
+                                        self.confirm_password.clear();
+                                        self.password.clear();
+                                        self.login_success = false;
+                                        self.login_success_time = 0.0;
+                                    }
+                                    
+                                    ctx.request_repaint();
+                                } else if self.login_error {
+                                    // Error state with red flash effect
+                                    self.login_error_time += dt;
+                                    
+                                    // Flash red for first 2 seconds, then stay solid red
+                                    let flash_intensity = if self.login_error_time < 2.0 {
+                                        ((self.login_error_time * 8.0).sin() * 0.3 + 0.7) as f32
+                                    } else {
+                                        1.0  // Stay solid after flashing
+                                    };
+                                    
+                                    let error_color = egui::Color32::from_rgb(
+                                        (200.0 + 55.0 * flash_intensity) as u8,
+                                        (50.0 * (1.0 - flash_intensity * 0.5)) as u8,
+                                        (50.0 * (1.0 - flash_intensity * 0.5)) as u8,
+                                    );
+                                    
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::from_rgba_unmultiplied(40, 0, 0, 200))
+                                        .stroke(egui::Stroke::new(2.0, error_color))
+                                        .corner_radius(egui::CornerRadius::same(4.0 as u8))
+                                        .inner_margin(egui::Margin::same(10.0 as i8))
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(320.0);
+                                            ui.label(egui::RichText::new("❌ AUTHENTICATION FAILED").monospace().size(12.0).color(error_color).strong());
+                                            ui.label(egui::RichText::new(&self.status).monospace().size(11.0).color(error_color));
+                                        });
+                                    
+                                    // Keep requesting repaint only during flash animation
+                                    if self.login_error_time < 2.0 {
+                                        ctx.request_repaint();
+                                    }
                                 } else {
                                     ui.colored_label(text_color, format!("Status: {}", self.status));
                                 }
@@ -1442,66 +1698,100 @@ impl eframe::App for AolApp {
             }
             Screen::Chat => {
                 egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+                    // First row: Title, status, user info, and main actions
                     ui.horizontal(|ui| {
+                        ui.add_space(8.0);
                         ui.heading("AOL Messenger");
+                        ui.add_space(8.0);
                         ui.separator();
-                        ui.label(format!("Status: {}", self.status));
+                        
                         if let Some(name) = &self.logged_in_user {
-                            ui.label(format!("User: {name}"));
+                            ui.label(format!("👤 {name}"));
                         }
 
                         ui.separator();
                         let online_count = self.buddies.iter().filter(|b| b.away.is_none()).count();
                         let away_count = self.buddies.len() - online_count;
-                        ui.label(format!("👥 {} online, {} away", online_count, away_count));
-                        if ui.button("Add Friend").clicked() {
-                            self.show_add_friend_modal = true;
-                        }
-                        // Show friend requests button with pending count
-                        let pending_count = self.pending_friend_requests.len();
-                        let fr_label = if pending_count > 0 {
-                            format!("Friend Requests ({})", pending_count)
-                        } else {
-                            "Friend Requests".to_string()
-                        };
-                        if ui.button(fr_label).clicked() {
-                            self.show_friend_requests_modal = true;
-                        }
-                        if ui.button("Disconnect").clicked() {
-                            let _ = self.network.tx.send(UiToNet::Disconnect);
-                            self.screen = Screen::SignIn;
-                            self.logged_in_user = None;
-                            self.selected_target = ChatTarget::Lobby;
-                        }
+                        ui.label(format!("👥 {}/{}", online_count, online_count + away_count));
+                        
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Disconnect").clicked() {
+                                let _ = self.network.tx.send(UiToNet::Disconnect);
+                                self.screen = Screen::SignIn;
+                                self.logged_in_user = None;
+                                self.selected_target = ChatTarget::Lobby;
+                            }
 
-                        ui.separator();
+                            // Audio settings menu
+                            ui.menu_button("🔊", |ui| {
+                                ui.checkbox(&mut self.sound_enabled, "Enable sound effects");
 
-                        // Audio settings menu
-                        ui.menu_button("🔊 Audio", |ui| {
-                            ui.checkbox(&mut self.sound_enabled, "Enable sound effects");
+                                ui.horizontal(|ui| {
+                                    ui.label("Volume:");
+                                    ui.add(egui::Slider::new(&mut self.sound_volume, 0.0..=1.0)
+                                        .show_value(false));
+                                });
 
-                            ui.horizontal(|ui| {
-                                ui.label("Volume:");
-                                ui.add(egui::Slider::new(&mut self.sound_volume, 0.0..=1.0)
-                                    .show_value(false));
+                                // Apply settings to audio manager
+                                self.audio_manager.set_enabled(self.sound_enabled);
+                                self.audio_manager.set_volume(self.sound_volume);
+
+                                ui.separator();
+                                ui.label("Test Sounds:");
+                                if ui.button("🔔 Sign On").clicked() {
+                                    self.audio_manager.play(SoundEffect::BuddySignOn);
+                                }
+                                if ui.button("🚪 Sign Off").clicked() {
+                                    self.audio_manager.play(SoundEffect::BuddySignOff);
+                                }
+                                if ui.button("💬 Message").clicked() {
+                                    self.audio_manager.play(SoundEffect::MessageReceived);
+                                }
                             });
 
-                            // Apply settings to audio manager
-                            self.audio_manager.set_enabled(self.sound_enabled);
-                            self.audio_manager.set_volume(self.sound_volume);
+                            // Show friend requests button with pending count
+                            let pending_count = self.pending_friend_requests.len();
+                            let fr_label = if pending_count > 0 {
+                                format!("📬 ({})", pending_count)
+                            } else {
+                                "📬".to_string()
+                            };
+                            if ui.button(fr_label).on_hover_text("Friend Requests").clicked() {
+                                self.show_friend_requests_modal = true;
+                            }
 
-                            ui.separator();
-                            ui.label("Test Sounds:");
-                            if ui.button("🔔 Sign On").clicked() {
-                                self.audio_manager.play(SoundEffect::BuddySignOn);
-                            }
-                            if ui.button("🚪 Sign Off").clicked() {
-                                self.audio_manager.play(SoundEffect::BuddySignOff);
-                            }
-                            if ui.button("💬 Message").clicked() {
-                                self.audio_manager.play(SoundEffect::MessageReceived);
+                            if ui.button("➕").on_hover_text("Add Friend").clicked() {
+                                self.show_add_friend_modal = true;
                             }
                         });
+                    });
+                    
+                    // Second row: Away message and custom status
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label("Away:");
+                        ui.add(egui::TextEdit::singleline(&mut self.away_text)
+                            .hint_text("Be right back...")
+                            .desired_width(140.0));
+                        if ui.small_button("Set").clicked() {
+                            self.send_away();
+                        }
+                        
+                        ui.separator();
+                        
+                        ui.label("Status:");
+                        ui.add(egui::TextEdit::singleline(&mut self.custom_status)
+                            .hint_text("🎮 Playing Halo")
+                            .desired_width(140.0));
+                        if ui.small_button("Set").clicked() {
+                            let status = if self.custom_status.trim().is_empty() {
+                                None
+                            } else {
+                                Some(Self::sanitize_input(&self.custom_status))
+                            };
+                            let _ = self.network.tx.send(UiToNet::SetStatus { status });
+                            self.custom_status.clear();
+                        }
                     });
                     // Modal for Add Friend
                     if self.show_add_friend_modal {
@@ -1511,7 +1801,17 @@ impl eframe::App for AolApp {
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                             .show(ctx, |ui| {
                                 ui.label("Enter friend's screen name:");
-                                ui.add(egui::TextEdit::singleline(&mut self.add_friend_name).hint_text("Screen name"));
+                                let text_edit = ui.add(egui::TextEdit::singleline(&mut self.add_friend_name).hint_text("Screen name"));
+                                
+                                // Auto-focus the text input when modal opens
+                                text_edit.request_focus();
+                                
+                                // Submit on Enter key
+                                if text_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    self.send_add_friend();
+                                    self.show_add_friend_modal = false;
+                                }
+                                
                                 ui.horizontal(|ui| {
                                     if ui.button("Add").clicked() {
                                         self.send_add_friend();
@@ -1519,8 +1819,15 @@ impl eframe::App for AolApp {
                                     }
                                     if ui.button("Cancel").clicked() {
                                         self.show_add_friend_modal = false;
+                                        self.add_friend_name.clear();
                                     }
                                 });
+                                
+                                // Close on Escape
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    self.show_add_friend_modal = false;
+                                    self.add_friend_name.clear();
+                                }
                             });
                     }
                     // Modal for Friend Requests
@@ -1558,13 +1865,101 @@ impl eframe::App for AolApp {
                                 }
                             });
                     }
-                    ui.horizontal(|ui| {
-                        ui.label("Away message:");
-                        ui.add(egui::TextEdit::singleline(&mut self.away_text).hint_text("Be right back..."));
-                        if ui.button("Update").clicked() {
-                            self.send_away();
+
+                    // Profile modal
+                    if let Some(ref username) = self.viewing_profile.clone() {
+                        let mut close_modal = false;
+                        egui::Window::new(format!("Profile: {}", username))
+                            .collapsible(false)
+                            .resizable(false)
+                            .default_size([400.0, 300.0])
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                // Profile circle
+                                let color = username_to_color(username);
+                                let initials = get_initials(username);
+                                ui.vertical_centered(|ui| {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(64.0, 64.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(rect.center(), 32.0, color);
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        &initials,
+                                        egui::FontId::proportional(28.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.heading(username);
+                                });
+
+                                ui.separator();
+
+                                if let Some((bio, status, joined)) = self.profile_cache.get(username).cloned() {
+                                    if let Some(ref status_text) = status {
+                                        ui.label(egui::RichText::new(status_text).italics().color(egui::Color32::GRAY));
+                                        ui.add_space(4.0);
+                                    }
+
+                                    ui.label(egui::RichText::new("Bio:").strong());
+                                    
+                                    // Allow editing own bio
+                                    if self.logged_in_user.as_ref() == Some(username) {
+                                        if self.bio_editing {
+                                            let bio_response = ui.add(egui::TextEdit::multiline(&mut self.bio_edit).desired_width(f32::INFINITY));
+                                            bio_response.request_focus();
+                                            
+                                            ui.horizontal(|ui| {
+                                                if ui.button("Save").clicked() {
+                                                    let _ = self.network.tx.send(UiToNet::SetBio { bio: self.bio_edit.clone() });
+                                                    self.bio_editing = false;
+                                                    // Update cache
+                                                    if let Some(entry) = self.profile_cache.get_mut(username) {
+                                                        entry.0 = self.bio_edit.clone();
+                                                    }
+                                                }
+                                                if ui.button("Cancel").clicked() {
+                                                    self.bio_editing = false;
+                                                }
+                                            });
+                                        } else {
+                                            if bio.is_empty() {
+                                                ui.label(egui::RichText::new("No bio set").italics().color(egui::Color32::GRAY));
+                                            } else {
+                                                ui.label(&bio);
+                                            }
+                                            if ui.button("Edit Bio").clicked() {
+                                                self.bio_edit = bio.clone();
+                                                self.bio_editing = true;
+                                            }
+                                        }
+                                    } else {
+                                        if bio.is_empty() {
+                                            ui.label(egui::RichText::new("No bio set").italics().color(egui::Color32::GRAY));
+                                        } else {
+                                            ui.label(&bio);
+                                        }
+                                    }
+
+                                    ui.add_space(8.0);
+                                    ui.label(format!("Joined: {}", joined));
+                                } else {
+                                    ui.label("Loading profile...");
+                                }
+
+                                ui.separator();
+                                if ui.button("Close").clicked() {
+                                    close_modal = true;
+                                    self.bio_editing = false;
+                                }
+                            });
+                        
+                        if close_modal {
+                            self.viewing_profile = None;
                         }
-                    });
+                    }
                 });
 
                 egui::SidePanel::left("buddy_list")
@@ -1573,20 +1968,35 @@ impl eframe::App for AolApp {
                     .show(ctx, |ui| {
                         ui.heading("Buddy List");
                         ui.separator();
-                        if ui
-                            .selectable_label(self.selected_target == ChatTarget::Lobby, "Lobby")
-                            .clicked()
-                        {
-                            self.select_target(ChatTarget::Lobby);
-                        }
+                        // Lobby with unread badge
+                        ui.horizontal(|ui| {
+                            let selected = self.selected_target == ChatTarget::Lobby;
+                            if ui.selectable_label(selected, "Lobby").clicked() {
+                                self.select_target(ChatTarget::Lobby);
+                            }
+                            if let Some(&count) = self.unread_counts.get(&ChatTarget::Lobby) {
+                                if count > 0 {
+                                    ui.label(egui::RichText::new(format!("●{}", count))
+                                        .small().color(egui::Color32::from_rgb(220, 60, 60)));
+                                }
+                            }
+                        });
                         ui.add_space(8.0);
                         ui.label("Recent DMs");
                         let recent_threads = self.recent_threads.clone();
                         for name in recent_threads {
                             let target = ChatTarget::Direct(name.clone());
-                            if ui.selectable_label(self.selected_target == target, &name).clicked() {
-                                self.select_target(ChatTarget::Direct(name));
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(self.selected_target == target, &name).clicked() {
+                                    self.select_target(ChatTarget::Direct(name));
+                                }
+                                if let Some(&count) = self.unread_counts.get(&target) {
+                                    if count > 0 {
+                                        ui.label(egui::RichText::new(format!("●{}", count))
+                                            .small().color(egui::Color32::from_rgb(220, 60, 60)));
+                                    }
+                                }
+                            });
                         }
                         if self.recent_threads.is_empty() {
                             ui.label("No recent threads.");
@@ -1628,9 +2038,9 @@ impl eframe::App for AolApp {
                                     let color = username_to_color(&buddy.username);
                                     let initials = get_initials(&buddy.username);
 
-                                    let (rect, _) = ui.allocate_exact_size(
+                                    let (rect, response) = ui.allocate_exact_size(
                                         egui::vec2(24.0, 24.0),
-                                        egui::Sense::hover(),
+                                        egui::Sense::click(),
                                     );
                                     ui.painter().circle_filled(rect.center(), 12.0, color);
                                     ui.painter().text(
@@ -1641,12 +2051,27 @@ impl eframe::App for AolApp {
                                         egui::Color32::WHITE,
                                     );
 
+                                    // Click profile circle to view profile
+                                    if response.clicked() {
+                                        self.viewing_profile = Some(buddy.username.clone());
+                                        let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
+                                    }
+
                                     let target = ChatTarget::Direct(buddy.username.clone());
                                     if ui.selectable_label(
                                         self.selected_target == target,
                                         &buddy.username
                                     ).clicked() {
                                         self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                    }
+
+                                    // Show custom status if set
+                                    if let Some(ref status) = buddy.status {
+                                        ui.label(
+                                            egui::RichText::new(status)
+                                                .small()
+                                                .color(egui::Color32::GRAY)
+                                        );
                                     }
                                 });
                             }
@@ -1668,9 +2093,9 @@ impl eframe::App for AolApp {
                                     let color = username_to_color(&buddy.username);
                                     let initials = get_initials(&buddy.username);
 
-                                    let (rect, _) = ui.allocate_exact_size(
+                                    let (rect, response) = ui.allocate_exact_size(
                                         egui::vec2(24.0, 24.0),
-                                        egui::Sense::hover(),
+                                        egui::Sense::click(),
                                     );
                                     ui.painter().circle_filled(rect.center(), 12.0, color);
                                     ui.painter().text(
@@ -1680,6 +2105,12 @@ impl eframe::App for AolApp {
                                         egui::FontId::proportional(10.0),
                                         egui::Color32::WHITE,
                                     );
+
+                                    // Click profile circle to view profile
+                                    if response.clicked() {
+                                        self.viewing_profile = Some(buddy.username.clone());
+                                        let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
+                                    }
 
                                     let target = ChatTarget::Direct(buddy.username.clone());
                                     if ui.selectable_label(
@@ -1693,6 +2124,15 @@ impl eframe::App for AolApp {
                                         ui.label(
                                             egui::RichText::new(format!("({})", away_msg))
                                                 .italics()
+                                                .small()
+                                                .color(egui::Color32::GRAY)
+                                        );
+                                    }
+
+                                    // Show custom status if set
+                                    if let Some(ref status) = buddy.status {
+                                        ui.label(
+                                            egui::RichText::new(status)
                                                 .small()
                                                 .color(egui::Color32::GRAY)
                                         );
@@ -1740,6 +2180,11 @@ impl eframe::App for AolApp {
                                 if ui.button(e2e_label).clicked() && !has_e2e {
                                     self.initiate_e2e_static(&name.clone());
                                 }
+                            }
+                            // Nudge button
+                            if ui.button("💥 Nudge").clicked() {
+                                let _ = self.network.tx.send(UiToNet::Nudge { to: name.clone() });
+                                self.show_toast(format!("Nudged {}!", name), ToastKind::Info);
                             }
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.report_reason)
@@ -1851,7 +2296,62 @@ impl eframe::App for AolApp {
                                     });
                                     // Convert emoticons and display message
                                     let body_with_emoji = convert_emoticons(&message.body);
-                                    ui.label(&body_with_emoji);
+                                    // Render with clickable links
+                                    render_message_body(ui, &body_with_emoji);
+                                    // Reactions display
+                                    if let Some(msg_id) = message.id {
+                                        let reactions = self.reactions.get(&msg_id).cloned().unwrap_or_default();
+                                        if !reactions.is_empty() {
+                                            ui.horizontal(|ui| {
+                                                // Group by emoji
+                                                let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                                                for (emoji, _) in &reactions {
+                                                    *counts.entry(emoji.clone()).or_default() += 1;
+                                                }
+                                                for (emoji, count) in counts {
+                                                    ui.label(egui::RichText::new(format!("{} {}", emoji, count)).small());
+                                                }
+                                            });
+                                        }
+                                        // Reaction picker on hover
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 2.0;
+                                            for emoji in ["👍","❤️","😂","😮","😢","🔥"] {
+                                                if ui.small_button(emoji).clicked() {
+                                                    let _ = self.network.tx.send(UiToNet::ReactToMessage {
+                                                        message_id: msg_id,
+                                                        emoji: emoji.to_string(),
+                                                    });
+                                                }
+                                            }
+                                        });
+                                    }
+                                    // Edit/delete context menu for own messages
+                                    if Some(&message.from) == self.logged_in_user.as_ref() {
+                                        if let Some(msg_id) = message.id {
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                if ui.small_button("✏️").on_hover_text("Edit").clicked() {
+                                                    self.editing_message = Some((msg_id, message.body.trim_end_matches(" ✏️").to_string()));
+                                                }
+                                                if ui.small_button("🗑").on_hover_text("Delete").clicked() {
+                                                    let _ = self.network.tx.send(UiToNet::DeleteMessage { message_id: msg_id });
+                                                }
+                                                if ui.small_button("↩️").on_hover_text("Reply").clicked() {
+                                                    let snippet = message.body.chars().take(50).collect::<String>();
+                                                    self.replying_to = Some((msg_id, message.from.clone(), snippet));
+                                                }
+                                            });
+                                        }
+                                    } else {
+                                        // Reply button for other users' messages
+                                        if let Some(msg_id) = message.id {
+                                            if ui.small_button("↩️").on_hover_text("Reply").clicked() {
+                                                let snippet = message.body.chars().take(50).collect::<String>();
+                                                self.replying_to = Some((msg_id, message.from.clone(), snippet));
+                                            }
+                                        }
+                                    }
                                 });
                             });
                             ui.add_space(4.0);
@@ -1911,6 +2411,42 @@ impl eframe::App for AolApp {
                         }
                     }
                     ui.add_space(4.0);
+
+                    // Edit message modal
+                    if self.editing_message.is_some() {
+                        let (msg_id, mut edit_text) = self.editing_message.take().unwrap();
+                        let mut done = false;
+                        let mut save = false;
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Editing:").small().color(egui::Color32::YELLOW));
+                            let edit_response = ui.add(
+                                egui::TextEdit::singleline(&mut edit_text)
+                                    .desired_width(f32::INFINITY)
+                            );
+                            save = ui.button("Save").clicked()
+                                || (edit_response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            done = save || ui.button("Cancel").clicked()
+                                || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        });
+                        if save {
+                            let _ = self.network.tx.send(UiToNet::EditMessage { message_id: msg_id, new_body: edit_text.clone() });
+                        }
+                        if !done {
+                            self.editing_message = Some((msg_id, edit_text));
+                        }
+                    } else {
+                    // Reply indicator
+                    let reply_display = self.replying_to.as_ref().map(|(_, from, snippet)| (from.clone(), snippet.clone()));
+                    if let Some((reply_from, reply_snippet)) = reply_display {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("↩️ Replying to {}: \"{}\"", reply_from, reply_snippet))
+                                .small().color(egui::Color32::YELLOW));
+                            if ui.small_button("✖").clicked() {
+                                self.replying_to = None;
+                            }
+                        });
+                    }
+
                     ui.horizontal(|ui| {
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.chat_input)
@@ -1943,21 +2479,50 @@ impl eframe::App for AolApp {
                             if let ChatTarget::Room(room_id) = &self.selected_target.clone() {
                                 let _ = self.network.tx.send(UiToNet::StopTyping { room_id: room_id.clone() });
                             }
-                            self.send_chat();
+                            
+                            // Handle reply if set
+                            let reply_info = self.replying_to.take();
+                            if let Some((reply_id, _, _)) = reply_info {
+                                let body = Self::sanitize_input(&self.chat_input);
+                                if !body.is_empty() {
+                                    match &self.selected_target {
+                                        ChatTarget::Lobby => {
+                                            let _ = self.network.tx.send(UiToNet::ReplyToMessage { reply_to_id: reply_id, body });
+                                        }
+                                        ChatTarget::Direct(to) => {
+                                            let _ = self.network.tx.send(UiToNet::ReplyToDirect { 
+                                                to: to.clone(), 
+                                                reply_to_id: reply_id, 
+                                                body 
+                                            });
+                                        }
+                                        ChatTarget::Room(_) => {
+                                            // Room replies not yet implemented on server
+                                            self.send_chat();
+                                        }
+                                    }
+                                    self.audio_manager.play(SoundEffect::MessageSent);
+                                    self.chat_input.clear();
+                                }
+                            } else {
+                                self.send_chat();
+                            }
                             response.request_focus();
                         } else {
-                            // Keep focus on input so Enter always works
-                            if !response.has_focus() {
+                            // Keep focus on input so Enter always works, but not if a modal is open
+                            if !response.has_focus() && !self.show_add_friend_modal && !self.show_friend_requests_modal && self.viewing_profile.is_none() {
                                 response.request_focus();
                             }
                         }
 
-                        // Escape to clear input
+                        // Escape to clear input and cancel reply
                         if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             self.chat_input.clear();
+                            self.replying_to = None;
                         }
-                    });
-                });
+                    }); // end horizontal input
+                    } // end else (not editing)
+                }); // end CentralPanel
             }
         }
     }
@@ -2033,9 +2598,25 @@ fn format_relative_time(at: &str) -> String {
     format!("{}w", days / 7)
 }
 
+// Render message body with clickable URLs
+fn render_message_body(ui: &mut egui::Ui, text: &str) {
+    // Split on whitespace, detect URLs, render as hyperlinks
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for word in text.split_whitespace() {
+            if word.starts_with("http://") || word.starts_with("https://") {
+                if ui.hyperlink(word).clicked() {
+                    // egui handles opening the URL via hyperlink widget
+                }
+            } else {
+                ui.label(word);
+            }
+        }
+    });
+}
+
 // Convert classic AIM emoticons to emoji
-fn convert_emoticons(text: &str) -> String {
-    text.replace(":)", "😊")
+fn convert_emoticons(text: &str) -> String {    text.replace(":)", "😊")
         .replace(":(", "😢")
         .replace(":D", "😄")
         .replace(";)", "😉")
@@ -2341,6 +2922,21 @@ where
                                 ServerToClient::ReadReceipt { message_id, read_by } => {
                                     let _ = net_tx.send(NetToUi::ReadReceipt { message_id, read_by });
                                 }
+                                ServerToClient::MessageEdited { message_id, new_body, edited_by: _ } => {
+                                    let _ = net_tx.send(NetToUi::MessageEdited { message_id, new_body });
+                                }
+                                ServerToClient::MessageDeleted { message_id, deleted_by: _ } => {
+                                    let _ = net_tx.send(NetToUi::MessageDeleted { message_id });
+                                }
+                                ServerToClient::MessageReaction { message_id, emoji, from } => {
+                                    let _ = net_tx.send(NetToUi::MessageReaction { message_id, emoji, from });
+                                }
+                                ServerToClient::Nudged { from } => {
+                                    let _ = net_tx.send(NetToUi::Nudged { from });
+                                }
+                                ServerToClient::ProfileData { username, bio, status, joined } => {
+                                    let _ = net_tx.send(NetToUi::ProfileData { username, bio, status, joined });
+                                }
                             }
                         }
                     }
@@ -2437,6 +3033,33 @@ where
                     UiToNet::MarkMessageAsRead { message_id } => {
                         send_json(&mut ws_tx, ClientToServer::MarkMessageAsRead { message_id }).await?;
                     }
+                    UiToNet::EditMessage { message_id, new_body } => {
+                        send_json(&mut ws_tx, ClientToServer::EditMessage { message_id, new_body }).await?;
+                    }
+                    UiToNet::DeleteMessage { message_id } => {
+                        send_json(&mut ws_tx, ClientToServer::DeleteMessage { message_id }).await?;
+                    }
+                    UiToNet::ReactToMessage { message_id, emoji } => {
+                        send_json(&mut ws_tx, ClientToServer::ReactToMessage { message_id, emoji }).await?;
+                    }
+                    UiToNet::Nudge { to } => {
+                        send_json(&mut ws_tx, ClientToServer::Nudge { to }).await?;
+                    }
+                    UiToNet::SetStatus { status } => {
+                        send_json(&mut ws_tx, ClientToServer::SetStatus { status }).await?;
+                    }
+                    UiToNet::SetBio { bio } => {
+                        send_json(&mut ws_tx, ClientToServer::SetBio { bio }).await?;
+                    }
+                    UiToNet::FetchProfile { username } => {
+                        send_json(&mut ws_tx, ClientToServer::FetchProfile { username }).await?;
+                    }
+                    UiToNet::ReplyToMessage { reply_to_id, body } => {
+                        send_json(&mut ws_tx, ClientToServer::ReplyToMessage { reply_to_id, body }).await?;
+                    }
+                    UiToNet::ReplyToDirect { to, reply_to_id, body } => {
+                        send_json(&mut ws_tx, ClientToServer::ReplyToDirect { to, reply_to_id, body }).await?;
+                    }
                     UiToNet::Disconnect => {
                         let _ = ws_tx.send(Message::Close(None)).await;
                         break;
@@ -2488,7 +3111,11 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "AOL-Style Messenger",
         options,
-        Box::new(|cc| Ok(Box::new(AolApp::new(cc)))),
+        Box::new(|cc| {
+            let mut app = AolApp::new(cc);
+            app.load_credentials();
+            Ok(Box::new(app))
+        }),
     )
 }
 
