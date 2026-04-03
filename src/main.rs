@@ -290,6 +290,7 @@ struct AolApp {
     confirm_password: String,
     show_password: bool,
     show_confirm_password: bool,
+    remember_me: bool,
     away_text: String,
     chat_input: String,
     dm_target: String,
@@ -468,6 +469,7 @@ impl AolApp {
             confirm_password: String::new(),
             show_password: false,
             show_confirm_password: false,
+            remember_me: true,  // Default to true for convenience
             away_text: String::new(),
             chat_input: String::new(),
             dm_target: String::new(),
@@ -540,6 +542,12 @@ impl AolApp {
     }
 
     fn save_credentials(&self) {
+        if !self.remember_me {
+            // If remember me is unchecked, delete saved credentials
+            let _ = std::fs::remove_file(self.credentials_file());
+            return;
+        }
+        
         let creds = SavedCredentials {
             username: self.username.clone(),
             password: self.password.clone(),
@@ -554,9 +562,16 @@ impl AolApp {
     fn load_credentials(&mut self) {
         if let Ok(data) = std::fs::read_to_string(self.credentials_file()) {
             if let Ok(creds) = serde_json::from_str::<SavedCredentials>(&data) {
-                if !creds.username.is_empty() { self.username = creds.username; }
-                if !creds.password.is_empty() { self.password = creds.password; }
-                if !creds.server_url.is_empty() { self.server_url = creds.server_url; }
+                if !creds.username.is_empty() { 
+                    self.username = creds.username;
+                    self.remember_me = true;
+                }
+                if !creds.password.is_empty() { 
+                    self.password = creds.password;
+                }
+                if !creds.server_url.is_empty() { 
+                    self.server_url = creds.server_url;
+                }
             }
         }
     }
@@ -1539,6 +1554,10 @@ impl eframe::App for AolApp {
                                     });
                                 }
                                 ui.add(egui::TextEdit::singleline(&mut self.server_url).hint_text("Server URL"));
+                                
+                                ui.add_space(8.0);
+                                ui.checkbox(&mut self.remember_me, "Remember me");
+                                
                                 ui.add_space(12.0);
 
                                 let button_label = match self.auth_mode {
@@ -1710,16 +1729,27 @@ impl eframe::App for AolApp {
                         }
 
                         ui.separator();
-                        let online_count = self.buddies.iter().filter(|b| b.away.is_none()).count();
-                        let away_count = self.buddies.len() - online_count;
-                        ui.label(format!("👥 {}/{}", online_count, online_count + away_count));
+                        let online_count = self.buddies.iter()
+                            .filter(|b| Some(&b.username) != self.logged_in_user.as_ref() && b.away.is_none())
+                            .count();
+                        let total_buddies = self.buddies.iter()
+                            .filter(|b| Some(&b.username) != self.logged_in_user.as_ref())
+                            .count();
+                        ui.label(format!("👥 {}/{}", online_count, total_buddies));
                         
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Disconnect").clicked() {
+                            if ui.button("Logout").clicked() {
+                                // Clear saved credentials
+                                let _ = std::fs::remove_file(self.credentials_file());
+                                
+                                // Disconnect and return to login
                                 let _ = self.network.tx.send(UiToNet::Disconnect);
                                 self.screen = Screen::SignIn;
                                 self.logged_in_user = None;
                                 self.selected_target = ChatTarget::Lobby;
+                                self.username.clear();
+                                self.password.clear();
+                                self.remember_me = false;
                             }
 
                             // Audio settings menu
@@ -2008,7 +2038,7 @@ impl eframe::App for AolApp {
                                 egui::TextEdit::singleline(&mut self.dm_target)
                                     .hint_text("Screen name"),
                             );
-                            if ui.button("Open").clicked() {
+                            if ui.button("Start DM").clicked() {
                                 let target = self.dm_target.trim();
                                 if !target.is_empty() {
                                     self.select_target(ChatTarget::Direct(target.to_string()));
@@ -2018,10 +2048,11 @@ impl eframe::App for AolApp {
                         });
                         ui.add_space(8.0);
 
-                        // Separate buddies by status
+                        // Separate buddies by status (exclude self)
                         let buddies = self.buddies.clone();
                         let (online, away): (Vec<_>, Vec<_>) = buddies
                             .iter()
+                            .filter(|b| Some(&b.username) != self.logged_in_user.as_ref())
                             .partition(|b| b.away.is_none());
 
                         // Online buddies section
@@ -2058,12 +2089,36 @@ impl eframe::App for AolApp {
                                     }
 
                                     let target = ChatTarget::Direct(buddy.username.clone());
-                                    if ui.selectable_label(
+                                    let username_response = ui.selectable_label(
                                         self.selected_target == target,
                                         &buddy.username
-                                    ).clicked() {
+                                    );
+                                    
+                                    // Single click to select, double-click to open DM
+                                    if username_response.clicked() {
                                         self.select_target(ChatTarget::Direct(buddy.username.clone()));
                                     }
+                                    if username_response.double_clicked() {
+                                        self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                    }
+                                    
+                                    // Right-click context menu
+                                    username_response.context_menu(|ui| {
+                                        if ui.button("💬 Send DM").clicked() {
+                                            self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("👤 View Profile").clicked() {
+                                            self.viewing_profile = Some(buddy.username.clone());
+                                            let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("💥 Nudge").clicked() {
+                                            let _ = self.network.tx.send(UiToNet::Nudge { to: buddy.username.clone() });
+                                            self.show_toast(format!("Nudged {}!", buddy.username), ToastKind::Info);
+                                            ui.close_menu();
+                                        }
+                                    });
 
                                     // Show custom status if set
                                     if let Some(ref status) = buddy.status {
@@ -2113,12 +2168,36 @@ impl eframe::App for AolApp {
                                     }
 
                                     let target = ChatTarget::Direct(buddy.username.clone());
-                                    if ui.selectable_label(
+                                    let username_response = ui.selectable_label(
                                         self.selected_target == target,
                                         &buddy.username
-                                    ).clicked() {
+                                    );
+                                    
+                                    // Single click to select, double-click to open DM
+                                    if username_response.clicked() {
                                         self.select_target(ChatTarget::Direct(buddy.username.clone()));
                                     }
+                                    if username_response.double_clicked() {
+                                        self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                    }
+                                    
+                                    // Right-click context menu
+                                    username_response.context_menu(|ui| {
+                                        if ui.button("💬 Send DM").clicked() {
+                                            self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("👤 View Profile").clicked() {
+                                            self.viewing_profile = Some(buddy.username.clone());
+                                            let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("💥 Nudge").clicked() {
+                                            let _ = self.network.tx.send(UiToNet::Nudge { to: buddy.username.clone() });
+                                            self.show_toast(format!("Nudged {}!", buddy.username), ToastKind::Info);
+                                            ui.close_menu();
+                                        }
+                                    });
 
                                     if let Some(ref away_msg) = buddy.away {
                                         ui.label(
