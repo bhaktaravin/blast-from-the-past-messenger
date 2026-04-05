@@ -368,6 +368,11 @@ struct AolApp {
     // Avatar upload
     show_avatar_modal: bool,
     avatar_upload_path: String,
+    // Buddy groups
+    buddy_groups: HashMap<String, Vec<String>>, // group_name -> list of usernames
+    show_group_modal: bool,
+    group_modal_username: Option<String>,
+    new_group_name: String,
     // Boot sequence
     boot_done: bool,
     boot_line: usize,
@@ -545,6 +550,16 @@ impl AolApp {
             bio_editing: false,
             show_avatar_modal: false,
             avatar_upload_path: String::new(),
+            buddy_groups: {
+                let mut groups = HashMap::new();
+                groups.insert("Friends".to_string(), Vec::new());
+                groups.insert("Work".to_string(), Vec::new());
+                groups.insert("Family".to_string(), Vec::new());
+                groups
+            },
+            show_group_modal: false,
+            group_modal_username: None,
+            new_group_name: String::new(),
         }
     }
 
@@ -1765,6 +1780,33 @@ impl eframe::App for AolApp {
                 });
             }
             Screen::Chat => {
+                // Global keyboard shortcuts
+                ctx.input(|i| {
+                    // Ctrl+K or Cmd+K: Focus search (jump to chat)
+                    if (i.modifiers.ctrl || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::K) {
+                        self.search_query.clear();
+                        // Focus will be handled by the search field
+                    }
+                    
+                    // Ctrl+D or Cmd+D: Open DM input
+                    if (i.modifiers.ctrl || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::D) {
+                        // Focus DM target field (will be handled by the field itself)
+                    }
+                    
+                    // Ctrl+F or Cmd+F: Focus search
+                    if (i.modifiers.ctrl || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::F) {
+                        // Focus search field
+                    }
+                    
+                    // Escape: Close modals
+                    if i.key_pressed(egui::Key::Escape) {
+                        self.show_add_friend_modal = false;
+                        self.show_friend_requests_modal = false;
+                        self.show_avatar_modal = false;
+                        self.viewing_profile = None;
+                    }
+                });
+
                 egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
                     // First row: Title, status, user info, and main actions
                     ui.horizontal(|ui| {
@@ -2306,6 +2348,19 @@ impl eframe::App for AolApp {
                                                 .color(egui::Color32::GRAY)
                                         );
                                     }
+                                    
+                                    // Show idle time if > 5 minutes
+                                    if let Some(idle_secs) = buddy.last_activity {
+                                        if idle_secs > 300 { // 5 minutes
+                                            let idle_str = format_idle_time(idle_secs);
+                                            ui.label(
+                                                egui::RichText::new(format!("(Idle {})", idle_str))
+                                                    .small()
+                                                    .italics()
+                                                    .color(egui::Color32::from_rgb(150, 150, 150))
+                                            );
+                                        }
+                                    }
                                 });
                             }
                         }
@@ -2445,6 +2500,19 @@ impl eframe::App for AolApp {
                                                 .small()
                                                 .color(egui::Color32::GRAY)
                                         );
+                                    }
+                                    
+                                    // Show idle time if > 5 minutes
+                                    if let Some(idle_secs) = buddy.last_activity {
+                                        if idle_secs > 300 { // 5 minutes
+                                            let idle_str = format_idle_time(idle_secs);
+                                            ui.label(
+                                                egui::RichText::new(format!("(Idle {})", idle_str))
+                                                    .small()
+                                                    .italics()
+                                                    .color(egui::Color32::from_rgb(150, 150, 150))
+                                            );
+                                        }
                                     }
                                 });
                             }
@@ -2596,11 +2664,12 @@ impl eframe::App for AolApp {
                                         );
                                         let relative = format_relative_time(&message.at);
                                         if !relative.is_empty() {
+                                            let full_time = format_full_timestamp(&message.at);
                                             ui.label(
                                                 egui::RichText::new(format!("• {}", relative))
                                                     .small()
                                                     .color(egui::Color32::GRAY)
-                                            );
+                                            ).on_hover_text(full_time);
                                         }
                                     });
                                     // Convert emoticons and display message
@@ -2905,6 +2974,31 @@ fn format_relative_time(at: &str) -> String {
         return format!("{}d", days);
     }
     format!("{}w", days / 7)
+}
+
+fn format_full_timestamp(at: &str) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(at).ok();
+    let timestamp = match parsed {
+        Some(value) => value.with_timezone(&chrono::Local),
+        None => return String::new(),
+    };
+    timestamp.format("%B %d, %Y at %I:%M %p").to_string()
+}
+
+fn format_idle_time(secs: i64) -> String {
+    if secs < 60 {
+        return format!("{}s", secs);
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{}m", mins);
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{}h", hours);
+    }
+    let days = hours / 24;
+    format!("{}d", days)
 }
 
 // Render message body with clickable URLs

@@ -30,6 +30,8 @@ pub struct UserStatus {
     pub status: Option<String>,
     /// Avatar URL or base64 encoded image data
     pub avatar_url: Option<String>,
+    /// Last activity timestamp (Unix timestamp in seconds)
+    pub last_activity: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

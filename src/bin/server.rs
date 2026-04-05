@@ -30,6 +30,7 @@ struct Peer {
     status: Option<String>,
     tx: mpsc::UnboundedSender<Message>,
     current_room: Option<String>,
+    last_activity: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -119,6 +120,7 @@ async fn handle_connection(
                 status: None,
                 tx: out_tx.clone(),
                 current_room: None,
+                last_activity: Instant::now(),
             },
         );
     }
@@ -284,6 +286,7 @@ async fn handle_client_event(
                 );
                 return;
             }
+            update_peer_activity(peers, id);
             let _ = insert_message(db, user_id, None, &body).await;
             send_chat_to_all(db, peers, user_id, &from, &body).await;
         }
@@ -311,6 +314,7 @@ async fn handle_client_event(
                 );
                 return;
             }
+            update_peer_activity(peers, id);
             if let Ok(Some(target_id)) = get_user_id_by_name(db, &to).await {
                 if is_blocked_or_muted(db, target_id, user_id).await {
                     send_to_peer(
@@ -1124,14 +1128,19 @@ fn send_dm_to_user(
 fn broadcast_presence(peers: &Arc<Mutex<HashMap<usize, Peer>>>) {
     let users = {
         if let Ok(guard) = peers.lock() {
+            let now = Instant::now();
             guard
                 .values()
                 .filter(|peer| peer.user_id.is_some())
-                .map(|peer| UserStatus {
-                    username: peer.username.clone(),
-                    away: peer.away.clone(),
-                    status: peer.status.clone(),
-                    avatar_url: None, // Will be fetched from DB when needed
+                .map(|peer| {
+                    let idle_secs = now.duration_since(peer.last_activity).as_secs() as i64;
+                    UserStatus {
+                        username: peer.username.clone(),
+                        away: peer.away.clone(),
+                        status: peer.status.clone(),
+                        avatar_url: None, // Will be fetched from DB when needed
+                        last_activity: Some(idle_secs),
+                    }
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -1139,6 +1148,14 @@ fn broadcast_presence(peers: &Arc<Mutex<HashMap<usize, Peer>>>) {
         }
     };
     send_to_all(peers, ServerToClient::Presence { users });
+}
+
+fn update_peer_activity(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize) {
+    if let Ok(mut guard) = peers.lock() {
+        if let Some(peer) = guard.get_mut(&id) {
+            peer.last_activity = Instant::now();
+        }
+    }
 }
 
 fn send_to_peer(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize, payload: ServerToClient) {
