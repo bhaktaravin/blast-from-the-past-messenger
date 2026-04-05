@@ -600,6 +600,27 @@ impl AolApp {
                 }
             }
         }
+        // Load buddy groups
+        self.load_buddy_groups();
+    }
+
+    fn buddy_groups_file(&self) -> std::path::PathBuf {
+        self.credentials_path.join("buddy_groups.json")
+    }
+
+    fn save_buddy_groups(&self) {
+        if let Ok(json) = serde_json::to_string(&self.buddy_groups) {
+            let _ = std::fs::create_dir_all(&self.credentials_path);
+            let _ = std::fs::write(self.buddy_groups_file(), json);
+        }
+    }
+
+    fn load_buddy_groups(&mut self) {
+        if let Ok(data) = std::fs::read_to_string(self.buddy_groups_file()) {
+            if let Ok(groups) = serde_json::from_str::<HashMap<String, Vec<String>>>(&data) {
+                self.buddy_groups = groups;
+            }
+        }
     }
 
     fn draw_background(&self, ctx: &egui::Context) {
@@ -2026,6 +2047,44 @@ impl eframe::App for AolApp {
                                             self.show_toast("Avatar updated!".to_string(), ToastKind::Success);
                                             self.show_avatar_modal = false;
                                         }
+                                    }
+                                });
+                            });
+                    }
+
+                    // Modal for creating new buddy group
+                    if self.show_group_modal {
+                        egui::Window::new("Create Buddy Group")
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                ui.label("Group name:");
+                                let text_edit = ui.add(egui::TextEdit::singleline(&mut self.new_group_name).hint_text("Work, Friends, etc."));
+                                text_edit.request_focus();
+                                
+                                ui.horizontal(|ui| {
+                                    if ui.button("Create").clicked() || (text_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                        let group_name = self.new_group_name.trim().to_string();
+                                        if !group_name.is_empty() && !self.buddy_groups.contains_key(&group_name) {
+                                            self.buddy_groups.insert(group_name.clone(), Vec::new());
+                                            // Add the buddy if one was selected
+                                            if let Some(ref username) = self.group_modal_username {
+                                                if let Some(group) = self.buddy_groups.get_mut(&group_name) {
+                                                    group.push(username.clone());
+                                                }
+                                            }
+                                            self.save_buddy_groups();
+                                            self.show_toast(format!("Created group: {}", group_name), ToastKind::Success);
+                                            self.show_group_modal = false;
+                                            self.new_group_name.clear();
+                                            self.group_modal_username = None;
+                                        }
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.show_group_modal = false;
+                                        self.new_group_name.clear();
+                                        self.group_modal_username = None;
                                     }
                                 });
                             });
