@@ -28,6 +28,8 @@ pub struct UserStatus {
     pub away: Option<String>,
     /// Custom status emoji + text e.g. "🎮 Playing Halo"
     pub status: Option<String>,
+    /// Avatar URL or base64 encoded image data
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +79,8 @@ pub enum ClientToServer {
     ReactToMessage { message_id: i64, emoji: String },
     /// Nudge a user (screen shake)
     Nudge { to: String },
+    /// Wink at a user (animated emoji)
+    Wink { to: String, emoji: String },
     /// Update custom status (shown in buddy list)
     SetStatus { status: Option<String> },
     /// Update profile bio
@@ -86,6 +90,8 @@ pub enum ClientToServer {
     /// Reply to a specific message
     ReplyToMessage { reply_to_id: i64, body: String },
     ReplyToDirect { to: String, reply_to_id: i64, body: String },
+    /// Set avatar (base64 encoded image data)
+    SetAvatar { avatar_data: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,8 +135,10 @@ pub enum ServerToClient {
     MessageReaction { message_id: i64, emoji: String, from: String },
     /// Someone nudged you
     Nudged { from: String },
+    /// Someone winked at you
+    Winked { from: String, emoji: String },
     /// A user's profile data
-    ProfileData { username: String, bio: String, status: Option<String>, joined: String },
+    ProfileData { username: String, bio: String, status: Option<String>, joined: String, avatar_url: Option<String> },
 }
 
 

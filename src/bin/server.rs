@@ -232,6 +232,12 @@ async fn handle_client_event(
                         from: from.clone(),
                         encrypted_body: encrypted_body.clone(),
                     });
+                    
+                    // Auto-responder: if target is away, send their away message back (unencrypted)
+                    if let Some(away_message) = get_peer_away_message(peers, target_id) {
+                        send_dm_to_user(peers, user_id, &to, &format!("[Auto-reply] {}", away_message));
+                        let _ = insert_message(db, target_id, Some(user_id), &format!("[Auto-reply] {}", away_message)).await;
+                    }
                 }
                 send_threads_to_peer(db, peers, id, user_id).await;
             }
@@ -321,6 +327,14 @@ async fn handle_client_event(
                 send_threads_to_peer(db, peers, id, user_id).await;
                 if delivered {
                     send_threads_to_user_id(db, peers, target_id).await;
+                    
+                    // Auto-responder: if target is away, send their away message back
+                    if let Some(away_message) = get_peer_away_message(peers, target_id) {
+                        // Send auto-reply back to sender
+                        send_dm_to_user(peers, user_id, &to, &format!("[Auto-reply] {}", away_message));
+                        // Also store the auto-reply in the database
+                        let _ = insert_message(db, target_id, Some(user_id), &format!("[Auto-reply] {}", away_message)).await;
+                    }
                 }
                 if !delivered {
                     send_to_peer(
@@ -855,6 +869,15 @@ async fn handle_client_event(
                 }
             }
         }
+        ClientToServer::Wink { to, emoji } => {
+            if let Some((from, _)) = get_peer_identity(peers, id) {
+                if let Ok(Some(target_id)) = get_user_id_by_name(db, &to).await {
+                    if let Some((target_peer_id, _)) = get_peer_by_user_id(peers, target_id) {
+                        send_to_peer(peers, target_peer_id, ServerToClient::Winked { from, emoji });
+                    }
+                }
+            }
+        }
         ClientToServer::SetStatus { status } => {
             if let Ok(mut guard) = peers.lock() {
                 if let Some(peer) = guard.get_mut(&id) {
@@ -880,7 +903,7 @@ async fn handle_client_event(
         }
         ClientToServer::FetchProfile { username } => {
             if let Ok(Some(row)) = sqlx::query(
-                "SELECT username, bio, status, created_at FROM users WHERE username = $1"
+                "SELECT username, bio, status, avatar_url, created_at FROM users WHERE username = $1"
             )
             .bind(&username)
             .fetch_optional(db)
@@ -889,12 +912,14 @@ async fn handle_client_event(
                 use sqlx::Row;
                 let bio: String = row.get::<Option<String>, _>("bio").unwrap_or_default();
                 let status: Option<String> = row.get("status");
+                let avatar_url: Option<String> = row.get("avatar_url");
                 let joined: chrono::DateTime<chrono::Utc> = row.get("created_at");
                 send_to_peer(peers, id, ServerToClient::ProfileData {
                     username,
                     bio,
                     status,
                     joined: joined.format("%B %Y").to_string(),
+                    avatar_url,
                 });
             }
         }
@@ -919,6 +944,14 @@ async fn handle_client_event(
             if let Ok(Some(target_id)) = get_user_id_by_name(db, &to).await {
                 let _ = insert_message_with_reply(db, user_id, Some(target_id), &body, Some(reply_to_id)).await;
                 send_dm_to_user(peers, target_id, &from, &body);
+            }
+        }
+        ClientToServer::SetAvatar { avatar_data } => {
+            if let Some((_, user_id)) = get_peer_identity(peers, id) {
+                // Store avatar as base64 data directly in database
+                let _ = sqlx::query("UPDATE users SET avatar_url = $1 WHERE id = $2")
+                    .bind(&avatar_data).bind(user_id).execute(db).await;
+                broadcast_presence(peers);
             }
         }
     }
@@ -980,6 +1013,14 @@ fn get_peer_by_user_id(peers: &Arc<Mutex<HashMap<usize, Peer>>>, user_id: i64) -
     peers.lock().ok().and_then(|guard| {
         guard.iter().find(|(_, peer)| peer.user_id == Some(user_id))
             .map(|(id, peer)| (*id, peer.username.clone()))
+    })
+}
+
+fn get_peer_away_message(peers: &Arc<Mutex<HashMap<usize, Peer>>>, user_id: i64) -> Option<String> {
+    peers.lock().ok().and_then(|guard| {
+        guard.values()
+            .find(|peer| peer.user_id == Some(user_id))
+            .and_then(|peer| peer.away.clone())
     })
 }
 
@@ -1090,6 +1131,7 @@ fn broadcast_presence(peers: &Arc<Mutex<HashMap<usize, Peer>>>) {
                     username: peer.username.clone(),
                     away: peer.away.clone(),
                     status: peer.status.clone(),
+                    avatar_url: None, // Will be fetched from DB when needed
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -1172,11 +1214,17 @@ async fn init_db(db: &PgPool) -> Result<(), sqlx::Error> {
             password_hash TEXT NOT NULL,\
             bio TEXT NOT NULL DEFAULT '',\
             status TEXT,\
+            avatar_url TEXT,\
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\
         )",
     )
     .execute(db)
     .await?;
+    
+    // Add avatar_url column if it doesn't exist (migration for existing databases)
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT")
+        .execute(db)
+        .await;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS chat_rooms (\

@@ -215,11 +215,13 @@ enum UiToNet {
     DeleteMessage { message_id: i64 },
     ReactToMessage { message_id: i64, emoji: String },
     Nudge { to: String },
+    Wink { to: String, emoji: String },
     SetStatus { status: Option<String> },
     SetBio { bio: String },
     FetchProfile { username: String },
     ReplyToMessage { reply_to_id: i64, body: String },
     ReplyToDirect { to: String, reply_to_id: i64, body: String },
+    SetAvatar { avatar_data: String },
 }
 
 enum NetToUi {
@@ -259,7 +261,8 @@ enum NetToUi {
     MessageDeleted { message_id: i64 },
     MessageReaction { message_id: i64, emoji: String, from: String },
     Nudged { from: String },
-    ProfileData { username: String, bio: String, status: Option<String>, joined: String },
+    Winked { from: String, emoji: String },
+    ProfileData { username: String, bio: String, status: Option<String>, joined: String, avatar_url: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,7 +338,9 @@ struct AolApp {
     reactions: HashMap<i64, Vec<(String, String)>>,
     // Nudge animation: time remaining for screen shake
     nudge_time: f32,
-    nudge_from: Option<String>, // message_id -> list of users who read
+    nudge_from: Option<String>,
+    // Wink animation: emoji, position, time, from
+    wink_animation: Option<(String, f32, f32, String)>, // (emoji, x_pos, time, from) // message_id -> list of users who read
     // E2E encryption: shared secrets keyed by peer username (native only)
     // Stored as raw 32-byte arrays to avoid lifetime issues with x25519_dalek types
     #[cfg(not(target_arch = "wasm32"))]
@@ -357,9 +362,12 @@ struct AolApp {
     custom_status: String,
     // Profile modal
     viewing_profile: Option<String>,
-    profile_cache: HashMap<String, (String, Option<String>, String)>, // (bio, status, joined)
+    profile_cache: HashMap<String, (String, Option<String>, String, Option<String>)>, // (bio, status, joined, avatar_url)
     bio_edit: String,
     bio_editing: bool,
+    // Avatar upload
+    show_avatar_modal: bool,
+    avatar_upload_path: String,
     // Boot sequence
     boot_done: bool,
     boot_line: usize,
@@ -506,6 +514,7 @@ impl AolApp {
             reactions: HashMap::new(),
             nudge_time: 0.0,
             nudge_from: None,
+            wink_animation: None,
             #[cfg(not(target_arch = "wasm32"))]
             e2e_shared_secrets: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -534,6 +543,8 @@ impl AolApp {
             profile_cache: HashMap::new(),
             bio_edit: String::new(),
             bio_editing: false,
+            show_avatar_modal: false,
+            avatar_upload_path: String::new(),
         }
     }
 
@@ -893,8 +904,13 @@ impl AolApp {
                     self.show_toast(format!("💥 {} nudged you!", from), ToastKind::Info);
                     self.audio_manager.play(SoundEffect::MessageReceived);
                 }
-                NetToUi::ProfileData { username, bio, status, joined } => {
-                    self.profile_cache.insert(username.clone(), (bio, status, joined));
+                NetToUi::Winked { from, emoji } => {
+                    self.wink_animation = Some((emoji.clone(), 0.0, 0.0, from.clone()));
+                    self.show_toast(format!("{} {} winked at you!", emoji, from), ToastKind::Info);
+                    self.audio_manager.play(SoundEffect::MessageReceived);
+                }
+                NetToUi::ProfileData { username, bio, status, joined, avatar_url } => {
+                    self.profile_cache.insert(username.clone(), (bio, status, joined, avatar_url));
                     if self.viewing_profile.as_ref() == Some(&username) {
                         // Profile modal is open, it will refresh automatically
                     }
@@ -1219,6 +1235,39 @@ impl eframe::App for AolApp {
             );
             ctx.request_repaint();
         }
+        
+        // Wink animation - emoji bounces across screen
+        if let Some((emoji, x_pos, time, from)) = &mut self.wink_animation {
+            let dt = ctx.input(|i| i.stable_dt).min(0.05);
+            *time += dt;
+            *x_pos += dt * 400.0; // Move 400 pixels per second
+            
+            let screen_rect = ctx.screen_rect();
+            let y_pos = screen_rect.center().y + (*time * 3.0).sin() * 50.0; // Bounce up and down
+            
+            // Draw the emoji
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("wink_animation"),
+            ));
+            
+            let size = 48.0 + (*time * 8.0).sin() * 8.0; // Pulse size
+            painter.text(
+                egui::pos2(*x_pos, y_pos),
+                egui::Align2::CENTER_CENTER,
+                emoji,
+                egui::FontId::proportional(size),
+                egui::Color32::WHITE,
+            );
+            
+            // Clear animation after it goes off screen or after 2 seconds
+            if *x_pos > screen_rect.right() + 50.0 || *time > 2.0 {
+                self.wink_animation = None;
+            } else {
+                ctx.request_repaint();
+            }
+        }
+        
         if self.startup_repaint_left > 0 {
             self.startup_repaint_left = self.startup_repaint_left.saturating_sub(1);
             ctx.request_repaint();
@@ -1896,6 +1945,50 @@ impl eframe::App for AolApp {
                             });
                     }
 
+                    // Modal for Avatar Upload
+                    if self.show_avatar_modal {
+                        egui::Window::new("Change Avatar")
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                ui.label("Enter image URL or emoji:");
+                                ui.add(egui::TextEdit::singleline(&mut self.avatar_upload_path).hint_text("https://... or 🎮"));
+                                
+                                ui.horizontal(|ui| {
+                                    if ui.button("Set Avatar").clicked() {
+                                        if !self.avatar_upload_path.trim().is_empty() {
+                                            let _ = self.network.tx.send(UiToNet::SetAvatar { 
+                                                avatar_data: self.avatar_upload_path.clone() 
+                                            });
+                                            self.show_toast("Avatar updated!".to_string(), ToastKind::Success);
+                                            self.show_avatar_modal = false;
+                                            self.avatar_upload_path.clear();
+                                        }
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.show_avatar_modal = false;
+                                        self.avatar_upload_path.clear();
+                                    }
+                                });
+                                
+                                ui.separator();
+                                ui.label("Quick emoji avatars:");
+                                ui.horizontal_wrapped(|ui| {
+                                    let emojis = ["😀", "😎", "🤖", "👾", "🎮", "🎨", "🎭", "🎪", "🎯", "🎲", "🎸", "🎹", "🚀", "🌟", "⭐", "💎"];
+                                    for emoji in emojis {
+                                        if ui.button(emoji).clicked() {
+                                            let _ = self.network.tx.send(UiToNet::SetAvatar { 
+                                                avatar_data: emoji.to_string() 
+                                            });
+                                            self.show_toast("Avatar updated!".to_string(), ToastKind::Success);
+                                            self.show_avatar_modal = false;
+                                        }
+                                    }
+                                });
+                            });
+                    }
+
                     // Profile modal
                     if let Some(ref username) = self.viewing_profile.clone() {
                         let mut close_modal = false;
@@ -1905,29 +1998,62 @@ impl eframe::App for AolApp {
                             .default_size([400.0, 300.0])
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                             .show(ctx, |ui| {
-                                // Profile circle
-                                let color = username_to_color(username);
-                                let initials = get_initials(username);
                                 ui.vertical_centered(|ui| {
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(64.0, 64.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(rect.center(), 32.0, color);
-                                    ui.painter().text(
-                                        rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        &initials,
-                                        egui::FontId::proportional(28.0),
-                                        egui::Color32::WHITE,
-                                    );
+                                    // Show avatar if available, otherwise show colored circle
+                                    if let Some((_, _, _, Some(avatar_url))) = self.profile_cache.get(username) {
+                                        if !avatar_url.is_empty() {
+                                            // Display avatar image (base64 or URL)
+                                            ui.label(egui::RichText::new("🖼️").size(64.0));
+                                            ui.label(egui::RichText::new("[Avatar Image]").small().italics());
+                                        } else {
+                                            // Fallback to colored circle
+                                            let color = username_to_color(username);
+                                            let initials = get_initials(username);
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                egui::vec2(64.0, 64.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().circle_filled(rect.center(), 32.0, color);
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                &initials,
+                                                egui::FontId::proportional(28.0),
+                                                egui::Color32::WHITE,
+                                            );
+                                        }
+                                    } else {
+                                        // Fallback to colored circle
+                                        let color = username_to_color(username);
+                                        let initials = get_initials(username);
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(64.0, 64.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(rect.center(), 32.0, color);
+                                        ui.painter().text(
+                                            rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            &initials,
+                                            egui::FontId::proportional(28.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+                                    
+                                    // Add "Change Avatar" button for own profile
+                                    if self.logged_in_user.as_ref() == Some(username) {
+                                        if ui.button("📷 Change Avatar").clicked() {
+                                            self.show_avatar_modal = true;
+                                        }
+                                    }
+                                    
                                     ui.add_space(8.0);
                                     ui.heading(username);
                                 });
 
                                 ui.separator();
 
-                                if let Some((bio, status, joined)) = self.profile_cache.get(username).cloned() {
+                                if let Some((bio, status, joined, _avatar)) = self.profile_cache.get(username).cloned() {
                                     if let Some(ref status_text) = status {
                                         ui.label(egui::RichText::new(status_text).italics().color(egui::Color32::GRAY));
                                         ui.add_space(4.0);
@@ -2065,22 +2191,61 @@ impl eframe::App for AolApp {
 
                             for buddy in &online {
                                 ui.horizontal(|ui| {
-                                    // Small profile circle
-                                    let color = username_to_color(&buddy.username);
-                                    let initials = get_initials(&buddy.username);
-
+                                    // Small profile circle or avatar
                                     let (rect, response) = ui.allocate_exact_size(
                                         egui::vec2(24.0, 24.0),
                                         egui::Sense::click(),
                                     );
-                                    ui.painter().circle_filled(rect.center(), 12.0, color);
-                                    ui.painter().text(
-                                        rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        &initials,
-                                        egui::FontId::proportional(10.0),
-                                        egui::Color32::WHITE,
-                                    );
+                                    
+                                    // Show avatar if available, otherwise colored circle
+                                    if let Some(ref avatar_url) = buddy.avatar_url {
+                                        if !avatar_url.is_empty() {
+                                            // If it's a single emoji, display it
+                                            if avatar_url.chars().count() <= 2 {
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    avatar_url,
+                                                    egui::FontId::proportional(20.0),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            } else {
+                                                // For URLs, show a placeholder icon
+                                                ui.painter().circle_filled(rect.center(), 12.0, egui::Color32::from_rgb(100, 100, 100));
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    "🖼️",
+                                                    egui::FontId::proportional(12.0),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            }
+                                        } else {
+                                            // Fallback to colored circle
+                                            let color = username_to_color(&buddy.username);
+                                            let initials = get_initials(&buddy.username);
+                                            ui.painter().circle_filled(rect.center(), 12.0, color);
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                &initials,
+                                                egui::FontId::proportional(10.0),
+                                                egui::Color32::WHITE,
+                                            );
+                                        }
+                                    } else {
+                                        // Fallback to colored circle
+                                        let color = username_to_color(&buddy.username);
+                                        let initials = get_initials(&buddy.username);
+                                        ui.painter().circle_filled(rect.center(), 12.0, color);
+                                        ui.painter().text(
+                                            rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            &initials,
+                                            egui::FontId::proportional(10.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
 
                                     // Click profile circle to view profile
                                     if response.clicked() {
@@ -2118,6 +2283,19 @@ impl eframe::App for AolApp {
                                             self.show_toast(format!("Nudged {}!", buddy.username), ToastKind::Info);
                                             ui.close_menu();
                                         }
+                                        ui.menu_button("😉 Wink", |ui| {
+                                            let emojis = ["😉", "😘", "👋", "💖", "✨", "🎉", "👍", "🔥"];
+                                            for emoji in emojis {
+                                                if ui.button(emoji).clicked() {
+                                                    let _ = self.network.tx.send(UiToNet::Wink { 
+                                                        to: buddy.username.clone(), 
+                                                        emoji: emoji.to_string() 
+                                                    });
+                                                    self.show_toast(format!("Winked {} at {}!", emoji, buddy.username), ToastKind::Info);
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        });
                                     });
 
                                     // Show custom status if set
@@ -2144,22 +2322,61 @@ impl eframe::App for AolApp {
 
                             for buddy in &away {
                                 ui.horizontal(|ui| {
-                                    // Small profile circle
-                                    let color = username_to_color(&buddy.username);
-                                    let initials = get_initials(&buddy.username);
-
+                                    // Small profile circle or avatar
                                     let (rect, response) = ui.allocate_exact_size(
                                         egui::vec2(24.0, 24.0),
                                         egui::Sense::click(),
                                     );
-                                    ui.painter().circle_filled(rect.center(), 12.0, color);
-                                    ui.painter().text(
-                                        rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        &initials,
-                                        egui::FontId::proportional(10.0),
-                                        egui::Color32::WHITE,
-                                    );
+                                    
+                                    // Show avatar if available, otherwise colored circle
+                                    if let Some(ref avatar_url) = buddy.avatar_url {
+                                        if !avatar_url.is_empty() {
+                                            // If it's a single emoji, display it
+                                            if avatar_url.chars().count() <= 2 {
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    avatar_url,
+                                                    egui::FontId::proportional(20.0),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            } else {
+                                                // For URLs, show a placeholder icon
+                                                ui.painter().circle_filled(rect.center(), 12.0, egui::Color32::from_rgb(100, 100, 100));
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    "🖼️",
+                                                    egui::FontId::proportional(12.0),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            }
+                                        } else {
+                                            // Fallback to colored circle
+                                            let color = username_to_color(&buddy.username);
+                                            let initials = get_initials(&buddy.username);
+                                            ui.painter().circle_filled(rect.center(), 12.0, color);
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                &initials,
+                                                egui::FontId::proportional(10.0),
+                                                egui::Color32::WHITE,
+                                            );
+                                        }
+                                    } else {
+                                        // Fallback to colored circle
+                                        let color = username_to_color(&buddy.username);
+                                        let initials = get_initials(&buddy.username);
+                                        ui.painter().circle_filled(rect.center(), 12.0, color);
+                                        ui.painter().text(
+                                            rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            &initials,
+                                            egui::FontId::proportional(10.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
 
                                     // Click profile circle to view profile
                                     if response.clicked() {
@@ -2197,6 +2414,19 @@ impl eframe::App for AolApp {
                                             self.show_toast(format!("Nudged {}!", buddy.username), ToastKind::Info);
                                             ui.close_menu();
                                         }
+                                        ui.menu_button("😉 Wink", |ui| {
+                                            let emojis = ["😉", "😘", "👋", "💖", "✨", "🎉", "👍", "🔥"];
+                                            for emoji in emojis {
+                                                if ui.button(emoji).clicked() {
+                                                    let _ = self.network.tx.send(UiToNet::Wink { 
+                                                        to: buddy.username.clone(), 
+                                                        emoji: emoji.to_string() 
+                                                    });
+                                                    self.show_toast(format!("Winked {} at {}!", emoji, buddy.username), ToastKind::Info);
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        });
                                     });
 
                                     if let Some(ref away_msg) = buddy.away {
@@ -3013,8 +3243,11 @@ where
                                 ServerToClient::Nudged { from } => {
                                     let _ = net_tx.send(NetToUi::Nudged { from });
                                 }
-                                ServerToClient::ProfileData { username, bio, status, joined } => {
-                                    let _ = net_tx.send(NetToUi::ProfileData { username, bio, status, joined });
+                                ServerToClient::Winked { from, emoji } => {
+                                    let _ = net_tx.send(NetToUi::Winked { from, emoji });
+                                }
+                                ServerToClient::ProfileData { username, bio, status, joined, avatar_url } => {
+                                    let _ = net_tx.send(NetToUi::ProfileData { username, bio, status, joined, avatar_url });
                                 }
                             }
                         }
@@ -3124,6 +3357,9 @@ where
                     UiToNet::Nudge { to } => {
                         send_json(&mut ws_tx, ClientToServer::Nudge { to }).await?;
                     }
+                    UiToNet::Wink { to, emoji } => {
+                        send_json(&mut ws_tx, ClientToServer::Wink { to, emoji }).await?;
+                    }
                     UiToNet::SetStatus { status } => {
                         send_json(&mut ws_tx, ClientToServer::SetStatus { status }).await?;
                     }
@@ -3138,6 +3374,9 @@ where
                     }
                     UiToNet::ReplyToDirect { to, reply_to_id, body } => {
                         send_json(&mut ws_tx, ClientToServer::ReplyToDirect { to, reply_to_id, body }).await?;
+                    }
+                    UiToNet::SetAvatar { avatar_data } => {
+                        send_json(&mut ws_tx, ClientToServer::SetAvatar { avatar_data }).await?;
                     }
                     UiToNet::Disconnect => {
                         let _ = ws_tx.send(Message::Close(None)).await;
