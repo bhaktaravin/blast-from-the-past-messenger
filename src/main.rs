@@ -34,7 +34,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 // Web-only imports
 #[cfg(target_arch = "wasm32")]
-use web_sys::WebSocket;
+use wasm_bindgen::JsCast;
 
 // Web stub for mpsc (use a simple Arc<Mutex<Vec>> based queue)
 #[cfg(target_arch = "wasm32")]
@@ -3601,9 +3601,20 @@ fn main() {
     let web_options = eframe::WebOptions::default();
 
     wasm_bindgen_futures::spawn_local(async {
+        let document = web_sys::window()
+            .expect("no window")
+            .document()
+            .expect("no document");
+        
+        let canvas = document
+            .get_element_by_id("the_canvas_id")
+            .expect("no canvas element")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("element is not a canvas");
+
         eframe::WebRunner::new()
             .start(
-                "the_canvas_id",
+                canvas,
                 web_options,
                 Box::new(|cc| Ok(Box::new(AolApp::new(cc)))),
             )
