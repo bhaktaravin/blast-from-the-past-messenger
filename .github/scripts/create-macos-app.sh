@@ -28,12 +28,20 @@ cat > "$APP/Contents/Info.plist" << 'EOF'
 </plist>
 EOF
 
+# Install create-dmg if not already installed
+if ! command -v create-dmg &> /dev/null; then
+    echo "Installing create-dmg..."
+    brew install create-dmg
+fi
+
 # Create DMG
-brew install create-dmg
 create-dmg \
   --volname "Blast From The Past" \
   --window-size 600 400 \
   --icon-size 100 \
   --app-drop-link 450 200 \
   "blast-from-the-past-macos.dmg" \
-  "$APP"
+  "$APP" || {
+    echo "create-dmg failed, creating simple DMG..."
+    hdiutil create -volname "Blast From The Past" -srcfolder "$APP" -ov -format UDZO "blast-from-the-past-macos.dmg"
+  }
