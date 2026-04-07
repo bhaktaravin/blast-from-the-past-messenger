@@ -58,7 +58,7 @@ jobs:
 
       - name: Build
         env:
-          DATABASE_URL: sqlite::memory:
+          DATABASE_URL: "sqlite::memory:"
         run: cargo build --release --bin chatmessagediscordclone --features client
 
       - name: Build Installer (Inno Setup)
@@ -97,7 +97,7 @@ jobs:
 
       - name: Build
         env:
-          DATABASE_URL: sqlite::memory:
+          DATABASE_URL: "sqlite::memory:"
         run: cargo build --release --bin chatmessagediscordclone --features client
 
       - name: Create DMG
@@ -146,7 +146,7 @@ jobs:
 
       - name: Build
         env:
-          DATABASE_URL: sqlite::memory:
+          DATABASE_URL: "sqlite::memory:"
         run: cargo build --release --bin chatmessagediscordclone --features client
 
       - name: Create tarball
