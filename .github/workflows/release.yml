@@ -105,26 +105,27 @@ jobs:
           mkdir -p "$APP/Contents/MacOS"
           mkdir -p "$APP/Contents/Resources"
           cp target/release/chatmessagediscordclone "$APP/Contents/MacOS/"
-          cat > "$APP/Contents/Info.plist" << EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>chatmessagediscordclone</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.blastfromthepast.messenger</string>
-              <key>CFBundleName</key>
-              <string>Blast From The Past</string>
-              <key>CFBundleVersion</key>
-              <string>${{ needs.create-release.outputs.version }}</string>
-              <key>CFBundleShortVersionString</key>
-              <string>${{ needs.create-release.outputs.version }}</string>
-              <key>NSHighResolutionCapable</key>
-              <true/>
-          </dict>
-          </plist>
-          EOF
+          
+          # Create Info.plist
+          echo '<?xml version="1.0" encoding="UTF-8"?>' > "$APP/Contents/Info.plist"
+          echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' >> "$APP/Contents/Info.plist"
+          echo '<plist version="1.0">' >> "$APP/Contents/Info.plist"
+          echo '<dict>' >> "$APP/Contents/Info.plist"
+          echo '    <key>CFBundleExecutable</key>' >> "$APP/Contents/Info.plist"
+          echo '    <string>chatmessagediscordclone</string>' >> "$APP/Contents/Info.plist"
+          echo '    <key>CFBundleIdentifier</key>' >> "$APP/Contents/Info.plist"
+          echo '    <string>com.blastfromthepast.messenger</string>' >> "$APP/Contents/Info.plist"
+          echo '    <key>CFBundleName</key>' >> "$APP/Contents/Info.plist"
+          echo '    <string>Blast From The Past</string>' >> "$APP/Contents/Info.plist"
+          echo '    <key>CFBundleVersion</key>' >> "$APP/Contents/Info.plist"
+          echo "    <string>${{ needs.create-release.outputs.version }}</string>" >> "$APP/Contents/Info.plist"
+          echo '    <key>CFBundleShortVersionString</key>' >> "$APP/Contents/Info.plist"
+          echo "    <string>${{ needs.create-release.outputs.version }}</string>" >> "$APP/Contents/Info.plist"
+          echo '    <key>NSHighResolutionCapable</key>' >> "$APP/Contents/Info.plist"
+          echo '    <true/>' >> "$APP/Contents/Info.plist"
+          echo '</dict>' >> "$APP/Contents/Info.plist"
+          echo '</plist>' >> "$APP/Contents/Info.plist"
+          
           create-dmg \
             --volname "Blast From The Past" \
             --window-size 600 400 \
