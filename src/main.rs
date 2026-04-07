@@ -595,9 +595,8 @@ impl AolApp {
                 if !creds.password.is_empty() { 
                     self.password = creds.password;
                 }
-                if !creds.server_url.is_empty() { 
-                    self.server_url = creds.server_url;
-                }
+                // Don't load server_url from saved credentials - always use default
+                // This prevents issues when switching servers
             }
         }
         // Load buddy groups
