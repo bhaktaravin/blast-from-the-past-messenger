@@ -1,3 +1,6 @@
+// Hide console window on Windows
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
 
