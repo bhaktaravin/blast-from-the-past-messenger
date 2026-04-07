@@ -83,6 +83,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
 
       - name: Cache cargo
         uses: actions/cache@v3
@@ -95,10 +97,22 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build
+      - name: Build for Intel (x86_64)
         env:
           DATABASE_URL: "sqlite::memory:"
-        run: cargo build --release --bin chatmessagediscordclone --features client
+        run: cargo build --release --bin chatmessagediscordclone --features client --target x86_64-apple-darwin
+
+      - name: Build for Apple Silicon (ARM64)
+        env:
+          DATABASE_URL: "sqlite::memory:"
+        run: cargo build --release --bin chatmessagediscordclone --features client --target aarch64-apple-darwin
+
+      - name: Create Universal Binary
+        run: |
+          lipo -create \
+            target/x86_64-apple-darwin/release/chatmessagediscordclone \
+            target/aarch64-apple-darwin/release/chatmessagediscordclone \
+            -output target/release/chatmessagediscordclone
 
       - name: Create DMG
         run: |
