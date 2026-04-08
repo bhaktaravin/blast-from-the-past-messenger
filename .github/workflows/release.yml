@@ -72,8 +72,8 @@ jobs:
           files: ./dist/blast-from-the-past-messenger-setup.exe
           tag_name: ${{ needs.create-release.outputs.version }}
 
-  build-macos:
-    name: Build macOS
+  build-macos-intel:
+    name: Build macOS (Intel)
     runs-on: macos-latest
     needs: create-release
     permissions:
@@ -84,7 +84,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
+          targets: x86_64-apple-darwin
 
       - name: Cache cargo
         uses: actions/cache@v3
@@ -95,34 +95,75 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-intel-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build for Intel (x86_64)
+      - name: Build for Intel
         env:
           DATABASE_URL: "sqlite::memory:"
         run: cargo build --release --bin chatmessagediscordclone --features client --target x86_64-apple-darwin
 
-      - name: Build for Apple Silicon (ARM64)
-        env:
-          DATABASE_URL: "sqlite::memory:"
-        run: cargo build --release --bin chatmessagediscordclone --features client --target aarch64-apple-darwin
-
-      - name: Create Universal Binary
+      - name: Prepare binary
         run: |
-          lipo -create \
-            target/x86_64-apple-darwin/release/chatmessagediscordclone \
-            target/aarch64-apple-darwin/release/chatmessagediscordclone \
-            -output target/release/chatmessagediscordclone
+          mkdir -p target/release
+          cp target/x86_64-apple-darwin/release/chatmessagediscordclone target/release/
 
       - name: Create DMG
         run: |
           chmod +x .github/scripts/create-macos-app.sh
           ./.github/scripts/create-macos-app.sh
+          mv blast-from-the-past-macos.dmg blast-from-the-past-macos-intel.dmg
 
-      - name: Upload DMG
+      - name: Upload Intel DMG
         uses: softprops/action-gh-release@v1
         with:
-          files: ./blast-from-the-past-macos.dmg
+          files: ./blast-from-the-past-macos-intel.dmg
+          tag_name: ${{ needs.create-release.outputs.version }}
+
+  build-macos-silicon:
+    name: Build macOS (Apple Silicon)
+    runs-on: macos-latest
+    needs: create-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-silicon-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build for Apple Silicon
+        env:
+          DATABASE_URL: "sqlite::memory:"
+        run: cargo build --release --bin chatmessagediscordclone --features client --target aarch64-apple-darwin
+
+      - name: Prepare binary
+        run: |
+          mkdir -p target/release
+          cp target/aarch64-apple-darwin/release/chatmessagediscordclone target/release/
+
+      - name: Create DMG
+        run: |
+          chmod +x .github/scripts/create-macos-app.sh
+          ./.github/scripts/create-macos-app.sh
+          mv blast-from-the-past-macos.dmg blast-from-the-past-macos-silicon.dmg
+
+      - name: Upload Silicon DMG
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./blast-from-the-past-macos-silicon.dmg
           tag_name: ${{ needs.create-release.outputs.version }}
 
   build-linux:
