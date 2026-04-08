@@ -925,13 +925,13 @@ impl AolApp {
                     });
                     self.audio_manager.play(SoundEffect::MessageReceived);
                 }
-                NetToUi::UserJoinedRoom { room_id, username } => {
+                NetToUi::UserJoinedRoom { room_id: _, username } => {
                     self.show_toast(format!("{} joined the room", username), ToastKind::Info);
                 }
-                NetToUi::UserLeftRoom { room_id, username } => {
+                NetToUi::UserLeftRoom { room_id: _, username } => {
                     self.show_toast(format!("{} left the room", username), ToastKind::Info);
                 }
-                NetToUi::RoomMembers { room_id, members } => {
+                NetToUi::RoomMembers { room_id: _, members: _ } => {
                     // Store member list - could be used for UI display
                 }
                 NetToUi::UserTyping { room_id, username } => {
@@ -1320,7 +1320,7 @@ impl eframe::App for AolApp {
         }
         
         // Wink animation - emoji bounces across screen
-        if let Some((emoji, x_pos, time, from)) = &mut self.wink_animation {
+        if let Some((emoji, x_pos, time, _from)) = &mut self.wink_animation {
             let dt = ctx.input(|i| i.stable_dt).min(0.05);
             *time += dt;
             *x_pos += dt * 400.0; // Move 400 pixels per second
@@ -2280,7 +2280,8 @@ impl eframe::App for AolApp {
                         }
                     }
                     
-                    if let Some(version) = &self.update_available {
+                    if let Some(version) = self.update_available.clone() {
+                        let mut dismiss = false;
                         egui::TopBottomPanel::top("update_banner").show(ctx, |ui| {
                             egui::Frame::new()
                                 .fill(egui::Color32::from_rgb(255, 200, 0))
@@ -2296,18 +2297,21 @@ impl eframe::App for AolApp {
                                         if ui.link(egui::RichText::new("GitHub Releases")
                                             .color(egui::Color32::from_rgb(0, 0, 200)))
                                             .on_hover_text("https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/latest")
-                                            .clicked() 
+                                            .clicked()
                                         {
                                             let _ = open::that("https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/latest");
                                         }
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             if ui.small_button("✕").clicked() {
-                                                self.update_available = None;
+                                                dismiss = true;
                                             }
                                         });
                                     });
                                 });
                         });
+                        if dismiss {
+                            self.update_available = None;
+                        }
                     }
                 }
 
