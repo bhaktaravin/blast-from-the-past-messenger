@@ -1553,7 +1553,6 @@ impl eframe::App for AolApp {
                             .corner_radius(egui::CornerRadius::same(4.0 as u8))
                             .inner_margin(egui::Margin::symmetric(20.0 as i8, 8.0 as i8))
                             .show(ui, |ui| {
-                                ui.set_min_width(320.0);
                                 for (row, line) in logo_lines.iter().enumerate() {
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1597,7 +1596,8 @@ impl eframe::App for AolApp {
                             .corner_radius(egui::CornerRadius::same(10.0 as u8))
                             .inner_margin(egui::Margin::same(20.0 as i8))
                             .show(ui, |ui| {
-                                ui.set_max_width(360.0);
+                                ui.set_min_width(400.0);
+                                ui.set_max_width(450.0);
 
                                 ui.horizontal(|ui| {
                                     if ui.selectable_label(self.auth_mode == AuthMode::Login, "Sign In").clicked() {
@@ -3578,7 +3578,8 @@ fn spawn_network() -> NetworkHandle {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(egui::vec2(920.0, 640.0)),
+            .with_inner_size(egui::vec2(1000.0, 700.0))
+            .with_min_inner_size(egui::vec2(900.0, 640.0)),
         ..Default::default()
     };
     eframe::run_native(
