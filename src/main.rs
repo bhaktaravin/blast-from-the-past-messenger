@@ -1,8 +1,13 @@
 // Hide console window on Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// Global update status
+static UPDATE_VERSION: once_cell::sync::Lazy<Arc<Mutex<Option<String>>>> = 
+    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
+
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use eframe::egui;
@@ -387,6 +392,8 @@ struct AolApp {
     modem_line: usize,
     modem_line_timer: f32,
     modem_char_pos: usize,
+    // Update checking
+    update_available: Option<String>, // Version string if update available
 }
 
 struct SearchResult {
@@ -563,6 +570,7 @@ impl AolApp {
             show_group_modal: false,
             group_modal_username: None,
             new_group_name: String::new(),
+            update_available: None,
         }
     }
 
@@ -623,6 +631,43 @@ impl AolApp {
                 self.buddy_groups = groups;
             }
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn check_for_updates(&mut self) {
+        std::thread::spawn(|| {
+            const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+            const GITHUB_API_URL: &str = "https://api.github.com/repos/bhaktaravin/blast-from-the-past-messenger/releases/latest";
+
+            match reqwest::blocking::Client::builder()
+                .user_agent("blast-from-the-past-messenger")
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(client) => {
+                    if let Ok(response) = client.get(GITHUB_API_URL).send() {
+                        if let Ok(json) = response.json::<serde_json::Value>() {
+                            if let Some(tag_name) = json["tag_name"].as_str() {
+                                let latest_version = tag_name.trim_start_matches('v');
+                                
+                                if latest_version != CURRENT_VERSION {
+                                    if let Ok(mut guard) = UPDATE_VERSION.lock() {
+                                        *guard = Some(latest_version.to_string());
+                                    }
+                                    println!("\n🔔 Update available: v{} (current: v{})", latest_version, CURRENT_VERSION);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn check_for_updates(&mut self) {
+        // No-op for web version
     }
 
     fn draw_background(&self, ctx: &egui::Context) {
@@ -1760,6 +1805,9 @@ impl eframe::App for AolApp {
                                         self.password.clear();
                                         self.login_success = false;
                                         self.login_success_time = 0.0;
+                                        
+                                        // Check for updates after successful login
+                                        self.check_for_updates();
                                     }
                                     
                                     ctx.request_repaint();
@@ -2220,6 +2268,48 @@ impl eframe::App for AolApp {
                         }
                     }
                 });
+
+                // Update banner - check global and update local
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if self.update_available.is_none() {
+                        if let Ok(guard) = UPDATE_VERSION.lock() {
+                            if let Some(version) = guard.as_ref() {
+                                self.update_available = Some(version.clone());
+                            }
+                        }
+                    }
+                    
+                    if let Some(version) = &self.update_available {
+                        egui::TopBottomPanel::top("update_banner").show(ctx, |ui| {
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgb(255, 200, 0))
+                                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("🔔").size(16.0));
+                                        ui.label(egui::RichText::new(format!("Update available: v{}", version))
+                                            .color(egui::Color32::BLACK)
+                                            .strong());
+                                        ui.label(egui::RichText::new("Download from:")
+                                            .color(egui::Color32::from_gray(60)));
+                                        if ui.link(egui::RichText::new("GitHub Releases")
+                                            .color(egui::Color32::from_rgb(0, 0, 200)))
+                                            .on_hover_text("https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/latest")
+                                            .clicked() 
+                                        {
+                                            let _ = open::that("https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/latest");
+                                        }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.small_button("✕").clicked() {
+                                                self.update_available = None;
+                                            }
+                                        });
+                                    });
+                                });
+                        });
+                    }
+                }
 
                 egui::SidePanel::left("buddy_list")
                     .resizable(false)
