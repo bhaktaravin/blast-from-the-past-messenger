@@ -2284,7 +2284,7 @@ impl eframe::App for AolApp {
                         egui::TopBottomPanel::top("update_banner").show(ctx, |ui| {
                             egui::Frame::new()
                                 .fill(egui::Color32::from_rgb(255, 200, 0))
-                                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                                .inner_margin(egui::Margin::symmetric(8, 6))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new("🔔").size(16.0));
