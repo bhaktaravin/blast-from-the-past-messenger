@@ -138,6 +138,9 @@ async fn handle_connection(
             message: "Please log in or register to continue.".to_string(),
         },
     );
+    
+    // Send current presence to the new connection
+    broadcast_presence(&peers);
 
     while let Some(message) = ws_rx.next().await {
         match message {
