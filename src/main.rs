@@ -331,6 +331,9 @@ struct AolApp {
     audio_manager: AudioManager,
     sound_enabled: bool,
     sound_volume: f32,
+    // Display settings
+    font_size: f32,
+    show_settings_modal: bool,
     // Chat rooms
     chat_rooms: Vec<(String, String, i32)>, // (id, name, member_count)
     show_room_creation_modal: bool,
@@ -517,6 +520,8 @@ impl AolApp {
             audio_manager: AudioManager::new(),
             sound_enabled: true,
             sound_volume: 0.8,
+            font_size: 14.0,
+            show_settings_modal: false,
             pending_friend_requests: Vec::new(),
             show_friend_requests_modal: false,
             chat_rooms: Vec::new(),
@@ -1875,6 +1880,7 @@ impl eframe::App for AolApp {
                         self.show_friend_requests_modal = false;
                         self.show_avatar_modal = false;
                         self.viewing_profile = None;
+                        self.show_settings_modal = false;
                     }
                 });
 
@@ -1914,32 +1920,9 @@ impl eframe::App for AolApp {
                                 self.remember_me = false;
                             }
 
-                            // Audio settings menu
-                            ui.menu_button("🔊", |ui| {
-                                ui.checkbox(&mut self.sound_enabled, "Enable sound effects");
-
-                                ui.horizontal(|ui| {
-                                    ui.label("Volume:");
-                                    ui.add(egui::Slider::new(&mut self.sound_volume, 0.0..=1.0)
-                                        .show_value(false));
-                                });
-
-                                // Apply settings to audio manager
-                                self.audio_manager.set_enabled(self.sound_enabled);
-                                self.audio_manager.set_volume(self.sound_volume);
-
-                                ui.separator();
-                                ui.label("Test Sounds:");
-                                if ui.button("🔔 Sign On").clicked() {
-                                    self.audio_manager.play(SoundEffect::BuddySignOn);
-                                }
-                                if ui.button("🚪 Sign Off").clicked() {
-                                    self.audio_manager.play(SoundEffect::BuddySignOff);
-                                }
-                                if ui.button("💬 Message").clicked() {
-                                    self.audio_manager.play(SoundEffect::MessageReceived);
-                                }
-                            });
+                            if ui.button("⚙").on_hover_text("Settings").clicked() {
+                                self.show_settings_modal = true;
+                            }
 
                             // Show friend requests button with pending count
                             let pending_count = self.pending_friend_requests.len();
@@ -1985,6 +1968,102 @@ impl eframe::App for AolApp {
                             self.custom_status.clear();
                         }
                     });
+                    // Settings modal
+                    if self.show_settings_modal {
+                        let mut open = true;
+                        egui::Window::new("⚙ Settings")
+                            .open(&mut open)
+                            .collapsible(false)
+                            .resizable(false)
+                            .default_size([380.0, 400.0])
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                // Theme
+                                ui.label("Theme");
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    let themes = [
+                                        (Theme::MidnightAmber, "🟠 Midnight Amber"),
+                                        (Theme::Dark,          "⚫ Dark"),
+                                        (Theme::Light,         "⚪ Light"),
+                                    ];
+                                    for (t, label) in themes {
+                                        if ui.selectable_label(self.theme == t, label).clicked() {
+                                            self.theme = t;
+                                            apply_theme(ctx, t);
+                                        }
+                                    }
+                                });
+
+                                ui.add_space(12.0);
+
+                                // Font size
+                                ui.label("Font Size");
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    let changed = ui.add(
+                                        egui::Slider::new(&mut self.font_size, 10.0..=22.0)
+                                            .step_by(1.0)
+                                            .suffix("px")
+                                    ).changed();
+                                    if changed {
+                                        let mut style = (*ctx.style()).clone();
+                                        let mono = egui::FontId::new(self.font_size, egui::FontFamily::Monospace);
+                                        style.text_styles.insert(egui::TextStyle::Body, mono.clone());
+                                        style.text_styles.insert(egui::TextStyle::Button, mono.clone());
+                                        style.text_styles.insert(egui::TextStyle::Small,
+                                            egui::FontId::new(self.font_size - 2.0, egui::FontFamily::Monospace));
+                                        ctx.set_style(style);
+                                    }
+                                    if ui.small_button("Reset").clicked() {
+                                        self.font_size = 14.0;
+                                        let mut style = (*ctx.style()).clone();
+                                        let mono = egui::FontId::new(14.0, egui::FontFamily::Monospace);
+                                        style.text_styles.insert(egui::TextStyle::Body, mono.clone());
+                                        style.text_styles.insert(egui::TextStyle::Button, mono.clone());
+                                        style.text_styles.insert(egui::TextStyle::Small,
+                                            egui::FontId::new(12.0, egui::FontFamily::Monospace));
+                                        ctx.set_style(style);
+                                    }
+                                });
+
+                                ui.add_space(12.0);
+
+                                // Sound
+                                ui.label("Sound");
+                                ui.separator();
+                                ui.checkbox(&mut self.sound_enabled, "Enable sound effects");
+                                ui.horizontal(|ui| {
+                                    ui.label("Volume:");
+                                    ui.add(egui::Slider::new(&mut self.sound_volume, 0.0..=1.0)
+                                        .show_value(true));
+                                });
+                                self.audio_manager.set_enabled(self.sound_enabled);
+                                self.audio_manager.set_volume(self.sound_volume);
+                                ui.horizontal(|ui| {
+                                    ui.label("Test:");
+                                    if ui.small_button("🔔 Sign On").clicked() {
+                                        self.audio_manager.play(SoundEffect::BuddySignOn);
+                                    }
+                                    if ui.small_button("🚪 Sign Off").clicked() {
+                                        self.audio_manager.play(SoundEffect::BuddySignOff);
+                                    }
+                                    if ui.small_button("💬 Message").clicked() {
+                                        self.audio_manager.play(SoundEffect::MessageReceived);
+                                    }
+                                });
+
+                                ui.add_space(12.0);
+                                ui.separator();
+                                if ui.button("Close").clicked() {
+                                    self.show_settings_modal = false;
+                                }
+                            });
+                        if !open {
+                            self.show_settings_modal = false;
+                        }
+                    }
+
                     // Modal for Add Friend
                     if self.show_add_friend_modal {
                         egui::Window::new("Add Friend")
