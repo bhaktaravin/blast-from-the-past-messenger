@@ -278,6 +278,7 @@ enum Theme {
     Light,
     Dark,
     MidnightAmber,
+    WindowsXP,
 }
 
 struct NetworkHandle {
@@ -1255,7 +1256,8 @@ impl AolApp {
         self.theme = match self.theme {
             Theme::Light => Theme::Dark,
             Theme::Dark => Theme::MidnightAmber,
-            Theme::MidnightAmber => Theme::Light,
+            Theme::MidnightAmber => Theme::WindowsXP,
+            Theme::WindowsXP => Theme::Light,
         };
         apply_theme(ctx, self.theme);
     }
@@ -1986,6 +1988,7 @@ impl eframe::App for AolApp {
                                         (Theme::MidnightAmber, "🟠 Midnight Amber"),
                                         (Theme::Dark,          "⚫ Dark"),
                                         (Theme::Light,         "⚪ Light"),
+                                        (Theme::WindowsXP,     "🪟 Windows XP"),
                                     ];
                                     for (t, label) in themes {
                                         if ui.selectable_label(self.theme == t, label).clicked() {
@@ -3173,6 +3176,35 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
             visuals.widgets.active.bg_fill = egui::Color32::from_rgb(108, 72, 30);
             visuals.selection.bg_fill = egui::Color32::from_rgb(240, 168, 58);
             visuals.override_text_color = Some(egui::Color32::from_rgb(231, 220, 198));
+            visuals
+        }
+        Theme::WindowsXP => {
+            // Classic Luna theme - silver/teal panels, blue title bars
+            let mut visuals = egui::Visuals::light();
+            // Main panel: classic XP silver/gray
+            visuals.panel_fill = egui::Color32::from_rgb(236, 233, 216);
+            // Windows: slightly lighter silver
+            visuals.window_fill = egui::Color32::from_rgb(255, 255, 255);
+            visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 84, 166));
+            // Buttons: classic XP raised gray
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(236, 233, 216);
+            visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 0, 0));
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(236, 233, 216);
+            visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 0, 0));
+            visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(3);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(193, 210, 238);
+            visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 0, 0));
+            visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(3);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(49, 106, 197);
+            visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+            visuals.widgets.active.corner_radius = egui::CornerRadius::same(3);
+            // Selection: XP blue highlight
+            visuals.selection.bg_fill = egui::Color32::from_rgb(49, 106, 197);
+            visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+            // Text: classic black on silver
+            visuals.override_text_color = Some(egui::Color32::from_rgb(0, 0, 0));
+            // Hyperlinks: XP blue
+            visuals.hyperlink_color = egui::Color32::from_rgb(0, 102, 204);
             visuals
         }
     };
