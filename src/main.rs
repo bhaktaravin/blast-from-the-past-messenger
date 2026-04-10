@@ -3572,26 +3572,6 @@ fn render_message_body(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-// Convert classic AIM emoticons to emoji
-fn convert_emoticons(text: &str) -> String {    text.replace(":)", "😊")
-        .replace(":(", "😢")
-        .replace(":D", "😄")
-        .replace(";)", "😉")
-        .replace(":P", "😛")
-        .replace(":p", "😛")
-        .replace("<3", "❤️")
-        .replace(":|", "😐")
-        .replace(":o", "😮")
-        .replace(":O", "😮")
-        .replace("8)", "😎")
-        .replace(":*", "😘")
-        .replace(":'(", "😢")
-        .replace("XD", "😆")
-        .replace("^_^", "😊")
-        .replace("-_-", "😑")
-}
-
-// Generate a color from username (consistent colors per user)
 fn username_to_color(username: &str) -> egui::Color32 {
     let mut hash: u32 = 0;
     for byte in username.bytes() {
