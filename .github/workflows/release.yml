@@ -107,11 +107,45 @@ jobs:
           mkdir -p target/release
           cp target/x86_64-apple-darwin/release/chatmessagediscordclone target/release/
 
-      - name: Create DMG
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
+
+      - name: Create and sign app bundle
         run: |
           chmod +x .github/scripts/create-macos-app.sh
           ./.github/scripts/create-macos-app.sh
+          codesign --deep --force --verify --verbose \
+            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
+            --options runtime \
+            "target/release/Blast From The Past.app"
+
+      - name: Notarize app
+        env:
+          NOTARIZATION_APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
+          NOTARIZATION_PWD: ${{ secrets.NOTARIZATION_PWD }}
+        run: |
+          ditto -c -k --keepParent "target/release/Blast From The Past.app" app-intel.zip
+          xcrun notarytool submit app-intel.zip \
+            --apple-id "$NOTARIZATION_APPLE_ID" \
+            --password "$NOTARIZATION_PWD" \
+            --team-id "VLJG47KK4K" \
+            --wait
+          xcrun stapler staple "target/release/Blast From The Past.app"
+
+      - name: Create signed DMG
+        run: |
           mv blast-from-the-past-macos.dmg blast-from-the-past-macos-intel.dmg
+          codesign --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
+            blast-from-the-past-macos-intel.dmg
 
       - name: Upload Intel DMG
         uses: softprops/action-gh-release@v1
@@ -154,11 +188,45 @@ jobs:
           mkdir -p target/release
           cp target/aarch64-apple-darwin/release/chatmessagediscordclone target/release/
 
-      - name: Create DMG
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
+
+      - name: Create and sign app bundle
         run: |
           chmod +x .github/scripts/create-macos-app.sh
           ./.github/scripts/create-macos-app.sh
+          codesign --deep --force --verify --verbose \
+            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
+            --options runtime \
+            "target/release/Blast From The Past.app"
+
+      - name: Notarize app
+        env:
+          NOTARIZATION_APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
+          NOTARIZATION_PWD: ${{ secrets.NOTARIZATION_PWD }}
+        run: |
+          ditto -c -k --keepParent "target/release/Blast From The Past.app" app-silicon.zip
+          xcrun notarytool submit app-silicon.zip \
+            --apple-id "$NOTARIZATION_APPLE_ID" \
+            --password "$NOTARIZATION_PWD" \
+            --team-id "VLJG47KK4K" \
+            --wait
+          xcrun stapler staple "target/release/Blast From The Past.app"
+
+      - name: Create signed DMG
+        run: |
           mv blast-from-the-past-macos.dmg blast-from-the-past-macos-silicon.dmg
+          codesign --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
+            blast-from-the-past-macos-silicon.dmg
 
       - name: Upload Silicon DMG
         uses: softprops/action-gh-release@v1
