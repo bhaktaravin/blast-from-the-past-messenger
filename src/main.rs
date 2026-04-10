@@ -400,6 +400,10 @@ struct AolApp {
     modem_char_pos: usize,
     // Update checking
     update_available: Option<String>, // Version string if update available
+    // Auto-reconnect
+    reconnect_credentials: Option<(String, String, String)>, // (url, username, password)
+    reconnect_attempts: u32,
+    reconnect_timer: f32,
 }
 
 struct SearchResult {
@@ -580,6 +584,9 @@ impl AolApp {
             group_modal_username: None,
             new_group_name: String::new(),
             update_available: None,
+            reconnect_credentials: None,
+            reconnect_attempts: 0,
+            reconnect_timer: 0.0,
         }
     }
 
@@ -730,8 +737,14 @@ impl AolApp {
                 }
                 NetToUi::Disconnected => {
                     self.connected = false;
-                    self.status = "Disconnected".to_string();
-                    self.screen = Screen::SignIn;
+                    // Only auto-reconnect if we were previously logged in (not a manual logout)
+                    if self.logged_in_user.is_some() && self.reconnect_credentials.is_some() {
+                        self.status = "Disconnected. Reconnecting...".to_string();
+                        self.reconnect_timer = 3.0; // wait 3 seconds before first retry
+                    } else {
+                        self.status = "Disconnected".to_string();
+                        self.screen = Screen::SignIn;
+                    }
                     self.logged_in_user = None;
                     self.logging_in = false;
                     self.login_started_at = None;
@@ -865,18 +878,15 @@ impl AolApp {
                         AuthMode::Login => "Logged in.".to_string(),
                     };
                     self.show_toast(self.status.clone(), ToastKind::Success);
-                    // Don't switch screen immediately - show success animation first
                     self.logging_in = false;
                     self.login_started_at = None;
                     self.login_success = true;
                     self.login_success_time = 0.0;
+                    // Reset reconnect backoff on successful login
+                    self.reconnect_attempts = 0;
+                    self.reconnect_timer = 0.0;
                     self.save_credentials();
-                    let _ = self
-                        .network
-                        .tx
-                        .send(UiToNet::FetchHistory {
-                            target: ChatTarget::Lobby,
-                        });
+                    let _ = self.network.tx.send(UiToNet::FetchHistory { target: ChatTarget::Lobby });
                     let _ = self.network.tx.send(UiToNet::FetchThreads);
                     let _ = self.network.tx.send(UiToNet::FetchChatRooms);
                 }
@@ -1056,6 +1066,9 @@ impl AolApp {
             }
         }
         self.server_url = url.clone();
+        // Save for auto-reconnect
+        self.reconnect_credentials = Some((url.clone(), safe_username.clone(), Self::sanitize_input(&self.password)));
+        self.reconnect_attempts = 0;
         let _ = self.network.tx.send(UiToNet::Connect {
             url,
             username: safe_username,
@@ -1374,6 +1387,31 @@ impl eframe::App for AolApp {
             ctx.request_repaint();
         }
         self.process_net_events();
+
+        // Auto-reconnect timer
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.reconnect_timer > 0.0 && !self.connected && self.screen != Screen::SignIn {
+            let dt = ctx.input(|i| i.stable_dt);
+            self.reconnect_timer -= dt;
+            ctx.request_repaint();
+            if self.reconnect_timer <= 0.0 {
+                self.reconnect_timer = 0.0;
+                if let Some((url, username, password)) = self.reconnect_credentials.clone() {
+                    self.reconnect_attempts += 1;
+                    let delay = (self.reconnect_attempts * 5).min(60); // cap at 60s
+                    self.status = format!("Reconnecting... (attempt {})", self.reconnect_attempts);
+                    self.reconnect_timer = delay as f32;
+                    self.logging_in = true;
+                    self.login_started_at = Some(Instant::now());
+                    let _ = self.network.tx.send(UiToNet::Connect {
+                        url,
+                        username,
+                        password,
+                        mode: AuthMode::Login,
+                    });
+                }
+            }
+        }
         
         // On native, timeout login after 15 seconds
         #[cfg(not(target_arch = "wasm32"))]
@@ -1926,8 +1964,11 @@ impl eframe::App for AolApp {
                         
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Logout").clicked() {
-                                // Clear saved credentials
+                                // Clear saved credentials and reconnect state
                                 let _ = std::fs::remove_file(self.credentials_file());
+                                self.reconnect_credentials = None;
+                                self.reconnect_attempts = 0;
+                                self.reconnect_timer = 0.0;
                                 
                                 // Disconnect and return to login
                                 let _ = self.network.tx.send(UiToNet::Disconnect);
@@ -2892,7 +2933,7 @@ impl eframe::App for AolApp {
                                             };
                                             ui.label(egui::RichText::new(format!("{}: ", msg.from))
                                                 .strong().color(name_color));
-                                            ui.label(&msg.body);
+                                            ui.label(convert_emoticons(&msg.body));
                                         });
                                     }
                                 });
@@ -3412,6 +3453,51 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
     };
     visuals.window_corner_radius = egui::CornerRadius::same(6);
     ctx.set_visuals(visuals);
+}
+
+fn convert_emoticons(text: &str) -> String {
+    // Classic AIM-style emoticons → emoji
+    let emoticons: &[(&str, &str)] = &[
+        (":)",   "😊"), (":-)",  "😊"),
+        (":D",   "😄"), (":-D",  "😄"),
+        (":(",   "😢"), (":-(",  "😢"),
+        (";)",   "😉"), (";-)",  "😉"),
+        (":P",   "😛"), (":-P",  "😛"),
+        (":p",   "😛"), (":-p",  "😛"),
+        (":O",   "😮"), (":-O",  "😮"),
+        (":o",   "😮"), (":-o",  "😮"),
+        (":|",   "😐"), (":-|",  "😐"),
+        (":*",   "😘"), (":-*",  "😘"),
+        (">:(",  "😠"), (">:-(",  "😠"),
+        (":'(",  "😭"),
+        ("B)",   "😎"), ("B-)",  "😎"),
+        ("O:)",  "😇"), ("O:-)", "😇"),
+        (":3",   "😺"),
+        ("<3",   "❤️"),
+        ("</3",  "💔"),
+        ("(y)",  "👍"),
+        ("(n)",  "👎"),
+        ("(h)",  "😎"),
+        (":-$",  "😳"),
+        (":$",   "😳"),
+        (":-/",  "😕"),
+        (":/",   "😕"),
+        ("^_^",  "😊"),
+        ("-_-",  "😑"),
+        ("o_o",  "😳"),
+        ("T_T",  "😭"),
+        (":fire:", "🔥"),
+        (":100:", "💯"),
+    ];
+
+    let mut result = text.to_string();
+    // Sort by length descending so longer patterns match first (e.g. O:-) before :-)
+    let mut sorted = emoticons.to_vec();
+    sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    for (pattern, emoji) in &sorted {
+        result = result.replace(pattern, emoji);
+    }
+    result
 }
 
 fn format_relative_time(at: &str) -> String {
