@@ -119,7 +119,9 @@ jobs:
           security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
           security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
-          # Verify identity is available
+          echo "=== Identities in build.keychain ==="
+          security find-identity -v build.keychain
+          echo "=== Codesigning identities ==="
           security find-identity -v -p codesigning build.keychain
 
       - name: Create app bundle, sign and notarize
@@ -127,29 +129,22 @@ jobs:
           NOTARIZATION_APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
           NOTARIZATION_PWD: ${{ secrets.NOTARIZATION_PWD }}
         run: |
-          # Build app bundle
           chmod +x .github/scripts/create-macos-app.sh
           ./.github/scripts/create-macos-app.sh
-
-          # Unlock keychain again (may lock between steps)
           security unlock-keychain -p actions build.keychain
-
-          # Sign the app bundle
+          echo "=== Identities before signing ==="
+          security find-identity -v -p codesigning
           codesign --deep --force --verify --verbose \
             --keychain build.keychain \
             --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
             --options runtime \
             "target/release/Blast From The Past.app"
-
-          # Notarize
           ditto -c -k --keepParent "target/release/Blast From The Past.app" app-intel.zip
           xcrun notarytool submit app-intel.zip \
             --apple-id "$NOTARIZATION_APPLE_ID" \
             --password "$NOTARIZATION_PWD" \
             --team-id "VLJG47KK4K" \
             --wait
-
-          # Staple and create DMG
           xcrun stapler staple "target/release/Blast From The Past.app"
           mv blast-from-the-past-macos.dmg blast-from-the-past-macos-intel.dmg
           codesign --keychain build.keychain \
