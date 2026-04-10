@@ -114,14 +114,15 @@ jobs:
         run: |
           printf "%s" "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
           echo "Certificate size: $(wc -c < certificate.p12) bytes"
+          # Create a PKCS12 without password for security import compatibility
+          openssl pkcs12 -in certificate.p12 -passin pass:blast123 -out cert_nopass.pem -nodes
+          openssl pkcs12 -export -in cert_nopass.pem -out certificate_import.p12 -passout pass:actions
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p actions build.keychain
-          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security import certificate_import.p12 -k build.keychain -P "actions" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
           security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
-          echo "=== Identities in build.keychain ==="
-          security find-identity -v build.keychain
           echo "=== Codesigning identities ==="
           security find-identity -v -p codesigning build.keychain
 
@@ -200,10 +201,12 @@ jobs:
         run: |
           printf "%s" "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
           echo "Certificate size: $(wc -c < certificate.p12) bytes"
+          openssl pkcs12 -in certificate.p12 -passin pass:blast123 -out cert_nopass.pem -nodes
+          openssl pkcs12 -export -in cert_nopass.pem -out certificate_import.p12 -passout pass:actions
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p actions build.keychain
-          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security import certificate_import.p12 -k build.keychain -P "actions" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
           security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
           security find-identity -v -p codesigning build.keychain
