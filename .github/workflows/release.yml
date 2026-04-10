@@ -118,6 +118,7 @@ jobs:
           security unlock-keychain -p actions build.keychain
           security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
+          security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
 
       - name: Create and sign app bundle
         run: |
@@ -199,6 +200,7 @@ jobs:
           security unlock-keychain -p actions build.keychain
           security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
+          security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
 
       - name: Create and sign app bundle
         run: |
