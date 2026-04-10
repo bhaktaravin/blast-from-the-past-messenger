@@ -414,8 +414,35 @@ struct SearchResult {
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SavedCredentials {
     username: String,
-    password: String,
+    /// Password is stored obfuscated (base64-encoded XOR with a derived key)
+    password_obfuscated: Option<String>,
     server_url: String,
+}
+
+/// Simple obfuscation for stored credentials - not cryptographic but prevents
+/// plaintext passwords in config files. Uses XOR with a key derived from app name.
+fn obfuscate_password(password: &str, username: &str) -> String {
+    let key = format!("blast-from-the-past-{}", username);
+    let key_bytes = key.as_bytes();
+    let obfuscated: Vec<u8> = password
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| b ^ key_bytes[i % key_bytes.len()])
+        .collect();
+    base64::engine::general_purpose::STANDARD.encode(&obfuscated)
+}
+
+fn deobfuscate_password(obfuscated: &str, username: &str) -> Option<String> {
+    let decoded = base64::engine::general_purpose::STANDARD.decode(obfuscated).ok()?;
+    let key = format!("blast-from-the-past-{}", username);
+    let key_bytes = key.as_bytes();
+    let password: Vec<u8> = decoded
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| b ^ key_bytes[i % key_bytes.len()])
+        .collect();
+    String::from_utf8(password).ok()
 }
 
 /// One column of falling characters in the matrix rain background
@@ -596,14 +623,13 @@ impl AolApp {
 
     fn save_credentials(&self) {
         if !self.remember_me {
-            // If remember me is unchecked, delete saved credentials
             let _ = std::fs::remove_file(self.credentials_file());
             return;
         }
         
         let creds = SavedCredentials {
             username: self.username.clone(),
-            password: self.password.clone(),
+            password_obfuscated: Some(obfuscate_password(&self.password, &self.username)),
             server_url: self.server_url.clone(),
         };
         if let Ok(json) = serde_json::to_string(&creds) {
@@ -615,18 +641,19 @@ impl AolApp {
     fn load_credentials(&mut self) {
         if let Ok(data) = std::fs::read_to_string(self.credentials_file()) {
             if let Ok(creds) = serde_json::from_str::<SavedCredentials>(&data) {
-                if !creds.username.is_empty() { 
-                    self.username = creds.username;
+                if !creds.username.is_empty() {
+                    self.username = creds.username.clone();
                     self.remember_me = true;
                 }
-                if !creds.password.is_empty() { 
-                    self.password = creds.password;
+                // Deobfuscate password
+                if let Some(ref obfuscated) = creds.password_obfuscated {
+                    if let Some(password) = deobfuscate_password(obfuscated, &creds.username) {
+                        self.password = password;
+                    }
                 }
-                // Don't load server_url from saved credentials - always use default
-                // This prevents issues when switching servers
+                // Don't load server_url - always use default
             }
         }
-        // Load buddy groups
         self.load_buddy_groups();
     }
 
