@@ -1,5 +1,5 @@
 #define AppName "Blast From The Past Messenger"
-#define AppVersion "0.1.6"
+#define AppVersion "1.2.0"
 #define AppExe "chatmessagediscordclone.exe"
 
 #define EnvRoot GetEnv("GITHUB_WORKSPACE")
