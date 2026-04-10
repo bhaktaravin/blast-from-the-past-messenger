@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,6 +21,13 @@ use chatmessagediscordclone::protocol::{
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
+// Security constants
+const MAX_MESSAGE_BYTES: usize = 4096;       // 4KB max message size
+const MAX_CONNECTIONS_PER_IP: usize = 5;     // max concurrent connections per IP
+const AUTH_TIMEOUT_SECS: u64 = 30;           // seconds before unauthenticated connection is dropped
+const LOGIN_MAX_ATTEMPTS: u32 = 5;           // max failed login attempts
+const LOGIN_LOCKOUT_SECS: u64 = 900;         // 15 minute lockout after too many failures
+
 type RedisPool = Arc<redis::Client>;
 
 #[derive(Clone)]
@@ -39,6 +47,14 @@ struct RateState {
     count: u32,
 }
 
+// Tracks failed login attempts per IP
+#[derive(Clone)]
+struct LoginAttemptState {
+    failures: u32,
+    first_failure: Instant,
+    locked_until: Option<Instant>,
+}
+
 #[tokio::main]
 async fn main() {
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
@@ -51,7 +67,6 @@ async fn main() {
     init_db(&db).await.expect("failed to init database");
 
     let redis = Arc::new(redis::Client::open(redis_url).expect("Invalid REDIS_URL"));
-    // Verify Redis connection on startup
     {
         let mut conn = redis.get_async_connection().await.expect("Failed to connect to Redis");
         let _: () = redis::cmd("PING").query_async(&mut conn).await.expect("Redis PING failed");
@@ -63,9 +78,11 @@ async fn main() {
 
     let peers: Arc<Mutex<HashMap<usize, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
     let rate_limits: Arc<Mutex<HashMap<i64, RateState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    let login_attempts: Arc<Mutex<HashMap<IpAddr, LoginAttemptState>>> = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, addr) = match listener.accept().await {
             Ok(pair) => pair,
             Err(err) => {
                 eprintln!("accept error: {err}");
@@ -73,13 +90,37 @@ async fn main() {
             }
         };
 
+        let client_ip = addr.ip();
+
+        // Check connection limit per IP
+        {
+            let mut ip_map = ip_connections.lock().unwrap();
+            let count = ip_map.entry(client_ip).or_insert(0);
+            if *count >= MAX_CONNECTIONS_PER_IP {
+                eprintln!("Connection limit reached for IP {client_ip}, rejecting");
+                continue;
+            }
+            *count += 1;
+        }
+
         let peer_map = Arc::clone(&peers);
         let db = db.clone();
         let redis = Arc::clone(&redis);
         let rate_limits = Arc::clone(&rate_limits);
+        let ip_connections = Arc::clone(&ip_connections);
+        let login_attempts = Arc::clone(&login_attempts);
+
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, peer_map, db, redis, rate_limits).await {
+            if let Err(err) = handle_connection(stream, client_ip, peer_map, db, redis, rate_limits, login_attempts).await {
                 eprintln!("connection error: {err}");
+            }
+            // Decrement connection count when done
+            let mut ip_map = ip_connections.lock().unwrap();
+            if let Some(count) = ip_map.get_mut(&client_ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    ip_map.remove(&client_ip);
+                }
             }
         });
     }
@@ -87,10 +128,12 @@ async fn main() {
 
 async fn handle_connection(
     stream: tokio::net::TcpStream,
+    client_ip: IpAddr,
     peers: Arc<Mutex<HashMap<usize, Peer>>>,
     db: PgPool,
     redis: RedisPool,
     rate_limits: Arc<Mutex<HashMap<i64, RateState>>>,
+    login_attempts: Arc<Mutex<HashMap<IpAddr, LoginAttemptState>>>,
 ) -> Result<(), String> {
     let ws_stream = accept_async(stream)
         .await
@@ -108,6 +151,7 @@ async fn handle_connection(
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let guest_name = format!("Guest{id}");
+    let connected_at = Instant::now();
 
     {
         let mut guard = peers.lock().map_err(|_| "peer lock poisoned")?;
@@ -138,20 +182,42 @@ async fn handle_connection(
             message: "Please log in or register to continue.".to_string(),
         },
     );
-    
-    // Send current presence to the new connection
     broadcast_presence(&peers);
 
-    while let Some(message) = ws_rx.next().await {
-        match message {
-            Ok(Message::Text(text)) => {
-                if let Ok(event) = serde_json::from_str::<ClientToServer>(&text) {
-                    handle_client_event(id, event, &peers, &db, &redis, &rate_limits).await;
+    loop {
+        // Auth timeout: drop unauthenticated connections after 30 seconds
+        let is_authed = is_authed(&peers, id);
+        let auth_deadline = tokio::time::sleep(tokio::time::Duration::from_millis(100));
+
+        tokio::select! {
+            msg = ws_rx.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        // Message size limit
+                        if text.len() > MAX_MESSAGE_BYTES {
+                            send_to_peer(&peers, id, ServerToClient::System {
+                                message: "Message too large (max 4KB).".to_string(),
+                            });
+                            continue;
+                        }
+                        if let Ok(event) = serde_json::from_str::<ClientToServer>(&text) {
+                            handle_client_event(id, client_ip, event, &peers, &db, &redis, &rate_limits, &login_attempts).await;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {}
                 }
             }
-            Ok(Message::Close(_)) => break,
-            Ok(_) => {}
-            Err(_) => break,
+            _ = auth_deadline => {
+                // Check auth timeout for unauthenticated connections
+                if !is_authed && connected_at.elapsed().as_secs() > AUTH_TIMEOUT_SECS {
+                    send_to_peer(&peers, id, ServerToClient::System {
+                        message: "Authentication timeout. Please reconnect and log in.".to_string(),
+                    });
+                    break;
+                }
+            }
         }
     }
 
@@ -168,14 +234,35 @@ async fn handle_connection(
 
 async fn handle_client_event(
     id: usize,
+    client_ip: IpAddr,
     event: ClientToServer,
     peers: &Arc<Mutex<HashMap<usize, Peer>>>,
     db: &PgPool,
     redis: &RedisPool,
     rate_limits: &Arc<Mutex<HashMap<i64, RateState>>>,
+    login_attempts: &Arc<Mutex<HashMap<IpAddr, LoginAttemptState>>>,
 ) {
     match event {
         ClientToServer::Register { username, password } => {
+            // Validate username
+            if username.len() < 3 || username.len() > 32 {
+                send_to_peer(peers, id, ServerToClient::AuthError {
+                    message: "Username must be 3-32 characters.".to_string(),
+                });
+                return;
+            }
+            if !username.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                send_to_peer(peers, id, ServerToClient::AuthError {
+                    message: "Username may only contain letters, numbers, _ and -.".to_string(),
+                });
+                return;
+            }
+            if password.len() < 6 {
+                send_to_peer(peers, id, ServerToClient::AuthError {
+                    message: "Password must be at least 6 characters.".to_string(),
+                });
+                return;
+            }
             match create_user(db, &username, &password).await {
                 Ok(user_id) => {
                     set_peer_auth(peers, id, user_id, username.clone());
@@ -190,8 +277,35 @@ async fn handle_client_event(
             }
         }
         ClientToServer::Login { username, password } => {
+            // Check login rate limit for this IP
+            {
+                let mut attempts = login_attempts.lock().unwrap();
+                let state = attempts.entry(client_ip).or_insert(LoginAttemptState {
+                    failures: 0,
+                    first_failure: Instant::now(),
+                    locked_until: None,
+                });
+                // Check if locked out
+                if let Some(locked_until) = state.locked_until {
+                    if Instant::now() < locked_until {
+                        let remaining = locked_until.duration_since(Instant::now()).as_secs();
+                        send_to_peer(peers, id, ServerToClient::AuthError {
+                            message: format!("Too many failed attempts. Try again in {}m {}s.",
+                                remaining / 60, remaining % 60),
+                        });
+                        return;
+                    } else {
+                        // Lockout expired, reset
+                        state.failures = 0;
+                        state.locked_until = None;
+                    }
+                }
+            }
+
             match verify_user(db, &username, &password).await {
                 Ok(user_id) => {
+                    // Reset login attempts on success
+                    login_attempts.lock().unwrap().remove(&client_ip);
                     set_peer_auth(peers, id, user_id, username.clone());
                     save_session(redis, user_id, &username).await;
                     send_to_peer(peers, id, ServerToClient::AuthOk { username });
@@ -199,6 +313,20 @@ async fn handle_client_event(
                     send_threads_to_peer(db, peers, id, user_id).await;
                 }
                 Err(message) => {
+                    // Track failed attempt
+                    {
+                        let mut attempts = login_attempts.lock().unwrap();
+                        let state = attempts.entry(client_ip).or_insert(LoginAttemptState {
+                            failures: 0,
+                            first_failure: Instant::now(),
+                            locked_until: None,
+                        });
+                        state.failures += 1;
+                        if state.failures >= LOGIN_MAX_ATTEMPTS {
+                            state.locked_until = Some(Instant::now() + Duration::from_secs(LOGIN_LOCKOUT_SECS));
+                            eprintln!("IP {client_ip} locked out after {} failed login attempts", state.failures);
+                        }
+                    }
                     send_to_peer(peers, id, ServerToClient::AuthError { message });
                 }
             }
@@ -287,6 +415,12 @@ async fn handle_client_event(
                         message: "Rate limit exceeded.".to_string(),
                     },
                 );
+                return;
+            }
+            if body.len() > MAX_MESSAGE_BYTES {
+                send_to_peer(peers, id, ServerToClient::System {
+                    message: "Message too large (max 4KB).".to_string(),
+                });
                 return;
             }
             update_peer_activity(peers, id);
