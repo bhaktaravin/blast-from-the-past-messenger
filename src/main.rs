@@ -352,7 +352,9 @@ struct AolApp {
     nudge_time: f32,
     nudge_from: Option<String>,
     // Wink animation: emoji, position, time, from
-    wink_animation: Option<(String, f32, f32, String)>, // (emoji, x_pos, time, from) // message_id -> list of users who read
+    wink_animation: Option<(String, f32, f32, String)>,
+    // Open DM windows: username -> input text
+    dm_windows: HashMap<String, String>,
     // E2E encryption: shared secrets keyed by peer username (native only)
     // Stored as raw 32-byte arrays to avoid lifetime issues with x25519_dalek types
     #[cfg(not(target_arch = "wasm32"))]
@@ -536,6 +538,7 @@ impl AolApp {
             nudge_time: 0.0,
             nudge_from: None,
             wink_animation: None,
+            dm_windows: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             e2e_shared_secrets: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -796,6 +799,8 @@ impl AolApp {
                         read_count: None,
                     });
                     self.audio_manager.play(SoundEffect::MessageReceived);
+                    // Auto-open DM window when a message arrives
+                    self.dm_windows.entry(from.clone()).or_default();
                     if self.selected_target != target {
                         *self.unread_counts.entry(target).or_default() += 1;
                     }
@@ -2618,22 +2623,22 @@ impl eframe::App for AolApp {
 
                                     let target = ChatTarget::Direct(buddy.username.clone());
                                     let username_response = ui.selectable_label(
-                                        self.selected_target == target,
+                                        self.dm_windows.contains_key(&buddy.username),
                                         &buddy.username
                                     );
                                     
-                                    // Single click to select, double-click to open DM
-                                    if username_response.clicked() {
-                                        self.select_target(ChatTarget::Direct(buddy.username.clone()));
-                                    }
-                                    if username_response.double_clicked() {
-                                        self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                    // Click or double-click opens DM window
+                                    if username_response.clicked() || username_response.double_clicked() {
+                                        self.dm_windows.entry(buddy.username.clone()).or_default();
+                                        if !self.messages.contains_key(&target) {
+                                            let _ = self.network.tx.send(UiToNet::FetchHistory { target: target.clone() });
+                                        }
                                     }
                                     
                                     // Right-click context menu
                                     username_response.context_menu(|ui| {
                                         if ui.button("💬 Send DM").clicked() {
-                                            self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                            self.dm_windows.entry(buddy.username.clone()).or_default();
                                             ui.close_menu();
                                         }
                                         if ui.button("👤 View Profile").clicked() {
@@ -2762,22 +2767,22 @@ impl eframe::App for AolApp {
 
                                     let target = ChatTarget::Direct(buddy.username.clone());
                                     let username_response = ui.selectable_label(
-                                        self.selected_target == target,
+                                        self.dm_windows.contains_key(&buddy.username),
                                         &buddy.username
                                     );
                                     
-                                    // Single click to select, double-click to open DM
-                                    if username_response.clicked() {
-                                        self.select_target(ChatTarget::Direct(buddy.username.clone()));
-                                    }
-                                    if username_response.double_clicked() {
-                                        self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                    // Click or double-click opens DM window
+                                    if username_response.clicked() || username_response.double_clicked() {
+                                        self.dm_windows.entry(buddy.username.clone()).or_default();
+                                        if !self.messages.contains_key(&target) {
+                                            let _ = self.network.tx.send(UiToNet::FetchHistory { target: target.clone() });
+                                        }
                                     }
                                     
                                     // Right-click context menu
                                     username_response.context_menu(|ui| {
                                         if ui.button("💬 Send DM").clicked() {
-                                            self.select_target(ChatTarget::Direct(buddy.username.clone()));
+                                            self.dm_windows.entry(buddy.username.clone()).or_default();
                                             ui.close_menu();
                                         }
                                         if ui.button("👤 View Profile").clicked() {
@@ -2843,6 +2848,99 @@ impl eframe::App for AolApp {
                             ui.label("No buddies online.");
                         }
                     });
+
+                // ── Floating DM Windows ───────────────────────────────────
+                let dm_usernames: Vec<String> = self.dm_windows.keys().cloned().collect();
+                let mut to_close: Vec<String> = Vec::new();
+
+                for peer in dm_usernames {
+                    let messages = self.messages
+                        .get(&ChatTarget::Direct(peer.clone()))
+                        .cloned()
+                        .unwrap_or_default();
+                    let input = self.dm_windows.get_mut(&peer).unwrap();
+                    let my_name = self.logged_in_user.clone().unwrap_or_default();
+                    let unread = self.unread_counts.get(&ChatTarget::Direct(peer.clone())).copied().unwrap_or(0);
+
+                    let title = if unread > 0 {
+                        format!("💬 {} ({})", peer, unread)
+                    } else {
+                        format!("💬 {}", peer)
+                    };
+
+                    let mut open = true;
+                    egui::Window::new(&title)
+                        .id(egui::Id::new(format!("dm_window_{}", peer)))
+                        .open(&mut open)
+                        .resizable(true)
+                        .default_size([380.0, 320.0])
+                        .min_size([280.0, 200.0])
+                        .show(ctx, |ui| {
+                            // Message history
+                            let available = ui.available_height() - 40.0;
+                            egui::ScrollArea::vertical()
+                                .max_height(available)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    for msg in &messages {
+                                        let is_me = msg.from == my_name;
+                                        ui.horizontal_wrapped(|ui| {
+                                            let name_color = if is_me {
+                                                egui::Color32::from_rgb(100, 180, 255)
+                                            } else {
+                                                egui::Color32::from_rgb(255, 160, 60)
+                                            };
+                                            ui.label(egui::RichText::new(format!("{}: ", msg.from))
+                                                .strong().color(name_color));
+                                            ui.label(&msg.body);
+                                        });
+                                    }
+                                });
+
+                            ui.separator();
+
+                            // Input row
+                            ui.horizontal(|ui| {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(input)
+                                        .hint_text("Send a message...")
+                                        .desired_width(ui.available_width() - 50.0)
+                                );
+                                let send = ui.button("Send").clicked()
+                                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                if send && !input.trim().is_empty() {
+                                    let body = input.trim().to_string();
+                                    input.clear();
+                                    let _ = self.network.tx.send(UiToNet::SendDirect {
+                                        to: peer.clone(),
+                                        body: body.clone(),
+                                    });
+                                    let entry = self.messages
+                                        .entry(ChatTarget::Direct(peer.clone()))
+                                        .or_default();
+                                    entry.push(ChatMessage {
+                                        from: my_name.clone(),
+                                        body,
+                                        at: chrono::Utc::now().to_rfc3339(),
+                                        id: None,
+                                        read_count: None,
+                                    });
+                                    self.audio_manager.play(SoundEffect::MessageSent);
+                                }
+                                if resp.gained_focus() {
+                                    // Clear unread when window is focused
+                                    self.unread_counts.remove(&ChatTarget::Direct(peer.clone()));
+                                }
+                            });
+                        });
+
+                    if !open {
+                        to_close.push(peer.clone());
+                    }
+                }
+                for peer in to_close {
+                    self.dm_windows.remove(&peer);
+                }
 
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let heading = match &self.selected_target {
