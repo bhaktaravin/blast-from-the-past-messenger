@@ -119,33 +119,41 @@ jobs:
           security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
           security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
+          # Verify identity is available
+          security find-identity -v -p codesigning build.keychain
 
-      - name: Create and sign app bundle
-        run: |
-          chmod +x .github/scripts/create-macos-app.sh
-          ./.github/scripts/create-macos-app.sh
-          codesign --deep --force --verify --verbose \
-            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
-            --options runtime \
-            "target/release/Blast From The Past.app"
-
-      - name: Notarize app
+      - name: Create app bundle, sign and notarize
         env:
           NOTARIZATION_APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
           NOTARIZATION_PWD: ${{ secrets.NOTARIZATION_PWD }}
         run: |
+          # Build app bundle
+          chmod +x .github/scripts/create-macos-app.sh
+          ./.github/scripts/create-macos-app.sh
+
+          # Unlock keychain again (may lock between steps)
+          security unlock-keychain -p actions build.keychain
+
+          # Sign the app bundle
+          codesign --deep --force --verify --verbose \
+            --keychain build.keychain \
+            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
+            --options runtime \
+            "target/release/Blast From The Past.app"
+
+          # Notarize
           ditto -c -k --keepParent "target/release/Blast From The Past.app" app-intel.zip
           xcrun notarytool submit app-intel.zip \
             --apple-id "$NOTARIZATION_APPLE_ID" \
             --password "$NOTARIZATION_PWD" \
             --team-id "VLJG47KK4K" \
             --wait
-          xcrun stapler staple "target/release/Blast From The Past.app"
 
-      - name: Create signed DMG
-        run: |
+          # Staple and create DMG
+          xcrun stapler staple "target/release/Blast From The Past.app"
           mv blast-from-the-past-macos.dmg blast-from-the-past-macos-intel.dmg
-          codesign --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
+          codesign --keychain build.keychain \
+            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
             blast-from-the-past-macos-intel.dmg
 
       - name: Upload Intel DMG
@@ -201,21 +209,21 @@ jobs:
           security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
           security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning build.keychain
 
-      - name: Create and sign app bundle
-        run: |
-          chmod +x .github/scripts/create-macos-app.sh
-          ./.github/scripts/create-macos-app.sh
-          codesign --deep --force --verify --verbose \
-            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
-            --options runtime \
-            "target/release/Blast From The Past.app"
-
-      - name: Notarize app
+      - name: Create app bundle, sign and notarize
         env:
           NOTARIZATION_APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
           NOTARIZATION_PWD: ${{ secrets.NOTARIZATION_PWD }}
         run: |
+          chmod +x .github/scripts/create-macos-app.sh
+          ./.github/scripts/create-macos-app.sh
+          security unlock-keychain -p actions build.keychain
+          codesign --deep --force --verify --verbose \
+            --keychain build.keychain \
+            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
+            --options runtime \
+            "target/release/Blast From The Past.app"
           ditto -c -k --keepParent "target/release/Blast From The Past.app" app-silicon.zip
           xcrun notarytool submit app-silicon.zip \
             --apple-id "$NOTARIZATION_APPLE_ID" \
@@ -223,11 +231,9 @@ jobs:
             --team-id "VLJG47KK4K" \
             --wait
           xcrun stapler staple "target/release/Blast From The Past.app"
-
-      - name: Create signed DMG
-        run: |
           mv blast-from-the-past-macos.dmg blast-from-the-past-macos-silicon.dmg
-          codesign --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
+          codesign --keychain build.keychain \
+            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
             blast-from-the-past-macos-silicon.dmg
 
       - name: Upload Silicon DMG
