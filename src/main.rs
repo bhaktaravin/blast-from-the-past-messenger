@@ -421,7 +421,9 @@ struct SavedCredentials {
 
 /// Simple obfuscation for stored credentials - not cryptographic but prevents
 /// plaintext passwords in config files. Uses XOR with a key derived from app name.
+#[cfg(not(target_arch = "wasm32"))]
 fn obfuscate_password(password: &str, username: &str) -> String {
+    use base64::Engine as _;
     let key = format!("blast-from-the-past-{}", username);
     let key_bytes = key.as_bytes();
     let obfuscated: Vec<u8> = password
@@ -433,7 +435,9 @@ fn obfuscate_password(password: &str, username: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(&obfuscated)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn deobfuscate_password(obfuscated: &str, username: &str) -> Option<String> {
+    use base64::Engine as _;
     let decoded = base64::engine::general_purpose::STANDARD.decode(obfuscated).ok()?;
     let key = format!("blast-from-the-past-{}", username);
     let key_bytes = key.as_bytes();
@@ -626,32 +630,33 @@ impl AolApp {
             let _ = std::fs::remove_file(self.credentials_file());
             return;
         }
-        
-        let creds = SavedCredentials {
-            username: self.username.clone(),
-            password_obfuscated: Some(obfuscate_password(&self.password, &self.username)),
-            server_url: self.server_url.clone(),
-        };
-        if let Ok(json) = serde_json::to_string(&creds) {
-            let _ = std::fs::create_dir_all(&self.credentials_path);
-            let _ = std::fs::write(self.credentials_file(), json);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let creds = SavedCredentials {
+                username: self.username.clone(),
+                password_obfuscated: Some(obfuscate_password(&self.password, &self.username)),
+                server_url: self.server_url.clone(),
+            };
+            if let Ok(json) = serde_json::to_string(&creds) {
+                let _ = std::fs::create_dir_all(&self.credentials_path);
+                let _ = std::fs::write(self.credentials_file(), json);
+            }
         }
     }
 
     fn load_credentials(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Ok(data) = std::fs::read_to_string(self.credentials_file()) {
             if let Ok(creds) = serde_json::from_str::<SavedCredentials>(&data) {
                 if !creds.username.is_empty() {
                     self.username = creds.username.clone();
                     self.remember_me = true;
                 }
-                // Deobfuscate password
                 if let Some(ref obfuscated) = creds.password_obfuscated {
                     if let Some(password) = deobfuscate_password(obfuscated, &creds.username) {
                         self.password = password;
                     }
                 }
-                // Don't load server_url - always use default
             }
         }
         self.load_buddy_groups();
