@@ -2439,6 +2439,7 @@ impl eframe::App for AolApp {
                                             .on_hover_text("https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/latest")
                                             .clicked()
                                         {
+                                            #[cfg(not(target_arch = "wasm32"))]
                                             let _ = open::that("https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/latest");
                                         }
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
