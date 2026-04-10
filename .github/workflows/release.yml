@@ -112,7 +112,8 @@ jobs:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
-          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          printf "%s" "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          echo "Certificate size: $(wc -c < certificate.p12) bytes"
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p actions build.keychain
@@ -197,7 +198,8 @@ jobs:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
-          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          printf "%s" "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          echo "Certificate size: $(wc -c < certificate.p12) bytes"
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p actions build.keychain
