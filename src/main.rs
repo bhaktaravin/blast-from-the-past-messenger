@@ -873,6 +873,7 @@ impl AolApp {
                             target: ChatTarget::Lobby,
                         });
                     let _ = self.network.tx.send(UiToNet::FetchThreads);
+                    let _ = self.network.tx.send(UiToNet::FetchChatRooms);
                 }
                 NetToUi::AuthError(message) => {
                     self.status = message;
@@ -2464,6 +2465,78 @@ impl eframe::App for AolApp {
                         });
                         ui.add_space(8.0);
 
+                        // ── Chat Rooms section ────────────────────────────
+                        ui.horizontal(|ui| {
+                            ui.colored_label(egui::Color32::from_rgb(100, 180, 255), "💬 Chat Rooms");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("＋").on_hover_text("Create Room").clicked() {
+                                    self.show_room_creation_modal = true;
+                                }
+                                if ui.small_button("↻").on_hover_text("Refresh Rooms").clicked() {
+                                    let _ = self.network.tx.send(UiToNet::FetchChatRooms);
+                                }
+                            });
+                        });
+                        ui.separator();
+
+                        let rooms = self.chat_rooms.clone();
+                        if rooms.is_empty() {
+                            ui.label(egui::RichText::new("No rooms yet.").small().italics()
+                                .color(egui::Color32::GRAY));
+                        } else {
+                            for (room_id, name, member_count) in &rooms {
+                                let target = ChatTarget::Room(room_id.clone());
+                                ui.horizontal(|ui| {
+                                    let label = format!("# {} ({})", name, member_count);
+                                    if ui.selectable_label(self.selected_target == target, label).clicked() {
+                                        // Join room if not already in it
+                                        let _ = self.network.tx.send(UiToNet::JoinChatRoom { room_id: room_id.clone() });
+                                        self.select_target(target.clone());
+                                    }
+                                    if let Some(&count) = self.unread_counts.get(&target) {
+                                        if count > 0 {
+                                            ui.label(egui::RichText::new(format!("●{}", count))
+                                                .small().color(egui::Color32::from_rgb(220, 60, 60)));
+                                        }
+                                    }
+                                });
+                            }
+                        }
+
+                        // Room creation modal
+                        if self.show_room_creation_modal {
+                            egui::Window::new("Create Chat Room")
+                                .collapsible(false)
+                                .resizable(false)
+                                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                                .show(ctx, |ui| {
+                                    ui.label("Room name:");
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(&mut self.new_room_name)
+                                            .hint_text("e.g. Gaming, Music...")
+                                            .desired_width(200.0)
+                                    );
+                                    resp.request_focus();
+                                    ui.horizontal(|ui| {
+                                        let can_create = !self.new_room_name.trim().is_empty();
+                                        if ui.add_enabled(can_create, egui::Button::new("Create")).clicked()
+                                            || (can_create && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                        {
+                                            let name = Self::sanitize_input(&self.new_room_name);
+                                            let _ = self.network.tx.send(UiToNet::CreateChatRoom { name });
+                                            self.new_room_name.clear();
+                                            self.show_room_creation_modal = false;
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            self.new_room_name.clear();
+                                            self.show_room_creation_modal = false;
+                                        }
+                                    });
+                                });
+                        }
+
+                        ui.add_space(8.0);
+
                         // Separate buddies by status (exclude self)
                         let buddies = self.buddies.clone();
                         let (online, away): (Vec<_>, Vec<_>) = buddies
@@ -2775,7 +2848,13 @@ impl eframe::App for AolApp {
                     let heading = match &self.selected_target {
                         ChatTarget::Lobby => "Chat Log - Lobby".to_string(),
                         ChatTarget::Direct(name) => format!("Chat Log - {name}"),
-                        ChatTarget::Room(room_id) => format!("Chat Log - Room {}", room_id),
+                        ChatTarget::Room(room_id) => {
+                            // Show room name if we have it, otherwise show id
+                            self.chat_rooms.iter()
+                                .find(|(id, _, _)| id == room_id)
+                                .map(|(_, name, _)| format!("# {}", name))
+                                .unwrap_or_else(|| format!("# {}", room_id))
+                        }
                     };
                     ui.heading(heading);
                     ui.separator();
@@ -2784,6 +2863,20 @@ impl eframe::App for AolApp {
                             ChatTarget::Direct(name) => Some(name.clone()),
                             _ => None,
                         };
+                        let room_id = match &self.selected_target {
+                            ChatTarget::Room(id) => Some(id.clone()),
+                            _ => None,
+                        };
+                        if let Some(room_id) = room_id {
+                            if ui.button("🚪 Leave Room").clicked() {
+                                let _ = self.network.tx.send(UiToNet::LeaveChatRoom { room_id: room_id.clone() });
+                                let _ = self.network.tx.send(UiToNet::FetchChatRooms);
+                                self.select_target(ChatTarget::Lobby);
+                            }
+                            if ui.button("👥 Members").clicked() {
+                                let _ = self.network.tx.send(UiToNet::FetchRoomMembers { room_id });
+                            }
+                        }
                         if let Some(name) = direct_name {
                             if ui.button("Block").clicked() {
                                 self.send_moderation(UiToNet::Block { username: name.clone() });
