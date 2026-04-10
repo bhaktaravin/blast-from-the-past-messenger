@@ -701,6 +701,11 @@ impl AolApp {
                     (22.0 + 6.0 * t) as u8,
                     (18.0 + 4.0 * t) as u8,
                 ),
+                Theme::WindowsXP => (
+                    (236.0 - 4.0 * t) as u8,
+                    (233.0 - 4.0 * t) as u8,
+                    (216.0 - 4.0 * t) as u8,
+                ),
             };
             let color = egui::Color32::from_rgb(r, g, b);
             let y0 = rect.top() + rect.height() * (i as f32 / steps as f32);
@@ -1437,6 +1442,11 @@ impl eframe::App for AolApp {
                         egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 80, 20)),
                         egui::Color32::from_rgb(231, 220, 198),
                     ),
+                    Theme::WindowsXP => (
+                        egui::Color32::from_rgb(255, 255, 255),
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 84, 166)),
+                        egui::Color32::from_rgb(0, 0, 0),
+                    ),
                 };
 
                 // ── top bar ──────────────────────────────────────────────
@@ -1449,7 +1459,8 @@ impl eframe::App for AolApp {
                         let label = match self.theme {
                             Theme::Light => "Dark Mode",
                             Theme::Dark  => "Midnight Amber",
-                            Theme::MidnightAmber => "Light Mode",
+                            Theme::MidnightAmber => "Windows XP",
+                            Theme::WindowsXP => "Light Mode",
                         };
                         if ui.button("Refresh UI").clicked() { ctx.request_repaint(); }
                         if ui.button(label).clicked() { self.toggle_theme(ctx); }
