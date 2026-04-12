@@ -1,0 +1,58 @@
+name: Web Build Check
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'index.html'
+      - 'Trunk.toml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-web-build:
+    name: Check Web Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-web-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install trunk
+        run: |
+          wget -qO- https://github.com/trunk-rs/trunk/releases/download/v0.18.8/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
+          sudo mv trunk /usr/local/bin/
+
+      - name: Build web app
+        run: trunk build --release
+
+      - name: Check dist folder
+        run: |
+          ls -lah dist/
+          echo "✅ Web build successful!"
+          
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: web-dist
+          path: dist/
+          retention-days: 7

@@ -12,6 +12,8 @@ pub enum SoundEffect {
     BuddySignOff,
     MessageReceived,
     MessageSent,
+    DoorSlam,      // When someone blocks you
+    Typing,        // Typing sound
 }
 
 pub struct AudioManager {
@@ -39,6 +41,8 @@ impl AudioManager {
                 SoundEffect::BuddySignOff => "buddy-out.wav",
                 SoundEffect::MessageReceived => "message.wav",
                 SoundEffect::MessageSent => "send.wav",
+                SoundEffect::DoorSlam => "buddy-out.wav", // Reuse buddy-out for now
+                SoundEffect::Typing => "send.wav", // Reuse send for now (quieter)
             };
 
             if let Some(sound_data) = SoundAssets::get(filename) {
@@ -47,7 +51,13 @@ impl AudioManager {
                     let cursor = Cursor::new(data);
                     if let Ok(source) = Decoder::new(cursor) {
                         if let Ok(sink) = Sink::try_new(&stream_handle) {
-                            sink.set_volume(volume);
+                            // Lower volume for typing sound
+                            let adjusted_volume = if matches!(effect, SoundEffect::Typing) {
+                                volume * 0.3
+                            } else {
+                                volume
+                            };
+                            sink.set_volume(adjusted_volume);
                             sink.append(source);
                             sink.sleep_until_end();
                         }

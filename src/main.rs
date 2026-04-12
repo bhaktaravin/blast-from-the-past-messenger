@@ -113,6 +113,8 @@ mod audio_stub {
         BuddySignOff,
         MessageReceived,
         MessageSent,
+        DoorSlam,
+        Typing,
     }
 
     pub struct AudioManager {
@@ -279,6 +281,10 @@ enum Theme {
     Dark,
     MidnightAmber,
     WindowsXP,
+    AolClassic,
+    MsnMessenger,
+    YahooMessenger,
+    Icq,
 }
 
 struct NetworkHandle {
@@ -332,6 +338,7 @@ struct AolApp {
     audio_manager: AudioManager,
     sound_enabled: bool,
     sound_volume: f32,
+    typing_sounds: bool,
     // Display settings
     font_size: f32,
     show_settings_modal: bool,
@@ -558,6 +565,7 @@ impl AolApp {
             audio_manager: AudioManager::new(),
             sound_enabled: true,
             sound_volume: 0.8,
+            typing_sounds: true,
             font_size: 14.0,
             show_settings_modal: false,
             pending_friend_requests: Vec::new(),
@@ -747,6 +755,26 @@ impl AolApp {
                     (236.0 - 4.0 * t) as u8,
                     (233.0 - 4.0 * t) as u8,
                     (216.0 - 4.0 * t) as u8,
+                ),
+                Theme::AolClassic => (
+                    (255.0 - 10.0 * t) as u8,
+                    (255.0 - 20.0 * t) as u8,
+                    (204.0 - 30.0 * t) as u8,
+                ),
+                Theme::MsnMessenger => (
+                    (227.0 - 10.0 * t) as u8,
+                    (242.0 - 15.0 * t) as u8,
+                    (253.0 - 20.0 * t) as u8,
+                ),
+                Theme::YahooMessenger => (
+                    (240.0 - 10.0 * t) as u8,
+                    (230.0 - 20.0 * t) as u8,
+                    (255.0 - 15.0 * t) as u8,
+                ),
+                Theme::Icq => (
+                    (240.0 - 10.0 * t) as u8,
+                    (255.0 - 15.0 * t) as u8,
+                    (240.0 - 20.0 * t) as u8,
                 ),
             };
             let color = egui::Color32::from_rgb(r, g, b);
@@ -1313,7 +1341,11 @@ impl AolApp {
             Theme::Light => Theme::Dark,
             Theme::Dark => Theme::MidnightAmber,
             Theme::MidnightAmber => Theme::WindowsXP,
-            Theme::WindowsXP => Theme::Light,
+            Theme::WindowsXP => Theme::AolClassic,
+            Theme::AolClassic => Theme::MsnMessenger,
+            Theme::MsnMessenger => Theme::YahooMessenger,
+            Theme::YahooMessenger => Theme::Icq,
+            Theme::Icq => Theme::Light,
         };
         apply_theme(ctx, self.theme);
     }
@@ -1523,6 +1555,26 @@ impl eframe::App for AolApp {
                         egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 84, 166)),
                         egui::Color32::from_rgb(0, 0, 0),
                     ),
+                    Theme::AolClassic => (
+                        egui::Color32::from_rgb(255, 255, 204),
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 0, 128)),
+                        egui::Color32::from_rgb(0, 0, 0),
+                    ),
+                    Theme::MsnMessenger => (
+                        egui::Color32::from_rgb(227, 242, 253),
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 215)),
+                        egui::Color32::from_rgb(0, 0, 0),
+                    ),
+                    Theme::YahooMessenger => (
+                        egui::Color32::from_rgb(240, 230, 255),
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(102, 0, 153)),
+                        egui::Color32::from_rgb(0, 0, 0),
+                    ),
+                    Theme::Icq => (
+                        egui::Color32::from_rgb(240, 255, 240),
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(34, 139, 34)),
+                        egui::Color32::from_rgb(0, 0, 0),
+                    ),
                 };
 
                 // ── top bar ──────────────────────────────────────────────
@@ -1536,7 +1588,11 @@ impl eframe::App for AolApp {
                             Theme::Light => "Dark Mode",
                             Theme::Dark  => "Midnight Amber",
                             Theme::MidnightAmber => "Windows XP",
-                            Theme::WindowsXP => "Light Mode",
+                            Theme::WindowsXP => "AOL Classic",
+                            Theme::AolClassic => "MSN Messenger",
+                            Theme::MsnMessenger => "Yahoo Messenger",
+                            Theme::YahooMessenger => "ICQ",
+                            Theme::Icq => "Light Mode",
                         };
                         if ui.button("Refresh UI").clicked() { ctx.request_repaint(); }
                         if ui.button(label).clicked() { self.toggle_theme(ctx); }
@@ -2079,6 +2135,10 @@ impl eframe::App for AolApp {
                                         (Theme::Dark,          "⚫ Dark"),
                                         (Theme::Light,         "⚪ Light"),
                                         (Theme::WindowsXP,     "🪟 Windows XP"),
+                                        (Theme::AolClassic,    "📧 AOL Classic"),
+                                        (Theme::MsnMessenger,  "🦋 MSN Messenger"),
+                                        (Theme::YahooMessenger,"💜 Yahoo Messenger"),
+                                        (Theme::Icq,           "🌺 ICQ"),
                                     ];
                                     for (t, label) in themes {
                                         if ui.selectable_label(self.theme == t, label).clicked() {
@@ -2126,6 +2186,7 @@ impl eframe::App for AolApp {
                                 ui.label("Sound");
                                 ui.separator();
                                 ui.checkbox(&mut self.sound_enabled, "Enable sound effects");
+                                ui.checkbox(&mut self.typing_sounds, "Typing sounds");
                                 ui.horizontal(|ui| {
                                     ui.label("Volume:");
                                     ui.add(egui::Slider::new(&mut self.sound_volume, 0.0..=1.0)
@@ -2143,6 +2204,9 @@ impl eframe::App for AolApp {
                                     }
                                     if ui.small_button("💬 Message").clicked() {
                                         self.audio_manager.play(SoundEffect::MessageReceived);
+                                    }
+                                    if ui.small_button("⌨️ Typing").clicked() {
+                                        self.audio_manager.play(SoundEffect::Typing);
                                     }
                                 });
 
@@ -2694,6 +2758,26 @@ impl eframe::App for AolApp {
                                         self.viewing_profile = Some(buddy.username.clone());
                                         let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
                                     }
+                                    
+                                    // Enhanced tooltip on hover
+                                    response.on_hover_ui(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.heading(&buddy.username);
+                                            if let Some(ref status) = buddy.status {
+                                                ui.label(egui::RichText::new(status).italics());
+                                            }
+                                            if let Some(ref away_msg) = buddy.away {
+                                                ui.label(egui::RichText::new(format!("Away: {}", away_msg)).color(egui::Color32::YELLOW));
+                                            }
+                                            let idle_text = format_idle_time(buddy.last_activity);
+                                            if !idle_text.is_empty() {
+                                                ui.label(egui::RichText::new(&idle_text).small().color(egui::Color32::GRAY));
+                                            }
+                                            ui.separator();
+                                            ui.label("Click to view profile");
+                                            ui.label("Right-click for options");
+                                        });
+                                    });
 
                                     let target = ChatTarget::Direct(buddy.username.clone());
                                     let username_response = ui.selectable_label(
@@ -2720,7 +2804,12 @@ impl eframe::App for AolApp {
                                             let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
                                             ui.close_menu();
                                         }
-                                        if ui.button("💥 Nudge").clicked() {
+                                        if ui.button("� Start E2E Encryption").clicked() {
+                                            #[cfg(not(target_arch = "wasm32"))]
+                                            self.initiate_e2e_static(&buddy.username);
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("�💥 Nudge").clicked() {
                                             let _ = self.network.tx.send(UiToNet::Nudge { to: buddy.username.clone() });
                                             self.show_toast(format!("Nudged {}!", buddy.username), ToastKind::Info);
                                             ui.close_menu();
@@ -2738,6 +2827,28 @@ impl eframe::App for AolApp {
                                                 }
                                             }
                                         });
+                                        ui.separator();
+                                        ui.menu_button("📁 Add to Group", |ui| {
+                                            let groups: Vec<String> = self.buddy_groups.keys().cloned().collect();
+                                            for group_name in groups {
+                                                if ui.button(&group_name).clicked() {
+                                                    if let Some(group) = self.buddy_groups.get_mut(&group_name) {
+                                                        if !group.contains(&buddy.username) {
+                                                            group.push(buddy.username.clone());
+                                                            self.save_buddy_groups();
+                                                            self.show_toast(format!("Added {} to {}", buddy.username, group_name), ToastKind::Success);
+                                                        }
+                                                    }
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                            ui.separator();
+                                            if ui.button("➕ New Group...").clicked() {
+                                                self.group_modal_username = Some(buddy.username.clone());
+                                                self.show_group_modal = true;
+                                                ui.close_menu();
+                                            }
+                                        });
                                     });
 
                                     // Show custom status if set
@@ -2749,17 +2860,15 @@ impl eframe::App for AolApp {
                                         );
                                     }
                                     
-                                    // Show idle time if > 5 minutes
-                                    if let Some(idle_secs) = buddy.last_activity {
-                                        if idle_secs > 300 { // 5 minutes
-                                            let idle_str = format_idle_time(idle_secs);
-                                            ui.label(
-                                                egui::RichText::new(format!("(Idle {})", idle_str))
-                                                    .small()
-                                                    .italics()
-                                                    .color(egui::Color32::from_rgb(150, 150, 150))
-                                            );
-                                        }
+                                    // Show idle time
+                                    let idle_text = format_idle_time(buddy.last_activity);
+                                    if !idle_text.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&idle_text)
+                                                .small()
+                                                .italics()
+                                                .color(egui::Color32::from_rgb(150, 150, 150))
+                                        );
                                     }
                                 });
                             }
@@ -2902,17 +3011,15 @@ impl eframe::App for AolApp {
                                         );
                                     }
                                     
-                                    // Show idle time if > 5 minutes
-                                    if let Some(idle_secs) = buddy.last_activity {
-                                        if idle_secs > 300 { // 5 minutes
-                                            let idle_str = format_idle_time(idle_secs);
-                                            ui.label(
-                                                egui::RichText::new(format!("(Idle {})", idle_str))
-                                                    .small()
-                                                    .italics()
-                                                    .color(egui::Color32::from_rgb(150, 150, 150))
-                                            );
-                                        }
+                                    // Show idle time
+                                    let idle_str = format_idle_time(buddy.last_activity);
+                                    if !idle_str.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&idle_str)
+                                                .small()
+                                                .italics()
+                                                .color(egui::Color32::from_rgb(150, 150, 150))
+                                        );
                                     }
                                 });
                             }
@@ -3352,6 +3459,12 @@ impl eframe::App for AolApp {
 
                         // Typing indicators — notify server when input changes
                         if response.has_focus() && response.changed() {
+                            // Play typing sound (subtle)
+                            if self.typing_sounds && !self.chat_input.is_empty() && self.chat_input.len() % 3 == 0 {
+                                // Only play every 3rd character to avoid spam
+                                self.audio_manager.play(SoundEffect::Typing);
+                            }
+                            
                             let room_key = match &self.selected_target {
                                 ChatTarget::Room(id) => Some(id.clone()),
                                 _ => None,
@@ -3483,6 +3596,73 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
             visuals.hyperlink_color = egui::Color32::from_rgb(0, 102, 204);
             visuals
         }
+        Theme::AolClassic => {
+            // Classic AOL Instant Messenger - yellow/blue theme
+            let mut visuals = egui::Visuals::light();
+            visuals.panel_fill = egui::Color32::from_rgb(255, 255, 204); // Light yellow
+            visuals.window_fill = egui::Color32::from_rgb(255, 255, 255);
+            visuals.window_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 0, 128)); // Navy blue
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(255, 255, 224);
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(255, 255, 153);
+            visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(255, 255, 102);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(255, 204, 0);
+            visuals.selection.bg_fill = egui::Color32::from_rgb(0, 0, 255); // AOL blue
+            visuals.override_text_color = Some(egui::Color32::from_rgb(0, 0, 0));
+            visuals.hyperlink_color = egui::Color32::from_rgb(0, 0, 255);
+            visuals
+        }
+        Theme::MsnMessenger => {
+            // MSN Messenger - green/blue theme
+            let mut visuals = egui::Visuals::light();
+            visuals.panel_fill = egui::Color32::from_rgb(227, 242, 253); // Light blue
+            visuals.window_fill = egui::Color32::from_rgb(255, 255, 255);
+            visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 120, 215));
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(240, 248, 255);
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(173, 216, 230);
+            visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(135, 206, 250);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0, 120, 215);
+            visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+            visuals.selection.bg_fill = egui::Color32::from_rgb(0, 120, 215);
+            visuals.override_text_color = Some(egui::Color32::from_rgb(0, 0, 0));
+            visuals.hyperlink_color = egui::Color32::from_rgb(0, 102, 204);
+            visuals
+        }
+        Theme::YahooMessenger => {
+            // Yahoo Messenger - purple theme
+            let mut visuals = egui::Visuals::light();
+            visuals.panel_fill = egui::Color32::from_rgb(240, 230, 255); // Light purple
+            visuals.window_fill = egui::Color32::from_rgb(255, 255, 255);
+            visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(102, 0, 153));
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(245, 240, 255);
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(216, 191, 216);
+            visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(3);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(186, 85, 211);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(138, 43, 226);
+            visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+            visuals.selection.bg_fill = egui::Color32::from_rgb(138, 43, 226);
+            visuals.override_text_color = Some(egui::Color32::from_rgb(0, 0, 0));
+            visuals.hyperlink_color = egui::Color32::from_rgb(102, 0, 153);
+            visuals
+        }
+        Theme::Icq => {
+            // ICQ - green/white theme with flower logo vibes
+            let mut visuals = egui::Visuals::light();
+            visuals.panel_fill = egui::Color32::from_rgb(240, 255, 240); // Mint green
+            visuals.window_fill = egui::Color32::from_rgb(255, 255, 255);
+            visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(34, 139, 34));
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(245, 255, 245);
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(144, 238, 144);
+            visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(3);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(50, 205, 50);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(34, 139, 34);
+            visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+            visuals.selection.bg_fill = egui::Color32::from_rgb(34, 139, 34);
+            visuals.override_text_color = Some(egui::Color32::from_rgb(0, 0, 0));
+            visuals.hyperlink_color = egui::Color32::from_rgb(0, 128, 0);
+            visuals
+        }
     };
     visuals.window_corner_radius = egui::CornerRadius::same(6);
     ctx.set_visuals(visuals);
@@ -3563,6 +3743,32 @@ fn format_relative_time(at: &str) -> String {
     format!("{}w", days / 7)
 }
 
+fn format_idle_time(last_activity: Option<i64>) -> String {
+    let Some(timestamp) = last_activity else {
+        return String::new();
+    };
+    
+    let now = chrono::Utc::now().timestamp();
+    let idle_secs = (now - timestamp).max(0);
+    
+    if idle_secs < 60 {
+        return String::new(); // Active
+    }
+    
+    let mins = idle_secs / 60;
+    if mins < 60 {
+        return format!("Idle {}m", mins);
+    }
+    
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("Idle {}h", hours);
+    }
+    
+    let days = hours / 24;
+    format!("Idle {}d", days)
+}
+
 fn format_full_timestamp(at: &str) -> String {
     let parsed = chrono::DateTime::parse_from_rfc3339(at).ok();
     let timestamp = match parsed {
@@ -3570,22 +3776,6 @@ fn format_full_timestamp(at: &str) -> String {
         None => return String::new(),
     };
     timestamp.format("%B %d, %Y at %I:%M %p").to_string()
-}
-
-fn format_idle_time(secs: i64) -> String {
-    if secs < 60 {
-        return format!("{}s", secs);
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{}m", mins);
-    }
-    let hours = mins / 60;
-    if hours < 24 {
-        return format!("{}h", hours);
-    }
-    let days = hours / 24;
-    format!("{}d", days)
 }
 
 // Render message body with clickable URLs

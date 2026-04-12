@@ -1,0 +1,28 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        # Install Rust
+        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        - source $HOME/.cargo/env
+        - rustup --version
+        # Add WASM target
+        - rustup target add wasm32-unknown-unknown
+        # Install trunk for building WASM
+        - cargo install --locked trunk
+        - trunk --version
+    build:
+      commands:
+        # Build the web app
+        - trunk build --release --public-url /
+  artifacts:
+    # Amplify will serve everything in the dist folder
+    baseDirectory: dist
+    files:
+      - '**/*'
+  cache:
+    paths:
+      # Cache Rust dependencies to speed up builds
+      - ~/.cargo/**/*
+      - target/**/*
