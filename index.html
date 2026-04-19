@@ -3,8 +3,8 @@
 <head>
     
 <script type="module">
-import init, * as bindings from '/blast-from-the-past-messenger/chatmessagediscordclone-741a2a5ce5b5c849.js';
-const wasm = await init({ module_or_path: '/blast-from-the-past-messenger/chatmessagediscordclone-741a2a5ce5b5c849_bg.wasm' });
+import init, * as bindings from '/blast-from-the-past-messenger/chatmessagediscordclone-61ebeea8d551773e.js';
+const wasm = await init({ module_or_path: '/blast-from-the-past-messenger/chatmessagediscordclone-61ebeea8d551773e_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -17,10 +17,13 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="X-UA-Compatible" content="ie=edge">
     <!-- Prevent extension interference -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'wasm-unsafe-eval'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'wasm-unsafe-eval' https://unpkg.com https://8x8.vc https://*.jitsi.net; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline' https://unpkg.com https://8x8.vc https://*.jitsi.net; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: https:; media-src 'self' blob:; frame-src https://8x8.vc https://*.jitsi.net;">
     <meta name="description" content="Blast From The Past Messenger - Retro AOL Messenger">
     <meta name="referrer" content="strict-origin-when-cross-origin">
     <title>Blast From The Past Messenger</title>
+    
+    <!-- Jitsi Meet Video Calling (Free & Open Source) -->
+    <script src="https://8x8.vc/vpaas-magic-cookie-c8e9c3e8e8e8e8e8/external_api.js"></script>
 
     <style>
         html, body {
@@ -62,6 +65,35 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             width: 100%;
             height: 100%;
         }
+        
+        /* Video call modal */
+        #video-call-container {
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 90%;
+            max-width: 1200px;
+            height: 80%;
+            background: #1a1a1a;
+            border: 2px solid #f0a83a;
+            border-radius: 8px;
+            z-index: 10000;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+            padding: 10px;
+        }
+        
+        #video-call-container.active {
+            display: block;
+        }
+        
+        #jitsi-video-frame {
+            width: 100%;
+            height: 100%;
+            border: none;
+            border-radius: 6px;
+        }
 
         .status {
             position: fixed;
@@ -74,7 +106,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             border-radius: 3px;
         }
     </style>
-<link rel="modulepreload" href="/blast-from-the-past-messenger/chatmessagediscordclone-741a2a5ce5b5c849.js" crossorigin="anonymous" integrity="sha384-kOf9HWKkihu7qIxcI9/QD5yiIHCDNbhTrAPoHjHl0YK9hl/pXN5+qgpwUZzH7ieY"><link rel="preload" href="/blast-from-the-past-messenger/chatmessagediscordclone-741a2a5ce5b5c849_bg.wasm" crossorigin="anonymous" integrity="sha384-8kNO23qC8S00tNaovjDEDknwCs5ArSlYYsNbcuZ28jD671RqhNGHMbUNtoLK7cHn" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/blast-from-the-past-messenger/chatmessagediscordclone-61ebeea8d551773e.js" crossorigin="anonymous" integrity="sha384-tNuQ8YcSGB2+6CLOsXOJHG24YnOD0IeU9jy8gUvLy6jiqpjFckmMz2JognCTb3+E"><link rel="preload" href="/blast-from-the-past-messenger/chatmessagediscordclone-61ebeea8d551773e_bg.wasm" crossorigin="anonymous" integrity="sha384-oIJdOLYfscj1YqI6XU87MUR0bhlRnNem7aWJyhkR2egUdgOyxOLa9bmLkLCYlK1r" as="fetch" type="application/wasm"></head>
 <body>
     <div id="loading">
         <div class="spinner"></div>
@@ -83,10 +115,91 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     </div>
 
     <canvas id="the_canvas_id"></canvas>
+    
+    <!-- Video Call Container -->
+    <div id="video-call-container">
+        <div id="jitsi-video-frame"></div>
+    </div>
 
     <div class="status">Powered by egui + wasm</div>
 
     <script>
+        // Jitsi Meet Video Call Manager (Free & Open Source!)
+        let jitsiApi = null;
+        let videoContainer = null;
+        
+        window.startVideoCall = function(roomUrl) {
+            console.log('Starting Jitsi video call:', roomUrl);
+            
+            videoContainer = document.getElementById('video-call-container');
+            const frame = document.getElementById('jitsi-video-frame');
+            
+            if (!videoContainer || !frame) {
+                console.error('Video container not found');
+                return;
+            }
+            
+            // Extract room name from URL (format: https://meet.jit.si/RoomName)
+            const roomName = roomUrl.split('/').pop();
+            
+            // Jitsi Meet configuration
+            const domain = '8x8.vc';
+            const options = {
+                roomName: roomName,
+                width: '100%',
+                height: '100%',
+                parentNode: frame,
+                configOverwrite: {
+                    startWithAudioMuted: false,
+                    startWithVideoMuted: false,
+                    enableWelcomePage: false,
+                    prejoinPageEnabled: false,
+                    disableDeepLinking: true
+                },
+                interfaceConfigOverwrite: {
+                    TOOLBAR_BUTTONS: [
+                        'microphone', 'camera', 'closedcaptions', 'desktop',
+                        'fullscreen', 'fodeviceselection', 'hangup',
+                        'chat', 'recording', 'livestreaming', 'etherpad',
+                        'sharedvideo', 'settings', 'raisehand',
+                        'videoquality', 'filmstrip', 'stats', 'shortcuts',
+                        'tileview', 'download', 'help', 'mute-everyone'
+                    ],
+                    SHOW_JITSI_WATERMARK: false,
+                    SHOW_WATERMARK_FOR_GUESTS: false
+                }
+            };
+            
+            // Create Jitsi Meet instance
+            jitsiApi = new JitsiMeetExternalAPI(domain, options);
+            
+            // Show the video container
+            videoContainer.classList.add('active');
+            
+            // Handle when user leaves the call
+            jitsiApi.addEventListener('readyToClose', () => {
+                console.log('User left the call');
+                endVideoCall();
+            });
+            
+            jitsiApi.addEventListener('videoConferenceJoined', () => {
+                console.log('Joined video conference');
+            });
+        };
+        
+        window.endVideoCall = function() {
+            console.log('Ending video call');
+            
+            if (jitsiApi) {
+                jitsiApi.dispose();
+                jitsiApi = null;
+            }
+            
+            if (videoContainer) {
+                videoContainer.classList.remove('active');
+            }
+        };
+        
         // Prevent extension interference with input handling
         const originalAddEventListener = Element.prototype.addEventListener;
         const blockedExtensionPatterns = [
