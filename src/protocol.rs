@@ -94,6 +94,9 @@ pub enum ClientToServer {
     ReplyToDirect { to: String, reply_to_id: i64, body: String },
     /// Set avatar (base64 encoded image data)
     SetAvatar { avatar_data: String },
+    /// Video calling
+    StartVideoCall { to: String },
+    VideoCallResponse { from: String, room_url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +144,8 @@ pub enum ServerToClient {
     Winked { from: String, emoji: String },
     /// A user's profile data
     ProfileData { username: String, bio: String, status: Option<String>, joined: String, avatar_url: Option<String> },
+    /// Video call invitation
+    IncomingVideoCall { from: String, room_url: String },
 }
 
 

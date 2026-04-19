@@ -232,6 +232,7 @@ enum UiToNet {
     ReplyToMessage { reply_to_id: i64, body: String },
     ReplyToDirect { to: String, reply_to_id: i64, body: String },
     SetAvatar { avatar_data: String },
+    StartVideoCall { to: String },
 }
 
 enum NetToUi {
@@ -273,6 +274,7 @@ enum NetToUi {
     Nudged { from: String },
     Winked { from: String, emoji: String },
     ProfileData { username: String, bio: String, status: Option<String>, joined: String, avatar_url: Option<String> },
+    IncomingVideoCall { from: String, room_url: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1083,6 +1085,31 @@ impl AolApp {
                     self.profile_cache.insert(username.clone(), (bio, status, joined, avatar_url));
                     if self.viewing_profile.as_ref() == Some(&username) {
                         // Profile modal is open, it will refresh automatically
+                    }
+                }
+                NetToUi::IncomingVideoCall { from, room_url } => {
+                    self.show_toast(format!("📹 Video call from {}", from), ToastKind::Info);
+                    self.audio_manager.play(SoundEffect::MessageReceived);
+                    
+                    // On web, call JavaScript to start video
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        use wasm_bindgen::prelude::*;
+                        #[wasm_bindgen]
+                        extern "C" {
+                            #[wasm_bindgen(js_namespace = window)]
+                            fn startVideoCall(room_url: &str);
+                        }
+                        startVideoCall(&room_url);
+                    }
+                    
+                    // On native, show message for now
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        self.show_toast(
+                            format!("Video calling not yet supported on desktop. Room: {}", room_url),
+                            ToastKind::Info
+                        );
                     }
                 }
             }
@@ -2799,6 +2826,11 @@ impl eframe::App for AolApp {
                                             self.dm_windows.entry(buddy.username.clone()).or_default();
                                             ui.close_menu();
                                         }
+                                        if ui.button("📹 Video Call").clicked() {
+                                            let _ = self.network.tx.send(UiToNet::StartVideoCall { to: buddy.username.clone() });
+                                            self.show_toast(format!("Starting video call with {}...", buddy.username), ToastKind::Info);
+                                            ui.close_menu();
+                                        }
                                         if ui.button("👤 View Profile").clicked() {
                                             self.viewing_profile = Some(buddy.username.clone());
                                             let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
@@ -2966,6 +2998,11 @@ impl eframe::App for AolApp {
                                     username_response.context_menu(|ui| {
                                         if ui.button("💬 Send DM").clicked() {
                                             self.dm_windows.entry(buddy.username.clone()).or_default();
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("📹 Video Call").clicked() {
+                                            let _ = self.network.tx.send(UiToNet::StartVideoCall { to: buddy.username.clone() });
+                                            self.show_toast(format!("Starting video call with {}...", buddy.username), ToastKind::Info);
                                             ui.close_menu();
                                         }
                                         if ui.button("👤 View Profile").clicked() {
@@ -4100,6 +4137,9 @@ where
                                 ServerToClient::ProfileData { username, bio, status, joined, avatar_url } => {
                                     let _ = net_tx.send(NetToUi::ProfileData { username, bio, status, joined, avatar_url });
                                 }
+                                ServerToClient::IncomingVideoCall { from, room_url } => {
+                                    let _ = net_tx.send(NetToUi::IncomingVideoCall { from, room_url });
+                                }
                             }
                         }
                     }
@@ -4228,6 +4268,9 @@ where
                     }
                     UiToNet::SetAvatar { avatar_data } => {
                         send_json(&mut ws_tx, ClientToServer::SetAvatar { avatar_data }).await?;
+                    }
+                    UiToNet::StartVideoCall { to } => {
+                        send_json(&mut ws_tx, ClientToServer::StartVideoCall { to }).await?;
                     }
                     UiToNet::Disconnect => {
                         let _ = ws_tx.send(Message::Close(None)).await;

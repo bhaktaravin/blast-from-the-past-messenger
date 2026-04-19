@@ -8,6 +8,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use futures_util::{SinkExt, StreamExt};
 use rand::rngs::OsRng;
+use rand::Rng;
 use redis::AsyncCommands;
 use sqlx::{PgPool, Row};
 use tokio::net::TcpListener;
@@ -1094,6 +1095,75 @@ async fn handle_client_event(
                     .bind(&avatar_data).bind(user_id).execute(db).await;
                 broadcast_presence(peers);
             }
+        }
+        ClientToServer::StartVideoCall { to } => {
+            let (from, user_id) = match get_peer_identity(peers, id) {
+                Some(info) => info,
+                None => {
+                    send_to_peer(
+                        peers,
+                        id,
+                        ServerToClient::AuthError {
+                            message: "Please log in first.".to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+            
+            update_peer_activity(peers, id);
+            
+            // Generate a unique Jitsi Meet room URL (Free!)
+            let random_id = {
+                let mut rng = rand::thread_rng();
+                rng.gen::<u32>()
+            };
+            let room_name = format!("BlastMessenger-{}-{}", 
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                random_id
+            );
+            // Using Jitsi's free public instance
+            let room_url = format!("https://meet.jit.si/{}", room_name);
+            
+            // Send room URL to target user
+            if let Ok(Some(target_id)) = get_user_id_by_name(db, &to).await {
+                let target_tx = {
+                    if let Ok(guard) = peers.lock() {
+                        guard
+                            .values()
+                            .find(|peer| peer.user_id == Some(target_id))
+                            .map(|peer| peer.tx.clone())
+                    } else {
+                        None
+                    }
+                };
+                
+                if let Some(tx) = target_tx {
+                    let _ = tx.send(Message::Text(
+                        serde_json::to_string(&ServerToClient::IncomingVideoCall {
+                            from: from.clone(),
+                            room_url: room_url.clone(),
+                        }).unwrap()
+                    ));
+                }
+            }
+            
+            // Send confirmation to caller
+            send_to_peer(
+                peers,
+                id,
+                ServerToClient::IncomingVideoCall {
+                    from: to.clone(),
+                    room_url,
+                },
+            );
+        }
+        ClientToServer::VideoCallResponse { from: _, room_url: _ } => {
+            // This is handled by the IncomingVideoCall message
+            // No additional server action needed
         }
     }
 }
