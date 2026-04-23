@@ -4302,11 +4302,148 @@ where
 // Web network stub
 #[cfg(target_arch = "wasm32")]
 fn spawn_network() -> NetworkHandle {
-    let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiToNet>();
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiToNet>();
     let (net_tx, net_rx) = std_mpsc::channel::<NetToUi>();
 
-    // On web, we'll handle login differently - just return a handle
-    // In the UI, we'll detect this is web and handle networking specially
+    // Spawn web network task
+    wasm_bindgen_futures::spawn_local(async move {
+        use wasm_bindgen::prelude::*;
+        use wasm_bindgen::JsCast;
+        use web_sys::{WebSocket, MessageEvent, CloseEvent, ErrorEvent};
+        
+        let mut ws: Option<WebSocket> = None;
+        
+        while let Some(msg) = ui_rx.recv().await {
+            match msg {
+                UiToNet::Connect { url, username, password, mode } => {
+                    // Close existing connection if any
+                    if let Some(old_ws) = ws.take() {
+                        let _ = old_ws.close();
+                    }
+                    
+                    // Create new WebSocket connection
+                    match WebSocket::new(&url) {
+                        Ok(new_ws) => {
+                            let net_tx_clone = net_tx.clone();
+                            
+                            // Handle open
+                            let onopen = Closure::wrap(Box::new(move || {
+                                let _ = net_tx_clone.send(NetToUi::Connected);
+                            }) as Box<dyn FnMut()>);
+                            new_ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+                            onopen.forget();
+                            
+                            // Handle messages
+                            let net_tx_clone = net_tx.clone();
+                            let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
+                                if let Ok(txt) = e.data().dyn_into::<wasm_bindgen::JsValue>() {
+                                    if let Some(msg_str) = txt.as_string() {
+                                        if let Ok(server_msg) = serde_json::from_str::<ServerToClient>(&msg_str) {
+                                            let ui_msg = match server_msg {
+                                            ServerToClient::Welcome { message } => NetToUi::System(message),
+                                            ServerToClient::AuthOk { username } => NetToUi::AuthOk { username },
+                                            ServerToClient::AuthError { message } => NetToUi::AuthError(message),
+                                            ServerToClient::Presence { users } => NetToUi::Presence(users),
+                                            ServerToClient::Chat { from, body } => NetToUi::Chat { from, body },
+                                            ServerToClient::DirectMessage { from, body } => NetToUi::DirectMessage { from, body },
+                                            ServerToClient::Threads { users } => NetToUi::Threads(users),
+                                            ServerToClient::History { target, messages } => {
+                                                let chat_target = match target {
+                                                    HistoryTarget::Lobby => ChatTarget::Lobby,
+                                                    HistoryTarget::Direct { username } => ChatTarget::Direct(username),
+                                                    HistoryTarget::Room { room_id } => ChatTarget::Room(room_id),
+                                                };
+                                                let chat_messages: Vec<ChatMessage> = messages.into_iter().map(|m| ChatMessage {
+                                                    from: m.from,
+                                                    body: m.body,
+                                                    at: m.at,
+                                                    id: m.id,
+                                                    read_count: m.read_count,
+                                                }).collect();
+                                                NetToUi::History { target: chat_target, messages: chat_messages }
+                                            },
+                                            ServerToClient::System { message } => NetToUi::System(message),
+                                            ServerToClient::IncomingVideoCall { from, room_url } => NetToUi::IncomingVideoCall { from, room_url },
+                                            _ => return, // Ignore other messages for now
+                                        };
+                                        let _ = net_tx_clone.send(ui_msg);
+                                    }
+                                }
+                                }
+                            }) as Box<dyn FnMut(MessageEvent)>);
+                            new_ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+                            onmessage.forget();
+                            
+                            // Handle close
+                            let net_tx_clone = net_tx.clone();
+                            let onclose = Closure::wrap(Box::new(move |_: CloseEvent| {
+                                let _ = net_tx_clone.send(NetToUi::Disconnected);
+                            }) as Box<dyn FnMut(CloseEvent)>);
+                            new_ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+                            onclose.forget();
+                            
+                            // Handle error
+                            let net_tx_clone = net_tx.clone();
+                            let onerror = Closure::wrap(Box::new(move |_: ErrorEvent| {
+                                let _ = net_tx_clone.send(NetToUi::Error("WebSocket error".to_string()));
+                            }) as Box<dyn FnMut(ErrorEvent)>);
+                            new_ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+                            onerror.forget();
+                            
+                            ws = Some(new_ws.clone());
+                            
+                            // Send login/register message
+                            let auth_msg = match mode {
+                                AuthMode::Login => ClientToServer::Login { username, password },
+                                AuthMode::Register => ClientToServer::Register { username, password },
+                            };
+                            if let Ok(json) = serde_json::to_string(&auth_msg) {
+                                let _ = new_ws.send_with_str(&json);
+                            }
+                        },
+                        Err(_) => {
+                            let _ = net_tx.send(NetToUi::Error("Failed to create WebSocket".to_string()));
+                        }
+                    }
+                },
+                UiToNet::Disconnect => {
+                    if let Some(old_ws) = ws.take() {
+                        let _ = old_ws.close();
+                    }
+                    let _ = net_tx.send(NetToUi::Disconnected);
+                },
+                _ => {
+                    // For other messages, serialize and send if connected
+                    if let Some(ref active_ws) = ws {
+                        if active_ws.ready_state() == WebSocket::OPEN {
+                            let client_msg = match msg {
+                                UiToNet::SendChat { body } => Some(ClientToServer::Chat { body }),
+                                UiToNet::SendDirect { to, body } => Some(ClientToServer::DirectMessage { to, body }),
+                                UiToNet::FetchThreads => Some(ClientToServer::FetchThreads),
+                                UiToNet::FetchHistory { target } => {
+                                    let history_target = match target {
+                                        ChatTarget::Lobby => HistoryTarget::Lobby,
+                                        ChatTarget::Direct(username) => HistoryTarget::Direct { username },
+                                        ChatTarget::Room(room_id) => HistoryTarget::Room { room_id },
+                                    };
+                                    Some(ClientToServer::FetchHistory { target: history_target })
+                                },
+                                UiToNet::SetAway { away } => Some(ClientToServer::SetAway { away }),
+                                UiToNet::StartVideoCall { to } => Some(ClientToServer::StartVideoCall { to }),
+                                _ => None,
+                            };
+                            
+                            if let Some(msg) = client_msg {
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    let _ = active_ws.send_with_str(&json);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
     
     NetworkHandle { tx: ui_tx, rx: net_rx }
 }
