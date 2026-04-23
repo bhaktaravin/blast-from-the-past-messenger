@@ -128,7 +128,7 @@ async fn main() {
 }
 
 async fn handle_connection(
-    stream: tokio::net::TcpStream,
+    mut stream: tokio::net::TcpStream,
     client_ip: IpAddr,
     peers: Arc<Mutex<HashMap<usize, Peer>>>,
     db: PgPool,
@@ -136,6 +136,22 @@ async fn handle_connection(
     rate_limits: Arc<Mutex<HashMap<i64, RateState>>>,
     login_attempts: Arc<Mutex<HashMap<IpAddr, LoginAttemptState>>>,
 ) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    
+    // Peek at the first few bytes to detect HTTP health checks
+    let mut buf = [0u8; 16];
+    stream.peek(&mut buf).await.map_err(|e| e.to_string())?;
+    
+    // Check if this is an HTTP request (not WebSocket upgrade)
+    let request_start = String::from_utf8_lossy(&buf);
+    if request_start.starts_with("GET / HTTP") || request_start.starts_with("HEAD / HTTP") || 
+       request_start.starts_with("POST / HTTP") {
+        // Respond with simple HTTP 200 for health checks
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK";
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Ok(());
+    }
+    
     let ws_stream = accept_async(stream)
         .await
         .map_err(|err| err.to_string())?;
