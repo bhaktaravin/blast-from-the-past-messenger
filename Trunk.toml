@@ -1,8 +1,3 @@
-[[hooks]]
-stage = "pre_build"
-command = "echo"
-command_arguments = ["Building Blast From The Past Messenger for Web..."]
-
 [build]
 target = "index.html"
 dist = "dist"
