@@ -1,6 +1,8 @@
 // Hide console window on Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod client_map;
+
 // Global update status
 static UPDATE_VERSION: once_cell::sync::Lazy<Arc<Mutex<Option<String>>>> = 
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
@@ -100,52 +102,15 @@ mod mpsc {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "client"))]
 use chatmessagediscordclone::audio::{AudioManager, SoundEffect};
+#[cfg(target_arch = "wasm32")]
+use chatmessagediscordclone::audio_web::{AudioManager, SoundEffect};
+use chatmessagediscordclone::avatar_cache::AvatarCache;
+use chatmessagediscordclone::buddy_icon::{
+    self, BuddyIconDisplay, BUDDY_ICON_PRESETS,
+};
 use chatmessagediscordclone::protocol::{
     ClientToServer, HistoryTarget, ServerToClient, UserStatus,
 };
-
-// Stub audio for web
-#[cfg(target_arch = "wasm32")]
-mod audio_stub {
-    #[derive(Debug, Clone, Copy)]
-    pub enum SoundEffect {
-        BuddySignOn,
-        BuddySignOff,
-        MessageReceived,
-        MessageSent,
-        DoorSlam,
-        Typing,
-    }
-
-    pub struct AudioManager {
-        enabled: bool,
-        volume: f32,
-    }
-
-    impl AudioManager {
-        pub fn new() -> Self {
-            Self {
-                enabled: false,
-                volume: 0.8,
-            }
-        }
-
-        pub fn play(&self, _effect: SoundEffect) {
-            // No-op on web
-        }
-
-        pub fn set_enabled(&mut self, enabled: bool) {
-            self.enabled = enabled;
-        }
-
-        pub fn set_volume(&mut self, volume: f32) {
-            self.volume = volume.clamp(0.0, 1.0);
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-use audio_stub::{AudioManager, SoundEffect};
 
 #[derive(Debug, Clone)]
 struct ChatMessage {
@@ -318,7 +283,7 @@ struct AolApp {
     report_reason: String,
     logging_in: bool,
     login_started_at: Option<Instant>,
-    login_frame_count: u32,  // Web: tracks elapsed frames for 3-second timeout
+    login_frame_count: u32,  // Web: frame counter for login timeout
     login_error: bool,  // Track if login failed for red flash effect
     login_error_time: f32,  // Time since error for fade effect
     login_success: bool,  // Track if login succeeded for green flash effect
@@ -413,6 +378,7 @@ struct AolApp {
     reconnect_credentials: Option<(String, String, String)>, // (url, username, password)
     reconnect_attempts: u32,
     reconnect_timer: f32,
+    avatar_cache: AvatarCache,
 }
 
 struct SearchResult {
@@ -428,9 +394,20 @@ struct SavedCredentials {
     server_url: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AppSettings {
+    sound_enabled: bool,
+    sound_volume: f32,
+    typing_sounds: bool,
+    /// effect key -> embedded wav filename or absolute path (native)
+    sound_overrides: HashMap<String, String>,
+}
+
+/// Built-in sound files users can pick in settings.
+const BUILTIN_SOUNDS: &[&str] = &["buddy-in.wav", "buddy-out.wav", "message.wav", "send.wav"];
+
 /// Simple obfuscation for stored credentials - not cryptographic but prevents
 /// plaintext passwords in config files. Uses XOR with a key derived from app name.
-#[cfg(not(target_arch = "wasm32"))]
 fn obfuscate_password(password: &str, username: &str) -> String {
     use base64::Engine as _;
     let key = format!("blast-from-the-past-{}", username);
@@ -444,7 +421,6 @@ fn obfuscate_password(password: &str, username: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(&obfuscated)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn deobfuscate_password(obfuscated: &str, username: &str) -> Option<String> {
     use base64::Engine as _;
     let decoded = base64::engine::general_purpose::STANDARD.decode(obfuscated).ok()?;
@@ -628,39 +604,195 @@ impl AolApp {
             reconnect_credentials: None,
             reconnect_attempts: 0,
             reconnect_timer: 0.0,
+            avatar_cache: AvatarCache::new(),
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn web_storage() -> Option<web_sys::Storage> {
+        web_sys::window().and_then(|w| w.local_storage().ok().flatten())
     }
 
     fn credentials_file(&self) -> std::path::PathBuf {
         self.credentials_path.join("credentials.json")
     }
 
-    fn save_credentials(&self) {
-        if !self.remember_me {
-            let _ = std::fs::remove_file(self.credentials_file());
-            return;
-        }
+    fn settings_file(&self) -> std::path::PathBuf {
+        self.credentials_path.join("settings.json")
+    }
+
+    fn save_settings(&self) {
+        let settings = AppSettings {
+            sound_enabled: self.sound_enabled,
+            sound_volume: self.sound_volume,
+            typing_sounds: self.typing_sounds,
+            sound_overrides: self.audio_manager.overrides().clone(),
+        };
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let creds = SavedCredentials {
-                username: self.username.clone(),
-                password_obfuscated: Some(obfuscate_password(&self.password, &self.username)),
-                server_url: self.server_url.clone(),
-            };
-            if let Ok(json) = serde_json::to_string(&creds) {
+            let _ = std::fs::create_dir_all(&self.credentials_path);
+            if let Ok(json) = serde_json::to_string_pretty(&settings) {
+                let _ = std::fs::write(self.settings_file(), json);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Ok(json) = serde_json::to_string(&settings) {
+            if let Some(storage) = Self::web_storage() {
+                let _ = storage.set_item("bfpm_settings", &json);
+            }
+        }
+    }
+
+    fn load_settings(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let loaded: Option<AppSettings> = std::fs::read_to_string(self.settings_file())
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok());
+        #[cfg(target_arch = "wasm32")]
+        let loaded: Option<AppSettings> = Self::web_storage()
+            .and_then(|s| s.get_item("bfpm_settings").ok().flatten())
+            .and_then(|data| serde_json::from_str(&data).ok());
+
+        if let Some(s) = loaded {
+            self.sound_enabled = s.sound_enabled;
+            self.sound_volume = s.sound_volume;
+            self.typing_sounds = s.typing_sounds;
+            self.audio_manager.set_enabled(s.sound_enabled);
+            self.audio_manager.set_volume(s.sound_volume);
+            self.audio_manager.set_overrides(s.sound_overrides);
+        }
+    }
+
+    fn paint_buddy_avatar(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        buddy: &UserStatus,
+    ) {
+        match buddy_icon::resolve_buddy_icon(&buddy.avatar_url, &buddy.username) {
+            BuddyIconDisplay::Url(url) => {
+                if !self.avatar_cache.paint_image(ctx, ui, rect, url) {
+                    let painter = ui.painter();
+                    painter.circle_filled(rect.center(), 12.0, egui::Color32::from_rgb(80, 80, 120));
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "…",
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::LIGHT_GRAY,
+                    );
+                }
+            }
+            BuddyIconDisplay::Emoji(emoji) => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    emoji,
+                    egui::FontId::proportional(20.0),
+                    egui::Color32::WHITE,
+                );
+            }
+            BuddyIconDisplay::Initials => {
+                let (r, g, b) = buddy_icon::username_to_color(&buddy.username);
+                let color = egui::Color32::from_rgb(r, g, b);
+                let initials = buddy_icon::get_initials(&buddy.username);
+                let painter = ui.painter();
+                painter.circle_filled(rect.center(), 12.0, color);
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    initials,
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+    }
+
+    fn paint_profile_avatar(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        username: &str,
+        avatar_url: &Option<String>,
+        size: f32,
+    ) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+        let buddy = UserStatus {
+            username: username.to_string(),
+            away: None,
+            status: None,
+            avatar_url: avatar_url.clone(),
+            last_activity: None,
+        };
+        self.paint_buddy_avatar(ctx, ui, rect, &buddy);
+    }
+
+    fn open_video_room(room_url: &str) -> Option<String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Err(e) = open::that(room_url) {
+                Some(format!("Could not open browser: {e}"))
+            } else {
+                Some("Opening video call in your browser…".to_string())
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::prelude::*;
+            #[wasm_bindgen]
+            extern "C" {
+                #[wasm_bindgen(js_namespace = window)]
+                fn startVideoCall(room_url: &str);
+            }
+            startVideoCall(room_url);
+            None
+        }
+    }
+
+    fn save_credentials(&self) {
+        if !self.remember_me {
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = std::fs::remove_file(self.credentials_file());
+            #[cfg(target_arch = "wasm32")]
+            if let Some(storage) = Self::web_storage() {
+                let _ = storage.remove_item("bfpm_credentials");
+            }
+            return;
+        }
+        let creds = SavedCredentials {
+            username: self.username.clone(),
+            password_obfuscated: Some(obfuscate_password(&self.password, &self.username)),
+            server_url: self.server_url.clone(),
+        };
+        if let Ok(json) = serde_json::to_string(&creds) {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
                 let _ = std::fs::create_dir_all(&self.credentials_path);
                 let _ = std::fs::write(self.credentials_file(), json);
+            }
+            #[cfg(target_arch = "wasm32")]
+            if let Some(storage) = Self::web_storage() {
+                let _ = storage.set_item("bfpm_credentials", &json);
             }
         }
     }
 
     fn load_credentials(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
-        if let Ok(data) = std::fs::read_to_string(self.credentials_file()) {
+        let data = std::fs::read_to_string(self.credentials_file()).ok();
+        #[cfg(target_arch = "wasm32")]
+        let data = Self::web_storage().and_then(|s| s.get_item("bfpm_credentials").ok().flatten());
+
+        if let Some(data) = data {
             if let Ok(creds) = serde_json::from_str::<SavedCredentials>(&data) {
                 if !creds.username.is_empty() {
                     self.username = creds.username.clone();
                     self.remember_me = true;
+                }
+                if !creds.server_url.is_empty() {
+                    self.server_url = creds.server_url;
                 }
                 if let Some(ref obfuscated) = creds.password_obfuscated {
                     if let Some(password) = deobfuscate_password(obfuscated, &creds.username) {
@@ -678,13 +810,25 @@ impl AolApp {
 
     fn save_buddy_groups(&self) {
         if let Ok(json) = serde_json::to_string(&self.buddy_groups) {
-            let _ = std::fs::create_dir_all(&self.credentials_path);
-            let _ = std::fs::write(self.buddy_groups_file(), json);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = std::fs::create_dir_all(&self.credentials_path);
+                let _ = std::fs::write(self.buddy_groups_file(), json);
+            }
+            #[cfg(target_arch = "wasm32")]
+            if let Some(storage) = Self::web_storage() {
+                let _ = storage.set_item("bfpm_buddy_groups", &json);
+            }
         }
     }
 
     fn load_buddy_groups(&mut self) {
-        if let Ok(data) = std::fs::read_to_string(self.buddy_groups_file()) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let data = std::fs::read_to_string(self.buddy_groups_file()).ok();
+        #[cfg(target_arch = "wasm32")]
+        let data = Self::web_storage().and_then(|s| s.get_item("bfpm_buddy_groups").ok().flatten());
+
+        if let Some(data) = data {
             if let Ok(groups) = serde_json::from_str::<HashMap<String, Vec<String>>>(&data) {
                 self.buddy_groups = groups;
             }
@@ -1090,29 +1234,23 @@ impl AolApp {
                 NetToUi::IncomingVideoCall { from, room_url } => {
                     self.show_toast(format!("📹 Video call from {}", from), ToastKind::Info);
                     self.audio_manager.play(SoundEffect::MessageReceived);
-                    
-                    // On web, call JavaScript to start video
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        use wasm_bindgen::prelude::*;
-                        #[wasm_bindgen]
-                        extern "C" {
-                            #[wasm_bindgen(js_namespace = window)]
-                            fn startVideoCall(room_url: &str);
-                        }
-                        startVideoCall(&room_url);
-                    }
-                    
-                    // On native, show message for now
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        self.show_toast(
-                            format!("Video calling not yet supported on desktop. Room: {}", room_url),
-                            ToastKind::Info
-                        );
+                    if let Some(msg) = Self::open_video_room(&room_url) {
+                        self.show_toast(msg, ToastKind::Info);
                     }
                 }
             }
+        }
+    }
+
+    fn reset_login_timer(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.login_started_at = Some(Instant::now());
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.login_started_at = Some(0);
+            self.login_frame_count = 0;
         }
     }
 
@@ -1127,15 +1265,7 @@ impl AolApp {
         self.login_error_time = 0.0;
         self.login_success = false;
         self.login_success_time = 0.0;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.login_started_at = Some(Instant::now());
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.login_started_at = Some(0);  // Start frame count at 0
-            self.login_frame_count = 0;
-        }
+        self.reset_login_timer();
         let safe_username = Self::sanitize_username(&self.username);
         self.status = format!("Logging in as {}...", safe_username);
         let mut url = self.server_url.trim().to_string();
@@ -1477,10 +1607,10 @@ impl eframe::App for AolApp {
             self.startup_repaint_left = self.startup_repaint_left.saturating_sub(1);
             ctx.request_repaint();
         }
+        self.avatar_cache.poll(ctx);
         self.process_net_events();
 
-        // Auto-reconnect timer
-        #[cfg(not(target_arch = "wasm32"))]
+        // Auto-reconnect timer (native + web)
         if self.reconnect_timer > 0.0 && !self.connected && self.screen != Screen::SignIn {
             let dt = ctx.input(|i| i.stable_dt);
             self.reconnect_timer -= dt;
@@ -1493,7 +1623,7 @@ impl eframe::App for AolApp {
                     self.status = format!("Reconnecting... (attempt {})", self.reconnect_attempts);
                     self.reconnect_timer = delay as f32;
                     self.logging_in = true;
-                    self.login_started_at = Some(Instant::now());
+                    self.reset_login_timer();
                     let _ = self.network.tx.send(UiToNet::Connect {
                         url,
                         username,
@@ -1517,23 +1647,18 @@ impl eframe::App for AolApp {
             }
         }
 
-        // On web, timeout login after 3 seconds (web networking is stubbed)
+        // On web, timeout login after 15 seconds (same as native)
         #[cfg(target_arch = "wasm32")]
         if self.logging_in && self.screen == Screen::SignIn {
             self.login_frame_count += 1;
-            let timeout_frames = 180;  // ~3 seconds at 60 FPS
+            let timeout_frames = 900; // ~15 seconds at 60 FPS
             if self.login_frame_count >= timeout_frames {
-                // Auto-approve login on web
-                self.screen = Screen::Chat;
-                self.connected = true;
-                self.logged_in_user = Some(self.username.trim().to_string());
-                self.status = format!("Connected as {}", self.username.trim());
                 self.logging_in = false;
                 self.login_started_at = None;
                 self.login_frame_count = 0;
-                self.show_toast("Web version: Messages won't sync yet".to_string(), ToastKind::Info);
+                self.status = "Connection timed out. Check the server URL.".to_string();
+                self.show_toast(self.status.clone(), ToastKind::Error);
             } else {
-                // Still waiting, keep requesting repaints
                 ctx.request_repaint();
             }
         }
@@ -2221,6 +2346,9 @@ impl eframe::App for AolApp {
                                 });
                                 self.audio_manager.set_enabled(self.sound_enabled);
                                 self.audio_manager.set_volume(self.sound_volume);
+                                if ui.input(|i| i.pointer.any_click()) {
+                                    self.save_settings();
+                                }
                                 ui.horizontal(|ui| {
                                     ui.label("Test:");
                                     if ui.small_button("🔔 Sign On").clicked() {
@@ -2237,9 +2365,68 @@ impl eframe::App for AolApp {
                                     }
                                 });
 
+                                ui.add_space(8.0);
+                                ui.label("Custom sounds (built-in or .wav path on desktop)");
+                                ui.separator();
+                                egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                                    for effect in SoundEffect::ALL {
+                                        ui.horizontal(|ui| {
+                                            ui.label(effect.label());
+                                            let current = self
+                                                .audio_manager
+                                                .get_override(effect)
+                                                .unwrap_or(effect.default_filename())
+                                                .to_string();
+                                            let mut selected = current.clone();
+                                            egui::ComboBox::from_id_salt(effect.settings_key())
+                                                .selected_text(&selected)
+                                                .show_ui(ui, |ui| {
+                                                    if ui
+                                                        .selectable_label(
+                                                            selected == effect.default_filename(),
+                                                            format!("Default ({})", effect.default_filename()),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        selected = effect.default_filename().to_string();
+                                                    }
+                                                    for name in BUILTIN_SOUNDS {
+                                                        if ui.selectable_label(selected == *name, *name).clicked() {
+                                                            selected = (*name).to_string();
+                                                        }
+                                                    }
+                                                });
+                                            if selected != current {
+                                                if selected == effect.default_filename() {
+                                                    self.audio_manager.set_override(effect, None);
+                                                } else {
+                                                    self.audio_manager.set_override(
+                                                        effect,
+                                                        Some(selected),
+                                                    );
+                                                }
+                                                self.save_settings();
+                                            }
+                                            #[cfg(all(not(target_arch = "wasm32"), feature = "client"))]
+                                            if ui.small_button("📁").on_hover_text("Pick a .wav file").clicked() {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .add_filter("WAV audio", &["wav"])
+                                                    .pick_file()
+                                                {
+                                                    self.audio_manager.set_override(
+                                                        effect,
+                                                        Some(path.display().to_string()),
+                                                    );
+                                                    self.save_settings();
+                                                }
+                                            }
+                                        });
+                                    }
+                                });
                                 ui.add_space(12.0);
                                 ui.separator();
                                 if ui.button("Close").clicked() {
+                                    self.save_settings();
                                     self.show_settings_modal = false;
                                 }
                             });
@@ -2349,13 +2536,27 @@ impl eframe::App for AolApp {
                                 });
                                 
                                 ui.separator();
+                                ui.label("Classic buddy icons:");
+                                ui.horizontal_wrapped(|ui| {
+                                    for (name, emoji) in BUDDY_ICON_PRESETS {
+                                        if ui.button(*emoji).on_hover_text(*name).clicked() {
+                                            let data = format!("icon:{name}");
+                                            let _ = self.network.tx.send(UiToNet::SetAvatar {
+                                                avatar_data: data,
+                                            });
+                                            self.show_toast("Buddy icon updated!".to_string(), ToastKind::Success);
+                                            self.show_avatar_modal = false;
+                                        }
+                                    }
+                                });
+                                ui.separator();
                                 ui.label("Quick emoji avatars:");
                                 ui.horizontal_wrapped(|ui| {
                                     let emojis = ["😀", "😎", "🤖", "👾", "🎮", "🎨", "🎭", "🎪", "🎯", "🎲", "🎸", "🎹", "🚀", "🌟", "⭐", "💎"];
                                     for emoji in emojis {
                                         if ui.button(emoji).clicked() {
-                                            let _ = self.network.tx.send(UiToNet::SetAvatar { 
-                                                avatar_data: emoji.to_string() 
+                                            let _ = self.network.tx.send(UiToNet::SetAvatar {
+                                                avatar_data: emoji.to_string(),
                                             });
                                             self.show_toast("Avatar updated!".to_string(), ToastKind::Success);
                                             self.show_avatar_modal = false;
@@ -2413,47 +2614,12 @@ impl eframe::App for AolApp {
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                             .show(ctx, |ui| {
                                 ui.vertical_centered(|ui| {
-                                    // Show avatar if available, otherwise show colored circle
-                                    if let Some((_, _, _, Some(avatar_url))) = self.profile_cache.get(username) {
-                                        if !avatar_url.is_empty() {
-                                            // Display avatar image (base64 or URL)
-                                            ui.label(egui::RichText::new("🖼️").size(64.0));
-                                            ui.label(egui::RichText::new("[Avatar Image]").small().italics());
-                                        } else {
-                                            // Fallback to colored circle
-                                            let color = username_to_color(username);
-                                            let initials = get_initials(username);
-                                            let (rect, _) = ui.allocate_exact_size(
-                                                egui::vec2(64.0, 64.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().circle_filled(rect.center(), 32.0, color);
-                                            ui.painter().text(
-                                                rect.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                &initials,
-                                                egui::FontId::proportional(28.0),
-                                                egui::Color32::WHITE,
-                                            );
-                                        }
-                                    } else {
-                                        // Fallback to colored circle
-                                        let color = username_to_color(username);
-                                        let initials = get_initials(username);
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(64.0, 64.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().circle_filled(rect.center(), 32.0, color);
-                                        ui.painter().text(
-                                            rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            &initials,
-                                            egui::FontId::proportional(28.0),
-                                            egui::Color32::WHITE,
-                                        );
-                                    }
-                                    
+                                    let avatar_url = self
+                                        .profile_cache
+                                        .get(username)
+                                        .and_then(|(_, _, _, a)| a.clone());
+                                    self.paint_profile_avatar(ctx, ui, username, &avatar_url, 64.0);
+
                                     // Add "Change Avatar" button for own profile
                                     if self.logged_in_user.as_ref() == Some(username) {
                                         if ui.button("📷 Change Avatar").clicked() {
@@ -2730,63 +2896,13 @@ impl eframe::App for AolApp {
                                         egui::Sense::click(),
                                     );
                                     
-                                    // Show avatar if available, otherwise colored circle
-                                    if let Some(ref avatar_url) = buddy.avatar_url {
-                                        if !avatar_url.is_empty() {
-                                            // If it's a single emoji, display it
-                                            if avatar_url.chars().count() <= 2 {
-                                                ui.painter().text(
-                                                    rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    avatar_url,
-                                                    egui::FontId::proportional(20.0),
-                                                    egui::Color32::WHITE,
-                                                );
-                                            } else {
-                                                // For URLs, show a placeholder icon
-                                                ui.painter().circle_filled(rect.center(), 12.0, egui::Color32::from_rgb(100, 100, 100));
-                                                ui.painter().text(
-                                                    rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    "🖼️",
-                                                    egui::FontId::proportional(12.0),
-                                                    egui::Color32::WHITE,
-                                                );
-                                            }
-                                        } else {
-                                            // Fallback to colored circle
-                                            let color = username_to_color(&buddy.username);
-                                            let initials = get_initials(&buddy.username);
-                                            ui.painter().circle_filled(rect.center(), 12.0, color);
-                                            ui.painter().text(
-                                                rect.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                &initials,
-                                                egui::FontId::proportional(10.0),
-                                                egui::Color32::WHITE,
-                                            );
-                                        }
-                                    } else {
-                                        // Fallback to colored circle
-                                        let color = username_to_color(&buddy.username);
-                                        let initials = get_initials(&buddy.username);
-                                        ui.painter().circle_filled(rect.center(), 12.0, color);
-                                        ui.painter().text(
-                                            rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            &initials,
-                                            egui::FontId::proportional(10.0),
-                                            egui::Color32::WHITE,
-                                        );
-                                    }
+                                    self.paint_buddy_avatar(ctx, ui, rect, buddy);
 
-                                    // Click profile circle to view profile
                                     if response.clicked() {
                                         self.viewing_profile = Some(buddy.username.clone());
                                         let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
                                     }
-                                    
-                                    // Enhanced tooltip on hover
+
                                     response.on_hover_ui(|ui| {
                                         ui.vertical(|ui| {
                                             ui.heading(&buddy.username);
@@ -2836,7 +2952,7 @@ impl eframe::App for AolApp {
                                             let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
                                             ui.close_menu();
                                         }
-                                        if ui.button("� Start E2E Encryption").clicked() {
+                                        if ui.button("?? Start E2E Encryption").clicked() {
                                             #[cfg(not(target_arch = "wasm32"))]
                                             self.initiate_e2e_static(&buddy.username);
                                             ui.close_menu();
@@ -2924,57 +3040,8 @@ impl eframe::App for AolApp {
                                         egui::Sense::click(),
                                     );
                                     
-                                    // Show avatar if available, otherwise colored circle
-                                    if let Some(ref avatar_url) = buddy.avatar_url {
-                                        if !avatar_url.is_empty() {
-                                            // If it's a single emoji, display it
-                                            if avatar_url.chars().count() <= 2 {
-                                                ui.painter().text(
-                                                    rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    avatar_url,
-                                                    egui::FontId::proportional(20.0),
-                                                    egui::Color32::WHITE,
-                                                );
-                                            } else {
-                                                // For URLs, show a placeholder icon
-                                                ui.painter().circle_filled(rect.center(), 12.0, egui::Color32::from_rgb(100, 100, 100));
-                                                ui.painter().text(
-                                                    rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    "🖼️",
-                                                    egui::FontId::proportional(12.0),
-                                                    egui::Color32::WHITE,
-                                                );
-                                            }
-                                        } else {
-                                            // Fallback to colored circle
-                                            let color = username_to_color(&buddy.username);
-                                            let initials = get_initials(&buddy.username);
-                                            ui.painter().circle_filled(rect.center(), 12.0, color);
-                                            ui.painter().text(
-                                                rect.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                &initials,
-                                                egui::FontId::proportional(10.0),
-                                                egui::Color32::WHITE,
-                                            );
-                                        }
-                                    } else {
-                                        // Fallback to colored circle
-                                        let color = username_to_color(&buddy.username);
-                                        let initials = get_initials(&buddy.username);
-                                        ui.painter().circle_filled(rect.center(), 12.0, color);
-                                        ui.painter().text(
-                                            rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            &initials,
-                                            egui::FontId::proportional(10.0),
-                                            egui::Color32::WHITE,
-                                        );
-                                    }
+                                    self.paint_buddy_avatar(ctx, ui, rect, buddy);
 
-                                    // Click profile circle to view profile
                                     if response.clicked() {
                                         self.viewing_profile = Some(buddy.username.clone());
                                         let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
@@ -2986,7 +3053,6 @@ impl eframe::App for AolApp {
                                         &buddy.username
                                     );
                                     
-                                    // Click or double-click opens DM window
                                     if username_response.clicked() || username_response.double_clicked() {
                                         self.dm_windows.entry(buddy.username.clone()).or_default();
                                         if !self.messages.contains_key(&target) {
@@ -2994,7 +3060,6 @@ impl eframe::App for AolApp {
                                         }
                                     }
                                     
-                                    // Right-click context menu
                                     username_response.context_menu(|ui| {
                                         if ui.button("💬 Send DM").clicked() {
                                             self.dm_windows.entry(buddy.username.clone()).or_default();
@@ -4339,36 +4404,11 @@ fn spawn_network() -> NetworkHandle {
                                 if let Ok(txt) = e.data().dyn_into::<wasm_bindgen::JsValue>() {
                                     if let Some(msg_str) = txt.as_string() {
                                         if let Ok(server_msg) = serde_json::from_str::<ServerToClient>(&msg_str) {
-                                            let ui_msg = match server_msg {
-                                            ServerToClient::Welcome { message } => NetToUi::System(message),
-                                            ServerToClient::AuthOk { username } => NetToUi::AuthOk { username },
-                                            ServerToClient::AuthError { message } => NetToUi::AuthError(message),
-                                            ServerToClient::Presence { users } => NetToUi::Presence(users),
-                                            ServerToClient::Chat { from, body } => NetToUi::Chat { from, body },
-                                            ServerToClient::DirectMessage { from, body } => NetToUi::DirectMessage { from, body },
-                                            ServerToClient::Threads { users } => NetToUi::Threads(users),
-                                            ServerToClient::History { target, messages } => {
-                                                let chat_target = match target {
-                                                    HistoryTarget::Lobby => ChatTarget::Lobby,
-                                                    HistoryTarget::Direct { username } => ChatTarget::Direct(username),
-                                                    HistoryTarget::Room { room_id } => ChatTarget::Room(room_id),
-                                                };
-                                                let chat_messages: Vec<ChatMessage> = messages.into_iter().map(|m| ChatMessage {
-                                                    from: m.from,
-                                                    body: m.body,
-                                                    at: m.at,
-                                                    id: m.id,
-                                                    read_count: m.read_count,
-                                                }).collect();
-                                                NetToUi::History { target: chat_target, messages: chat_messages }
-                                            },
-                                            ServerToClient::System { message } => NetToUi::System(message),
-                                            ServerToClient::IncomingVideoCall { from, room_url } => NetToUi::IncomingVideoCall { from, room_url },
-                                            _ => return, // Ignore other messages for now
-                                        };
-                                        let _ = net_tx_clone.send(ui_msg);
+                                            if let Some(ui_msg) = client_map::server_to_ui(server_msg) {
+                                                let _ = net_tx_clone.send(ui_msg);
+                                            }
+                                        }
                                     }
-                                }
                                 }
                             }) as Box<dyn FnMut(MessageEvent)>);
                             new_ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
@@ -4412,29 +4452,11 @@ fn spawn_network() -> NetworkHandle {
                     }
                     let _ = net_tx.send(NetToUi::Disconnected);
                 },
-                _ => {
-                    // For other messages, serialize and send if connected
+                other => {
                     if let Some(ref active_ws) = ws {
                         if active_ws.ready_state() == WebSocket::OPEN {
-                            let client_msg = match msg {
-                                UiToNet::SendChat { body } => Some(ClientToServer::Chat { body }),
-                                UiToNet::SendDirect { to, body } => Some(ClientToServer::DirectMessage { to, body }),
-                                UiToNet::FetchThreads => Some(ClientToServer::FetchThreads),
-                                UiToNet::FetchHistory { target } => {
-                                    let history_target = match target {
-                                        ChatTarget::Lobby => HistoryTarget::Lobby,
-                                        ChatTarget::Direct(username) => HistoryTarget::Direct { username },
-                                        ChatTarget::Room(room_id) => HistoryTarget::Room { room_id },
-                                    };
-                                    Some(ClientToServer::FetchHistory { target: history_target })
-                                },
-                                UiToNet::SetAway { away } => Some(ClientToServer::SetAway { away }),
-                                UiToNet::StartVideoCall { to } => Some(ClientToServer::StartVideoCall { to }),
-                                _ => None,
-                            };
-                            
-                            if let Some(msg) = client_msg {
-                                if let Ok(json) = serde_json::to_string(&msg) {
+                            if let Some(client_msg) = client_map::ui_to_server(other) {
+                                if let Ok(json) = serde_json::to_string(&client_msg) {
                                     let _ = active_ws.send_with_str(&json);
                                 }
                             }
@@ -4464,6 +4486,7 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             let mut app = AolApp::new(cc);
             app.load_credentials();
+            app.load_settings();
             Ok(Box::new(app))
         }),
     )
@@ -4496,7 +4519,12 @@ fn main() {
             .start(
                 canvas,
                 web_options,
-                Box::new(|cc| Ok(Box::new(AolApp::new(cc)))),
+                Box::new(|cc| {
+                    let mut app = AolApp::new(cc);
+                    app.load_credentials();
+                    app.load_settings();
+                    Ok(Box::new(app))
+                }),
             )
             .await
             .expect("failed to start eframe");
