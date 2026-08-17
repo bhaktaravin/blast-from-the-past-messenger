@@ -138,14 +138,20 @@ async fn handle_connection(
 ) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     
-    // Peek at the first few bytes to detect HTTP health checks
-    let mut buf = [0u8; 16];
-    stream.peek(&mut buf).await.map_err(|e| e.to_string())?;
-    
-    // Check if this is an HTTP request (not WebSocket upgrade)
-    let request_start = String::from_utf8_lossy(&buf);
-    if request_start.starts_with("GET / HTTP") || request_start.starts_with("HEAD / HTTP") || 
-       request_start.starts_with("POST / HTTP") {
+    // Peek enough of the request to see the headers, not just the request line —
+    // a WebSocket upgrade to "/" starts with the exact same "GET / HTTP/1.1" as a
+    // plain HTTP health check, so the two can only be told apart by the presence
+    // of an `Upgrade: websocket` header further down.
+    let mut buf = [0u8; 512];
+    let n = stream.peek(&mut buf).await.map_err(|e| e.to_string())?;
+    let request_start = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+    let is_ws_upgrade = request_start.contains("upgrade: websocket") || request_start.contains("upgrade:websocket");
+
+    let looks_like_http = request_start.starts_with("get / http")
+        || request_start.starts_with("head / http")
+        || request_start.starts_with("post / http");
+
+    if looks_like_http && !is_ws_upgrade {
         // Respond with simple HTTP 200 for health checks
         let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK";
         let _ = stream.write_all(response.as_bytes()).await;
