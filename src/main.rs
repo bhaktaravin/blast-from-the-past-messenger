@@ -73,12 +73,12 @@ mod mpsc {
 
     impl<T> UnboundedReceiver<T> {
         pub fn try_recv(&mut self) -> Result<T, ()> {
-            self.queue
-                .lock()
-                .map_err(|_| ())?
-                .first()
-                .ok_or(())
-                .and_then(|_| self.queue.lock().map_err(|_| ()).map(|mut q| q.remove(0)))
+            let mut queue = self.queue.lock().map_err(|_| ())?;
+            if queue.is_empty() {
+                Err(())
+            } else {
+                Ok(queue.remove(0))
+            }
         }
 
         pub async fn recv(&mut self) -> Option<T> {
