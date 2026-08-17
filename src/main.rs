@@ -3990,6 +3990,20 @@ async fn network_task(
     }
 }
 
+/// Convert a ws(s):// URL to its http(s) equivalent and GET it, ignoring the
+/// result. This is enough to wake a sleeping host (e.g. Railway's idle sleep)
+/// so the following WebSocket upgrade lands on an already-running server.
+#[cfg(not(target_arch = "wasm32"))]
+async fn wake_server(url: &str) {
+    let wake_url = url.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        let _ = client.get(&wake_url).send().await;
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn run_connection(
     url: String,
@@ -4000,6 +4014,10 @@ async fn run_connection(
     net_tx: &std_mpsc::Sender<NetToUi>,
 ) -> Result<(), String> {
     eprintln!("[DEBUG] Connecting to: {}", url);
+
+    // Wake a sleeping host (e.g. Railway's free-tier idle sleep) with a quick HTTP
+    // request before the WebSocket handshake, so the upgrade doesn't hang on a cold start.
+    wake_server(&url).await;
 
     // ws:// — plain TCP to avoid rustls interference
     // wss:// — connect_async with TLS
@@ -4385,7 +4403,20 @@ fn spawn_network() -> NetworkHandle {
                     if let Some(old_ws) = ws.take() {
                         let _ = old_ws.close();
                     }
-                    
+
+                    // Wake a sleeping host (e.g. Railway's free-tier idle sleep) with a
+                    // plain HTTP request before the WebSocket handshake, so the upgrade
+                    // doesn't hang while the container cold-starts. Give up after 8s
+                    // either way — the WS attempt below has its own timeout.
+                    {
+                        let wake_url = url.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
+                        let wake_fut = gloo_net::http::Request::get(&wake_url).send();
+                        futures_util::pin_mut!(wake_fut);
+                        let timeout_fut = gloo_timers::future::sleep(std::time::Duration::from_secs(8));
+                        futures_util::pin_mut!(timeout_fut);
+                        let _ = futures_util::future::select(wake_fut, timeout_fut).await;
+                    }
+
                     // Create new WebSocket connection
                     match WebSocket::new(&url) {
                         Ok(new_ws) => {
