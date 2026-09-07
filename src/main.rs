@@ -109,7 +109,7 @@ use chatmessagediscordclone::buddy_icon::{
     self, BuddyIconDisplay, BUDDY_ICON_PRESETS,
 };
 use chatmessagediscordclone::protocol::{
-    ClientToServer, HistoryTarget, ServerToClient, UserStatus,
+    AdminUserEntry, ClientToServer, HistoryTarget, ServerToClient, UserStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -198,6 +198,8 @@ enum UiToNet {
     ReplyToDirect { to: String, reply_to_id: i64, body: String },
     SetAvatar { avatar_data: String },
     StartVideoCall { to: String },
+    AdminListUsers,
+    AdminResetPassword { username: String, new_password: String },
 }
 
 enum NetToUi {
@@ -217,7 +219,7 @@ enum NetToUi {
         query: String,
         messages: Vec<ChatMessage>,
     },
-    AuthOk { username: String },
+    AuthOk { username: String, is_admin: bool },
     AuthError(String),
     System(String),
     Error(String),
@@ -240,6 +242,8 @@ enum NetToUi {
     Winked { from: String, emoji: String },
     ProfileData { username: String, bio: String, status: Option<String>, joined: String, avatar_url: Option<String> },
     IncomingVideoCall { from: String, room_url: String },
+    AdminUserList(Vec<AdminUserEntry>),
+    AdminActionResult { success: bool, message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +273,12 @@ struct AolApp {
     show_background: bool,
     auth_mode: AuthMode,
     logged_in_user: Option<String>,
+    is_admin: bool,
+    show_admin_panel: bool,
+    admin_users: Vec<AdminUserEntry>,
+    admin_reset_target: Option<String>,
+    admin_reset_new_password: String,
+    show_forgot_password_info: bool,
     server_url: String,
     username: String,
     password: String,
@@ -512,6 +522,12 @@ impl AolApp {
             show_background: false,
             auth_mode: AuthMode::Login,
             logged_in_user: None,
+            is_admin: false,
+            show_admin_panel: false,
+            admin_users: Vec::new(),
+            admin_reset_target: None,
+            admin_reset_new_password: String::new(),
+            show_forgot_password_info: false,
             server_url: "wss://blast-from-the-past-messenger-production.up.railway.app".to_string(),
             username: "RetroUser".to_string(),
             password: String::new(),
@@ -952,6 +968,7 @@ impl AolApp {
                         self.screen = Screen::SignIn;
                     }
                     self.logged_in_user = None;
+                    self.is_admin = false;
                     self.logging_in = false;
                     self.login_started_at = None;
                 }
@@ -1077,8 +1094,9 @@ impl AolApp {
                     let kind = if success { ToastKind::Success } else { ToastKind::Error };
                     self.show_toast(message, kind);
                 }
-                NetToUi::AuthOk { username } => {
+                NetToUi::AuthOk { username, is_admin } => {
                     self.logged_in_user = Some(username);
+                    self.is_admin = is_admin;
                     self.status = match self.auth_mode {
                         AuthMode::Register => "Account created. Logged in.".to_string(),
                         AuthMode::Login => "Logged in.".to_string(),
@@ -1236,6 +1254,18 @@ impl AolApp {
                     self.audio_manager.play(SoundEffect::MessageReceived);
                     if let Some(msg) = Self::open_video_room(&room_url) {
                         self.show_toast(msg, ToastKind::Info);
+                    }
+                }
+                NetToUi::AdminUserList(users) => {
+                    self.admin_users = users;
+                }
+                NetToUi::AdminActionResult { success, message } => {
+                    let kind = if success { ToastKind::Success } else { ToastKind::Error };
+                    self.show_toast(message, kind);
+                    if success && self.admin_reset_target.is_some() {
+                        // Password reset succeeded — clear the inline form
+                        self.admin_reset_target = None;
+                        self.admin_reset_new_password.clear();
                     }
                 }
             }
@@ -1986,6 +2016,18 @@ impl eframe::App for AolApp {
                                         );
                                         ui.checkbox(&mut self.show_confirm_password, "Show");
                                     });
+                                } else if ui.small_button("Forgot password?").clicked() {
+                                    self.show_forgot_password_info = !self.show_forgot_password_info;
+                                }
+                                if self.show_forgot_password_info && self.auth_mode == AuthMode::Login {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Password resets are admin-assisted — ask whoever runs \
+                                             this server to reset it for you from the Admin Panel.",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
                                 }
                                 ui.add(egui::TextEdit::singleline(&mut self.server_url).hint_text("Server URL"));
                                 
@@ -2214,6 +2256,8 @@ impl eframe::App for AolApp {
                                 let _ = self.network.tx.send(UiToNet::Disconnect);
                                 self.screen = Screen::SignIn;
                                 self.logged_in_user = None;
+                                self.is_admin = false;
+                                self.show_admin_panel = false;
                                 self.selected_target = ChatTarget::Lobby;
                                 self.username.clear();
                                 self.password.clear();
@@ -2222,6 +2266,11 @@ impl eframe::App for AolApp {
 
                             if ui.button("⚙").on_hover_text("Settings").clicked() {
                                 self.show_settings_modal = true;
+                            }
+
+                            if self.is_admin && ui.button("🛡").on_hover_text("Admin Panel").clicked() {
+                                self.show_admin_panel = true;
+                                let _ = self.network.tx.send(UiToNet::AdminListUsers);
                             }
 
                             // Show friend requests button with pending count
@@ -2432,6 +2481,83 @@ impl eframe::App for AolApp {
                             });
                         if !open {
                             self.show_settings_modal = false;
+                        }
+                    }
+
+                    // Admin panel: view registered users, reset a user's password
+                    if self.show_admin_panel && self.is_admin {
+                        let mut open = true;
+                        egui::Window::new("🛡 Admin Panel")
+                            .open(&mut open)
+                            .collapsible(false)
+                            .resizable(true)
+                            .default_size([420.0, 420.0])
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{} registered user(s)", self.admin_users.len()));
+                                    if ui.small_button("Refresh").clicked() {
+                                        let _ = self.network.tx.send(UiToNet::AdminListUsers);
+                                    }
+                                });
+                                ui.separator();
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    let usernames: Vec<String> = self.admin_users.iter()
+                                        .map(|u| u.username.clone())
+                                        .collect();
+                                    for username in usernames {
+                                        let entry = self.admin_users.iter()
+                                            .find(|u| u.username == username)
+                                            .cloned();
+                                        let Some(entry) = entry else { continue };
+                                        ui.horizontal(|ui| {
+                                            let label = if entry.is_admin {
+                                                format!("{} 🛡", entry.username)
+                                            } else {
+                                                entry.username.clone()
+                                            };
+                                            ui.label(label);
+                                            ui.label(
+                                                egui::RichText::new(&entry.created_at)
+                                                    .small()
+                                                    .weak(),
+                                            );
+                                            let resetting = self.admin_reset_target.as_deref() == Some(entry.username.as_str());
+                                            if !resetting {
+                                                if ui.small_button("Reset password").clicked() {
+                                                    self.admin_reset_target = Some(entry.username.clone());
+                                                    self.admin_reset_new_password.clear();
+                                                }
+                                            }
+                                        });
+                                        if self.admin_reset_target.as_deref() == Some(entry.username.as_str()) {
+                                            ui.horizontal(|ui| {
+                                                ui.add(
+                                                    egui::TextEdit::singleline(&mut self.admin_reset_new_password)
+                                                        .password(true)
+                                                        .hint_text("New password (min 6 chars)")
+                                                        .desired_width(180.0),
+                                                );
+                                                if ui.small_button("Confirm").clicked()
+                                                    && self.admin_reset_new_password.len() >= 6
+                                                {
+                                                    let _ = self.network.tx.send(UiToNet::AdminResetPassword {
+                                                        username: entry.username.clone(),
+                                                        new_password: self.admin_reset_new_password.clone(),
+                                                    });
+                                                }
+                                                if ui.small_button("Cancel").clicked() {
+                                                    self.admin_reset_target = None;
+                                                    self.admin_reset_new_password.clear();
+                                                }
+                                            });
+                                        }
+                                        ui.separator();
+                                    }
+                                });
+                            });
+                        if !open {
+                            self.show_admin_panel = false;
                         }
                     }
 
@@ -4093,8 +4219,8 @@ where
                                 ServerToClient::Welcome { message } => {
                                     let _ = net_tx.send(NetToUi::Chat { from: "Server".to_string(), body: message });
                                 }
-                                ServerToClient::AuthOk { username } => {
-                                    let _ = net_tx.send(NetToUi::AuthOk { username });
+                                ServerToClient::AuthOk { username, is_admin } => {
+                                    let _ = net_tx.send(NetToUi::AuthOk { username, is_admin });
                                 }
                                 ServerToClient::AuthError { message } => {
                                     let _ = net_tx.send(NetToUi::AuthError(message));
@@ -4222,6 +4348,12 @@ where
                                 }
                                 ServerToClient::IncomingVideoCall { from, room_url } => {
                                     let _ = net_tx.send(NetToUi::IncomingVideoCall { from, room_url });
+                                }
+                                ServerToClient::AdminUserList { users } => {
+                                    let _ = net_tx.send(NetToUi::AdminUserList(users));
+                                }
+                                ServerToClient::AdminActionResult { success, message } => {
+                                    let _ = net_tx.send(NetToUi::AdminActionResult { success, message });
                                 }
                             }
                         }
@@ -4354,6 +4486,12 @@ where
                     }
                     UiToNet::StartVideoCall { to } => {
                         send_json(&mut ws_tx, ClientToServer::StartVideoCall { to }).await?;
+                    }
+                    UiToNet::AdminListUsers => {
+                        send_json(&mut ws_tx, ClientToServer::AdminListUsers).await?;
+                    }
+                    UiToNet::AdminResetPassword { username, new_password } => {
+                        send_json(&mut ws_tx, ClientToServer::AdminResetPassword { username, new_password }).await?;
                     }
                     UiToNet::Disconnect => {
                         let _ = ws_tx.send(Message::Close(None)).await;

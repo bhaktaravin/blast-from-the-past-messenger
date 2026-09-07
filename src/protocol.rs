@@ -42,6 +42,13 @@ pub struct ChatRoom {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminUserEntry {
+    pub username: String,
+    pub created_at: String,
+    pub is_admin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientToServer {
     Register { username: String, password: String },
@@ -97,13 +104,17 @@ pub enum ClientToServer {
     /// Video calling
     StartVideoCall { to: String },
     VideoCallResponse { from: String, room_url: String },
+    /// Admin: list all registered users (server rejects if requester isn't an admin)
+    AdminListUsers,
+    /// Admin: force-set another user's password (used for account recovery)
+    AdminResetPassword { username: String, new_password: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToClient {
     Welcome { message: String },
-    AuthOk { username: String },
+    AuthOk { username: String, is_admin: bool },
     AuthError { message: String },
     /// Relay a peer's public key to us for E2E key exchange
     KeyExchange { from: String, public_key: String },
@@ -146,6 +157,10 @@ pub enum ServerToClient {
     ProfileData { username: String, bio: String, status: Option<String>, joined: String, avatar_url: Option<String> },
     /// Video call invitation
     IncomingVideoCall { from: String, room_url: String },
+    /// Admin: full list of registered users
+    AdminUserList { users: Vec<AdminUserEntry> },
+    /// Admin: result of an admin-only action (list/reset) — also used to report "not authorized"
+    AdminActionResult { success: bool, message: String },
 }
 
 

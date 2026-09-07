@@ -13,7 +13,7 @@ pub fn server_to_ui(event: ServerToClient) -> Option<NetToUi> {
                 body: message,
             }
         }
-        ServerToClient::AuthOk { username } => NetToUi::AuthOk { username },
+        ServerToClient::AuthOk { username, is_admin } => NetToUi::AuthOk { username, is_admin },
         ServerToClient::AuthError { message } => NetToUi::AuthError(message),
         ServerToClient::Presence { users } => NetToUi::Presence(users),
         ServerToClient::Chat { from, body } => NetToUi::Chat { from, body },
@@ -126,6 +126,10 @@ pub fn server_to_ui(event: ServerToClient) -> Option<NetToUi> {
         ServerToClient::IncomingVideoCall { from, room_url } => {
             NetToUi::IncomingVideoCall { from, room_url }
         }
+        ServerToClient::AdminUserList { users } => NetToUi::AdminUserList(users),
+        ServerToClient::AdminActionResult { success, message } => {
+            NetToUi::AdminActionResult { success, message }
+        }
     })
 }
 
@@ -201,6 +205,10 @@ pub fn ui_to_server(cmd: UiToNet) -> Option<ClientToServer> {
         }
         UiToNet::SetAvatar { avatar_data } => Some(ClientToServer::SetAvatar { avatar_data }),
         UiToNet::StartVideoCall { to } => Some(ClientToServer::StartVideoCall { to }),
+        UiToNet::AdminListUsers => Some(ClientToServer::AdminListUsers),
+        UiToNet::AdminResetPassword { username, new_password } => {
+            Some(ClientToServer::AdminResetPassword { username, new_password })
+        }
         UiToNet::Connect { .. } | UiToNet::Disconnect => None,
     }
 }

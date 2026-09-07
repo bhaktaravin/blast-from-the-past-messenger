@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use chatmessagediscordclone::protocol::{
-    ClientToServer, HistoryTarget, MessageRecord, ServerToClient, UserStatus,
+    AdminUserEntry, ClientToServer, HistoryTarget, MessageRecord, ServerToClient, UserStatus,
 };
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -77,6 +77,22 @@ async fn main() {
     let listener = TcpListener::bind(&addr).await.expect("failed to bind address");
     println!("AOL-style chat server running on ws://{addr}");
 
+    // Comma-separated allowlist of usernames granted admin capabilities
+    // (view all registered users, reset a user's password). Case-insensitive.
+    let admin_usernames: Arc<HashSet<String>> = Arc::new(
+        std::env::var("ADMIN_USERNAMES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    );
+    if admin_usernames.is_empty() {
+        println!("ADMIN_USERNAMES not set — admin panel is disabled for all users");
+    } else {
+        println!("Admin users: {}", admin_usernames.len());
+    }
+
     let peers: Arc<Mutex<HashMap<usize, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
     let rate_limits: Arc<Mutex<HashMap<i64, RateState>>> = Arc::new(Mutex::new(HashMap::new()));
     let ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -110,9 +126,10 @@ async fn main() {
         let rate_limits = Arc::clone(&rate_limits);
         let ip_connections = Arc::clone(&ip_connections);
         let login_attempts = Arc::clone(&login_attempts);
+        let admin_usernames = Arc::clone(&admin_usernames);
 
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, client_ip, peer_map, db, redis, rate_limits, login_attempts).await {
+            if let Err(err) = handle_connection(stream, client_ip, peer_map, db, redis, rate_limits, login_attempts, admin_usernames).await {
                 eprintln!("connection error: {err}");
             }
             // Decrement connection count when done
@@ -135,6 +152,7 @@ async fn handle_connection(
     redis: RedisPool,
     rate_limits: Arc<Mutex<HashMap<i64, RateState>>>,
     login_attempts: Arc<Mutex<HashMap<IpAddr, LoginAttemptState>>>,
+    admin_usernames: Arc<HashSet<String>>,
 ) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     
@@ -226,7 +244,7 @@ async fn handle_connection(
                             continue;
                         }
                         if let Ok(event) = serde_json::from_str::<ClientToServer>(&text) {
-                            handle_client_event(id, client_ip, event, &peers, &db, &redis, &rate_limits, &login_attempts).await;
+                            handle_client_event(id, client_ip, event, &peers, &db, &redis, &rate_limits, &login_attempts, &admin_usernames).await;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -266,6 +284,7 @@ async fn handle_client_event(
     redis: &RedisPool,
     rate_limits: &Arc<Mutex<HashMap<i64, RateState>>>,
     login_attempts: &Arc<Mutex<HashMap<IpAddr, LoginAttemptState>>>,
+    admin_usernames: &Arc<HashSet<String>>,
 ) {
     match event {
         ClientToServer::Register { username, password } => {
@@ -290,9 +309,10 @@ async fn handle_client_event(
             }
             match create_user(db, &username, &password).await {
                 Ok(user_id) => {
+                    let is_admin = admin_usernames.contains(&username.to_lowercase());
                     set_peer_auth(peers, id, user_id, username.clone());
                     save_session(redis, user_id, &username).await;
-                    send_to_peer(peers, id, ServerToClient::AuthOk { username });
+                    send_to_peer(peers, id, ServerToClient::AuthOk { username, is_admin });
                     broadcast_presence(peers);
                     send_threads_to_peer(db, peers, id, user_id).await;
                 }
@@ -331,9 +351,10 @@ async fn handle_client_event(
                 Ok(user_id) => {
                     // Reset login attempts on success
                     login_attempts.lock().unwrap().remove(&client_ip);
+                    let is_admin = admin_usernames.contains(&username.to_lowercase());
                     set_peer_auth(peers, id, user_id, username.clone());
                     save_session(redis, user_id, &username).await;
-                    send_to_peer(peers, id, ServerToClient::AuthOk { username });
+                    send_to_peer(peers, id, ServerToClient::AuthOk { username, is_admin });
                     broadcast_presence(peers);
                     send_threads_to_peer(db, peers, id, user_id).await;
                 }
@@ -1189,6 +1210,77 @@ async fn handle_client_event(
             // This is handled by the IncomingVideoCall message
             // No additional server action needed
         }
+        ClientToServer::AdminListUsers => {
+            let requester = match get_peer_identity(peers, id) {
+                Some((name, _)) => name,
+                None => return,
+            };
+            if !admin_usernames.contains(&requester.to_lowercase()) {
+                send_to_peer(peers, id, ServerToClient::AdminActionResult {
+                    success: false,
+                    message: "Not authorized.".to_string(),
+                });
+                return;
+            }
+            match list_all_users(db).await {
+                Ok(rows) => {
+                    let users = rows
+                        .into_iter()
+                        .map(|(username, created_at)| {
+                            let is_admin = admin_usernames.contains(&username.to_lowercase());
+                            AdminUserEntry { username, created_at: created_at.to_rfc3339(), is_admin }
+                        })
+                        .collect();
+                    send_to_peer(peers, id, ServerToClient::AdminUserList { users });
+                }
+                Err(_) => {
+                    send_to_peer(peers, id, ServerToClient::AdminActionResult {
+                        success: false,
+                        message: "Failed to load users.".to_string(),
+                    });
+                }
+            }
+        }
+        ClientToServer::AdminResetPassword { username, new_password } => {
+            let requester = match get_peer_identity(peers, id) {
+                Some((name, _)) => name,
+                None => return,
+            };
+            if !admin_usernames.contains(&requester.to_lowercase()) {
+                send_to_peer(peers, id, ServerToClient::AdminActionResult {
+                    success: false,
+                    message: "Not authorized.".to_string(),
+                });
+                return;
+            }
+            if new_password.len() < 6 {
+                send_to_peer(peers, id, ServerToClient::AdminActionResult {
+                    success: false,
+                    message: "Password must be at least 6 characters.".to_string(),
+                });
+                return;
+            }
+            match admin_set_password(db, &username, &new_password).await {
+                Ok(true) => {
+                    send_to_peer(peers, id, ServerToClient::AdminActionResult {
+                        success: true,
+                        message: format!("Password reset for {username}."),
+                    });
+                }
+                Ok(false) => {
+                    send_to_peer(peers, id, ServerToClient::AdminActionResult {
+                        success: false,
+                        message: format!("No such user: {username}."),
+                    });
+                }
+                Err(_) => {
+                    send_to_peer(peers, id, ServerToClient::AdminActionResult {
+                        success: false,
+                        message: "Failed to reset password.".to_string(),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -1922,6 +2014,34 @@ async fn verify_user(db: &PgPool, username: &str, password: &str) -> Result<i64,
         .map_err(|_| "Invalid username or password".to_string())?;
 
     Ok(row.get::<i64, _>("id"))
+}
+
+async fn list_all_users(db: &PgPool) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, sqlx::Error> {
+    let rows = sqlx::query("SELECT username, created_at FROM users ORDER BY created_at DESC")
+        .fetch_all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.get::<String, _>("username"), row.get::<chrono::DateTime<chrono::Utc>, _>("created_at")))
+        .collect())
+}
+
+/// Force-sets a user's password (admin-assisted account recovery, bypasses
+/// the old password check). Returns Ok(false) if no such user exists.
+async fn admin_set_password(db: &PgPool, username: &str, new_password: &str) -> Result<bool, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(new_password.as_bytes(), &salt)
+        .map_err(|_| "failed to hash password".to_string())?
+        .to_string();
+
+    let result = sqlx::query("UPDATE users SET password_hash = $1 WHERE username = $2")
+        .bind(hash)
+        .bind(username)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(result.rows_affected() > 0)
 }
 
 async fn get_user_id_by_name(db: &PgPool, username: &str) -> Result<Option<i64>, sqlx::Error> {
