@@ -141,8 +141,10 @@ async fn handle_connection(
     // Peek enough of the request to see the headers, not just the request line —
     // a WebSocket upgrade to "/" starts with the exact same "GET / HTTP/1.1" as a
     // plain HTTP health check, so the two can only be told apart by the presence
-    // of an `Upgrade: websocket` header further down.
-    let mut buf = [0u8; 512];
+    // of an `Upgrade: websocket` header further down. Real browsers attach enough
+    // extra headers (User-Agent, Origin, Sec-WebSocket-Extensions, ...) to push
+    // that header past a few hundred bytes, so use a generous buffer.
+    let mut buf = [0u8; 8192];
     let n = stream.peek(&mut buf).await.map_err(|e| e.to_string())?;
     let request_start = String::from_utf8_lossy(&buf[..n]).to_lowercase();
     let is_ws_upgrade = request_start.contains("upgrade: websocket") || request_start.contains("upgrade:websocket");
