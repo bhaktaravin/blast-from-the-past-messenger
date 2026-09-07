@@ -4421,10 +4421,25 @@ fn spawn_network() -> NetworkHandle {
                     match WebSocket::new(&url) {
                         Ok(new_ws) => {
                             let net_tx_clone = net_tx.clone();
-                            
+
+                            // Build the login/register message now, send it once the
+                            // socket actually reaches OPEN — sending immediately after
+                            // `new()` hits the socket while it's still CONNECTING, which
+                            // throws and (silently, since it's discarded) never reaches
+                            // the server, leaving the client stuck on the login screen.
+                            let auth_msg = match mode {
+                                AuthMode::Login => ClientToServer::Login { username, password },
+                                AuthMode::Register => ClientToServer::Register { username, password },
+                            };
+                            let auth_json = serde_json::to_string(&auth_msg).ok();
+
                             // Handle open
+                            let ws_for_open = new_ws.clone();
                             let onopen = Closure::wrap(Box::new(move || {
                                 let _ = net_tx_clone.send(NetToUi::Connected);
+                                if let Some(json) = &auth_json {
+                                    let _ = ws_for_open.send_with_str(json);
+                                }
                             }) as Box<dyn FnMut()>);
                             new_ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
                             onopen.forget();
@@ -4462,15 +4477,6 @@ fn spawn_network() -> NetworkHandle {
                             onerror.forget();
                             
                             ws = Some(new_ws.clone());
-                            
-                            // Send login/register message
-                            let auth_msg = match mode {
-                                AuthMode::Login => ClientToServer::Login { username, password },
-                                AuthMode::Register => ClientToServer::Register { username, password },
-                            };
-                            if let Ok(json) = serde_json::to_string(&auth_msg) {
-                                let _ = new_ws.send_with_str(&json);
-                            }
                         },
                         Err(_) => {
                             let _ = net_tx.send(NetToUi::Error("Failed to create WebSocket".to_string()));
