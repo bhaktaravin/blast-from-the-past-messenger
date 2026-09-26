@@ -1,7 +1,38 @@
 [package]
 name = "chatmessagediscordclone"
-version = "1.2.0"
+# Release builds are stamped with the git tag's version by .github/workflows/release.yml
+version = "1.2.6"
 edition = "2021"
+description = "Retro AOL-style instant messenger"
+homepage = "https://github.com/bhaktaravin/blast-from-the-past-messenger"
+
+# Linux packages (built in CI with cargo-deb / cargo-generate-rpm after `cargo build --release --features client`)
+[package.metadata.deb]
+name = "blast-from-the-past"
+maintainer = "Ravin Bhakta <ravin.bhakta@gmail.com>"
+copyright = "Ravin Bhakta. All rights reserved."
+license-file = ["packaging/linux/COPYRIGHT", "0"]
+extended-description = "Blast From The Past Messenger: a retro AOL-style instant messenger with buddy lists, chat rooms, end-to-end encrypted DMs and more."
+section = "net"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/chatmessagediscordclone", "usr/bin/blast-from-the-past", "755"],
+    ["packaging/linux/blast-from-the-past.desktop", "usr/share/applications/", "644"],
+    ["assets/icons/icon-256.png", "usr/share/icons/hicolor/256x256/apps/blast-from-the-past.png", "644"],
+    ["assets/icons/icon.svg", "usr/share/icons/hicolor/scalable/apps/blast-from-the-past.svg", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "blast-from-the-past"
+summary = "Retro AOL-style instant messenger"
+license = "All rights reserved"
+assets = [
+    { source = "target/release/chatmessagediscordclone", dest = "/usr/bin/blast-from-the-past", mode = "755" },
+    { source = "packaging/linux/blast-from-the-past.desktop", dest = "/usr/share/applications/blast-from-the-past.desktop", mode = "644" },
+    { source = "assets/icons/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/blast-from-the-past.png", mode = "644" },
+    { source = "assets/icons/icon.svg", dest = "/usr/share/icons/hicolor/scalable/apps/blast-from-the-past.svg", mode = "644" },
+]
 
 # Define binaries explicitly
 [[bin]]

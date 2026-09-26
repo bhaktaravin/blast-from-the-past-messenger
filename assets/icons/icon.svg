@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2e2a26"/>
+      <stop offset="1" stop-color="#15130f"/>
+    </linearGradient>
+    <linearGradient id="bubble" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd27a"/>
+      <stop offset="1" stop-color="#f0a83a"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="none" stroke="#f0a83a" stroke-width="12"/>
+  <!-- speech bubble -->
+  <path d="M116 120 H396 a44 44 0 0 1 44 44 V312 a44 44 0 0 1 -44 44 H236 L148 424 L164 356 H116 a44 44 0 0 1 -44 -44 V164 a44 44 0 0 1 44 -44 Z"
+        fill="url(#bubble)"/>
+  <!-- typing dots -->
+  <circle cx="176" cy="238" r="30" fill="#1e1c1a"/>
+  <circle cx="256" cy="238" r="30" fill="#1e1c1a"/>
+  <circle cx="336" cy="238" r="30" fill="#1e1c1a"/>
+</svg>

@@ -1,5 +1,8 @@
 name: Release Builds
 
+# Pushing a tag like v1.3.0 builds every installer and publishes a GitHub release.
+# "Run workflow" (workflow_dispatch) builds the same installers as downloadable
+# workflow artifacts without publishing anything — use it to test packaging changes.
 on:
   push:
     tags:
@@ -10,199 +13,85 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      version: ${{ steps.get_version.outputs.version }}
-    steps:
-      - name: Get version
-        id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ github.ref }}
-          name: Release ${{ steps.get_version.outputs.version }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-
   build-windows:
     name: Build Windows
     runs-on: windows-latest
-    needs: create-release
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set version
+        shell: bash
+        run: .github/scripts/set-version.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        env:
-          DATABASE_URL: "sqlite::memory:"
         run: cargo build --release --bin chatmessagediscordclone --features client
 
-      - name: Build Installer (Inno Setup)
+      - name: Build installer (Inno Setup)
         run: |
-          choco install innosetup -y
-          iscc scripts/installer/installer.iss
+          choco install innosetup -y --no-progress
+          iscc "/DAppVersion=$env:VERSION" scripts/installer/installer.iss
 
-      - name: Upload Installer
-        uses: softprops/action-gh-release@v1
+      - uses: actions/upload-artifact@v4
         with:
-          files: ./dist/blast-from-the-past-messenger-setup.exe
-          tag_name: ${{ needs.create-release.outputs.version }}
+          name: installer-windows
+          path: dist/blast-from-the-past-messenger-setup.exe
+          if-no-files-found: error
 
-  build-macos-intel:
-    name: Build macOS (Intel)
+  build-macos:
+    name: Build macOS (${{ matrix.name }})
     runs-on: macos-latest
-    needs: create-release
-    permissions:
-      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Intel
+            target: x86_64-apple-darwin
+            dmg: blast-from-the-past-macos-intel.dmg
+          - name: Apple Silicon
+            target: aarch64-apple-darwin
+            dmg: blast-from-the-past-macos-silicon.dmg
+    env:
+      HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      SIGN_IDENTITY: "Developer ID Application: Ravin Bhakta (VLJG47KK4K)"
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set version
+        run: .github/scripts/set-version.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin
+          targets: ${{ matrix.target }}
 
-      - name: Cache cargo
-        uses: actions/cache@v3
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-intel-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}
 
-      - name: Build for Intel
-        env:
-          DATABASE_URL: "sqlite::memory:"
-        run: cargo build --release --bin chatmessagediscordclone --features client --target x86_64-apple-darwin
-
-      - name: Prepare binary
+      - name: Build
         run: |
+          cargo build --release --bin chatmessagediscordclone --features client --target ${{ matrix.target }}
           mkdir -p target/release
-          cp target/x86_64-apple-darwin/release/chatmessagediscordclone target/release/
+          cp target/${{ matrix.target }}/release/chatmessagediscordclone target/release/
+
+      - name: Create app bundle
+        run: .github/scripts/create-macos-app.sh
 
       - name: Import signing certificate
+        if: env.HAS_SIGNING == 'true'
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
           printf "%s" "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
-          echo "Certificate size: $(wc -c < certificate.p12) bytes"
-          # Create a PKCS12 without password for security import compatibility
+          # Re-export with a known password for `security import` compatibility
           openssl pkcs12 -in certificate.p12 -passin pass:blast123 -out cert_nopass.pem -nodes
           openssl pkcs12 -export -in cert_nopass.pem -out certificate_import.p12 -passout pass:actions
-          security create-keychain -p actions build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p actions build.keychain
-          security import certificate_import.p12 -k build.keychain -P "actions" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
-          security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
-          echo "=== Codesigning identities ==="
-          security find-identity -v -p codesigning build.keychain
-
-      - name: Create app bundle, sign and notarize
-        env:
-          NOTARIZATION_APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
-          NOTARIZATION_PWD: ${{ secrets.NOTARIZATION_PWD }}
-        run: |
-          chmod +x .github/scripts/create-macos-app.sh
-          ./.github/scripts/create-macos-app.sh
-          security unlock-keychain -p actions build.keychain
-          echo "=== Identities before signing ==="
-          security find-identity -v -p codesigning
-          codesign --deep --force --verify --verbose \
-            --keychain build.keychain \
-            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
-            --options runtime \
-            "target/release/Blast From The Past.app"
-          ditto -c -k --keepParent "target/release/Blast From The Past.app" app-intel.zip
-          xcrun notarytool submit app-intel.zip \
-            --apple-id "$NOTARIZATION_APPLE_ID" \
-            --password "$NOTARIZATION_PWD" \
-            --team-id "VLJG47KK4K" \
-            --wait
-          xcrun stapler staple "target/release/Blast From The Past.app"
-          mv blast-from-the-past-macos.dmg blast-from-the-past-macos-intel.dmg
-          codesign --keychain build.keychain \
-            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
-            blast-from-the-past-macos-intel.dmg
-
-      - name: Upload Intel DMG
-        uses: softprops/action-gh-release@v1
-        with:
-          files: ./blast-from-the-past-macos-intel.dmg
-          tag_name: ${{ needs.create-release.outputs.version }}
-
-  build-macos-silicon:
-    name: Build macOS (Apple Silicon)
-    runs-on: macos-latest
-    needs: create-release
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
-
-      - name: Cache cargo
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-silicon-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build for Apple Silicon
-        env:
-          DATABASE_URL: "sqlite::memory:"
-        run: cargo build --release --bin chatmessagediscordclone --features client --target aarch64-apple-darwin
-
-      - name: Prepare binary
-        run: |
-          mkdir -p target/release
-          cp target/aarch64-apple-darwin/release/chatmessagediscordclone target/release/
-
-      - name: Import signing certificate
-        env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
-        run: |
-          printf "%s" "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
-          echo "Certificate size: $(wc -c < certificate.p12) bytes"
-          openssl pkcs12 -in certificate.p12 -passin pass:blast123 -out cert_nopass.pem -nodes
-          openssl pkcs12 -export -in cert_nopass.pem -out certificate_import.p12 -passout pass:actions
+          rm certificate.p12 cert_nopass.pem
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p actions build.keychain
@@ -211,45 +100,60 @@ jobs:
           security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
           security find-identity -v -p codesigning build.keychain
 
-      - name: Create app bundle, sign and notarize
+      # Order matters: sign + notarize + staple the app first, then pack *that* app
+      # into the DMG. Packing first shipped an unsigned app Gatekeeper refuses to open.
+      - name: Sign and notarize app
+        if: env.HAS_SIGNING == 'true'
         env:
           NOTARIZATION_APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
           NOTARIZATION_PWD: ${{ secrets.NOTARIZATION_PWD }}
         run: |
-          chmod +x .github/scripts/create-macos-app.sh
-          ./.github/scripts/create-macos-app.sh
+          APP="target/release/Blast From The Past.app"
           security unlock-keychain -p actions build.keychain
-          codesign --deep --force --verify --verbose \
-            --keychain build.keychain \
-            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
-            --options runtime \
-            "target/release/Blast From The Past.app"
-          ditto -c -k --keepParent "target/release/Blast From The Past.app" app-silicon.zip
-          xcrun notarytool submit app-silicon.zip \
-            --apple-id "$NOTARIZATION_APPLE_ID" \
-            --password "$NOTARIZATION_PWD" \
-            --team-id "VLJG47KK4K" \
-            --wait
-          xcrun stapler staple "target/release/Blast From The Past.app"
-          mv blast-from-the-past-macos.dmg blast-from-the-past-macos-silicon.dmg
-          codesign --keychain build.keychain \
-            --sign "Developer ID Application: Ravin Bhakta (VLJG47KK4K)" \
-            blast-from-the-past-macos-silicon.dmg
+          codesign --force --timestamp --options runtime \
+            --keychain build.keychain --sign "$SIGN_IDENTITY" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" app.zip
+          xcrun notarytool submit app.zip \
+            --apple-id "$NOTARIZATION_APPLE_ID" --password "$NOTARIZATION_PWD" \
+            --team-id "VLJG47KK4K" --wait
+          xcrun stapler staple "$APP"
 
-      - name: Upload Silicon DMG
-        uses: softprops/action-gh-release@v1
+      - name: Create DMG
+        run: .github/scripts/create-macos-dmg.sh "${{ matrix.dmg }}"
+
+      - name: Sign and notarize DMG
+        if: env.HAS_SIGNING == 'true'
+        env:
+          NOTARIZATION_APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
+          NOTARIZATION_PWD: ${{ secrets.NOTARIZATION_PWD }}
+        run: |
+          security unlock-keychain -p actions build.keychain
+          codesign --force --timestamp --keychain build.keychain --sign "$SIGN_IDENTITY" "${{ matrix.dmg }}"
+          xcrun notarytool submit "${{ matrix.dmg }}" \
+            --apple-id "$NOTARIZATION_APPLE_ID" --password "$NOTARIZATION_PWD" \
+            --team-id "VLJG47KK4K" --wait
+          xcrun stapler staple "${{ matrix.dmg }}"
+          # Final check: what a user's Mac will decide about the app inside
+          MNT=$(hdiutil attach -nobrowse -readonly "${{ matrix.dmg }}" | tail -1 | cut -f3-)
+          spctl --assess --type execute --verbose=2 "$MNT/Blast From The Past.app"
+          hdiutil detach "$MNT"
+
+      - uses: actions/upload-artifact@v4
         with:
-          files: ./blast-from-the-past-macos-silicon.dmg
-          tag_name: ${{ needs.create-release.outputs.version }}
+          name: installer-macos-${{ matrix.target }}
+          path: ${{ matrix.dmg }}
+          if-no-files-found: error
 
   build-linux:
     name: Build Linux
-    runs-on: ubuntu-latest
-    needs: create-release
-    permissions:
-      contents: write
+    # Oldest supported runner: binaries built against an older glibc run on more distros
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set version
+        run: .github/scripts/set-version.sh
 
       - name: Install dependencies
         run: |
@@ -264,40 +168,81 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v3
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install packagers
+        uses: taiki-e/install-action@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          tool: cargo-deb,cargo-generate-rpm
 
       - name: Build
-        env:
-          DATABASE_URL: "sqlite::memory:"
-        run: cargo build --release --bin chatmessagediscordclone --features client
-
-      - name: Create tarball
         run: |
-          tar -czf blast-from-the-past-linux-x86_64.tar.gz \
-            -C target/release chatmessagediscordclone
+          cargo build --release --bin chatmessagediscordclone --features client
+          strip target/release/chatmessagediscordclone
 
-      - name: Upload Linux Binary
-        uses: softprops/action-gh-release@v1
+      - name: Package .deb, .rpm and .tar.gz
+        run: |
+          mkdir -p dist
+          cargo deb --no-build --no-strip --output dist/blast-from-the-past-linux-x86_64.deb
+          cargo generate-rpm --output dist/blast-from-the-past-linux-x86_64.rpm
+
+          # Portable tarball with a per-user installer (no root; works on immutable distros)
+          STAGE=target/tarball/blast-from-the-past
+          mkdir -p "$STAGE"
+          cp target/release/chatmessagediscordclone "$STAGE/blast-from-the-past"
+          cp packaging/linux/blast-from-the-past.desktop packaging/linux/install.sh "$STAGE/"
+          cp assets/icons/icon-256.png "$STAGE/blast-from-the-past.png"
+          cp assets/icons/icon.svg "$STAGE/blast-from-the-past.svg"
+          tar -czf dist/blast-from-the-past-linux-x86_64.tar.gz -C target/tarball blast-from-the-past
+
+      - uses: actions/upload-artifact@v4
         with:
-          files: ./blast-from-the-past-linux-x86_64.tar.gz
-          tag_name: ${{ needs.create-release.outputs.version }}
+          name: installer-linux
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/') && !cancelled()
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      intel_sha: ${{ steps.sums.outputs.intel_sha }}
+      silicon_sha: ${{ steps.sums.outputs.silicon_sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        id: sums
+        run: |
+          cd dist
+          ls -la
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          for arch in intel silicon; do
+            f="blast-from-the-past-macos-$arch.dmg"
+            [ -f "$f" ] && echo "${arch}_sha=$(sha256sum "$f" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          done
+          true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
 
   update-homebrew:
     name: Update Homebrew Tap
+    needs: publish
+    if: needs.publish.outputs.intel_sha != '' || needs.publish.outputs.silicon_sha != ''
     runs-on: ubuntu-latest
-    needs: [build-macos-intel, build-macos-silicon, create-release]
-    if: always() && needs.create-release.result == 'success'
-    permissions:
-      contents: write
     steps:
       - name: Checkout tap repo
         uses: actions/checkout@v4
@@ -306,25 +251,15 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
 
-      - name: Download Intel DMG and get checksum
-        if: needs.build-macos-intel.result == 'success'
-        run: |
-          VERSION=${{ needs.create-release.outputs.version }}
-          curl -L -o intel.dmg "https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/download/${VERSION}/blast-from-the-past-macos-intel.dmg"
-          echo "INTEL_SHA=$(shasum -a 256 intel.dmg | cut -d' ' -f1)" >> $GITHUB_ENV
-
-      - name: Download Silicon DMG and get checksum
-        if: needs.build-macos-silicon.result == 'success'
-        run: |
-          VERSION=${{ needs.create-release.outputs.version }}
-          curl -L -o silicon.dmg "https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/download/${VERSION}/blast-from-the-past-macos-silicon.dmg"
-          echo "SILICON_SHA=$(shasum -a 256 silicon.dmg | cut -d' ' -f1)" >> $GITHUB_ENV
-
       - name: Update cask formula
+        env:
+          INTEL_SHA: ${{ needs.publish.outputs.intel_sha }}
+          SILICON_SHA: ${{ needs.publish.outputs.silicon_sha }}
         run: |
-          VERSION=${{ needs.create-release.outputs.version }}
-          VERSION_NUM=${VERSION#v}
+          VERSION_NUM=${GITHUB_REF_NAME#v}
           CASK_FILE="homebrew-tap/Casks/blast-from-the-past.rb"
+          # A missing build can't be checksummed; Homebrew spells "skip the check" :no_check
+          sha() { if [ -n "$1" ]; then echo "\"$1\""; else echo ":no_check"; fi; }
 
           cat > "$CASK_FILE" << CASK
           cask "blast-from-the-past" do
@@ -332,12 +267,12 @@ jobs:
 
             on_intel do
               url "https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/download/v#{version}/blast-from-the-past-macos-intel.dmg"
-              sha256 "${INTEL_SHA:-to_be_updated}"
+              sha256 $(sha "$INTEL_SHA")
             end
 
             on_arm do
               url "https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/download/v#{version}/blast-from-the-past-macos-silicon.dmg"
-              sha256 "${SILICON_SHA:-to_be_updated}"
+              sha256 $(sha "$SILICON_SHA")
             end
 
             name "Blast From The Past"
@@ -347,10 +282,11 @@ jobs:
             app "Blast From The Past.app"
 
             zap trash: [
-              "~/.config/blast-from-the-past",
+              "~/Library/Application Support/blast-from-the-past",
             ]
           end
           CASK
+          cat "$CASK_FILE"
 
       - name: Commit and push cask update
         run: |
@@ -358,5 +294,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Casks/blast-from-the-past.rb
-          git diff --staged --quiet || git commit -m "Update blast-from-the-past to ${{ needs.create-release.outputs.version }}"
+          git diff --staged --quiet || git commit -m "Update blast-from-the-past to ${GITHUB_REF_NAME}"
           git push

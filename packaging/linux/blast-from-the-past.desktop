@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Blast From The Past
+GenericName=Instant Messenger
+Comment=Retro AOL-style instant messenger
+Exec=blast-from-the-past
+Icon=blast-from-the-past
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=chat;messenger;aol;im;
+StartupWMClass=blast-from-the-past

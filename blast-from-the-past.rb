@@ -18,6 +18,6 @@ cask "blast-from-the-past" do
   app "Blast From The Past.app"
 
   zap trash: [
-    "~/.config/blast-from-the-past",
+    "~/Library/Application Support/blast-from-the-past",
   ]
 end

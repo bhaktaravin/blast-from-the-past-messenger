@@ -1070,8 +1070,8 @@ impl AolApp {
                         if let Ok(json) = response.json::<serde_json::Value>() {
                             if let Some(tag_name) = json["tag_name"].as_str() {
                                 let latest_version = tag_name.trim_start_matches('v');
-                                
-                                if latest_version != CURRENT_VERSION {
+
+                                if is_newer_version(latest_version, CURRENT_VERSION) {
                                     if let Ok(mut guard) = UPDATE_VERSION.lock() {
                                         *guard = Some(latest_version.to_string());
                                     }
@@ -4216,6 +4216,18 @@ fn convert_emoticons(text: &str) -> String {
     result
 }
 
+/// "1.10.0" > "1.9.3". Compares dotted numbers so a stale or dev build
+/// doesn't nag about a release it's already ahead of.
+fn is_newer_version(candidate: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.split(['.', '-', '+'])
+            .take(3)
+            .map(|part| part.parse().unwrap_or(0))
+            .collect()
+    };
+    parse(candidate) > parse(current)
+}
+
 fn format_relative_time(at: &str) -> String {
     let parsed = chrono::DateTime::parse_from_rfc3339(at).ok();
     let timestamp = match parsed {
@@ -4937,7 +4949,12 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(egui::vec2(1000.0, 700.0))
-            .with_min_inner_size(egui::vec2(900.0, 640.0)),
+            .with_min_inner_size(egui::vec2(900.0, 640.0))
+            .with_app_id("blast-from-the-past")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/icon-256.png"))
+                    .expect("bundled icon is a valid PNG"),
+            ),
         ..Default::default()
     };
     eframe::run_native(
@@ -4989,4 +5006,18 @@ fn main() {
             .await
             .expect("failed to start eframe");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_newer_version;
+
+    #[test]
+    fn compares_versions_numerically() {
+        assert!(is_newer_version("1.2.6", "1.2.0"));
+        assert!(is_newer_version("1.10.0", "1.9.9"));
+        assert!(is_newer_version("2.0.0", "1.99.99"));
+        assert!(!is_newer_version("1.2.6", "1.2.6"));
+        assert!(!is_newer_version("1.2.5", "1.2.6"));
+    }
 }
