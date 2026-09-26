@@ -25,6 +25,11 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 #[cfg(not(target_arch = "wasm32"))]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
+/// How long a login/registration may take before we give up. Generous because a
+/// sleeping server host (e.g. Railway idle sleep) needs time to cold-start.
+const LOGIN_TIMEOUT_SECS: i64 = 30;
+const LOGIN_TIMEOUT_MESSAGE: &str = "Connection timed out. The server may be waking up — try again in a moment.";
+
 // Platform-specific timing
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -328,7 +333,7 @@ struct AolApp {
     report_reason: String,
     logging_in: bool,
     login_started_at: Option<Instant>,
-    login_frame_count: u32,  // Web: frame counter for login timeout
+    login_started_ms: i64,  // Web: wall-clock login start (no Instant on wasm)
     login_error: bool,  // Track if login failed for red flash effect
     login_error_time: f32,  // Time since error for fade effect
     login_success: bool,  // Track if login succeeded for green flash effect
@@ -578,7 +583,7 @@ impl AolApp {
             report_reason: String::new(),
             logging_in: false,
             login_started_at: None,
-            login_frame_count: 0,
+            login_started_ms: 0,
             login_error: false,
             login_error_time: 0.0,
             login_success: false,
@@ -1531,7 +1536,7 @@ impl AolApp {
         #[cfg(target_arch = "wasm32")]
         {
             self.login_started_at = Some(0);
-            self.login_frame_count = 0;
+            self.login_started_ms = Utc::now().timestamp_millis();
         }
     }
 
@@ -1923,29 +1928,28 @@ impl eframe::App for AolApp {
             }
         }
         
-        // On native, timeout login after 15 seconds
+        // Give up on a login that never gets an answer
         #[cfg(not(target_arch = "wasm32"))]
         if self.logging_in {
             if let Some(start) = self.login_started_at {
-                if start.elapsed().as_secs() >= 15 {
+                if start.elapsed().as_secs() as i64 >= LOGIN_TIMEOUT_SECS {
                     self.logging_in = false;
                     self.login_started_at = None;
-                    self.status = "Connection timed out. Check the server URL.".to_string();
+                    self.status = LOGIN_TIMEOUT_MESSAGE.to_string();
                     self.show_toast(self.status.clone(), ToastKind::Error);
                 }
             }
         }
 
-        // On web, timeout login after 15 seconds (same as native)
+        // Same on web, by the wall clock — counting frames made the timeout
+        // depend on the display's refresh rate (7.5s on a 120Hz phone)
         #[cfg(target_arch = "wasm32")]
         if self.logging_in && self.screen == Screen::SignIn {
-            self.login_frame_count += 1;
-            let timeout_frames = 900; // ~15 seconds at 60 FPS
-            if self.login_frame_count >= timeout_frames {
+            let elapsed_ms = Utc::now().timestamp_millis() - self.login_started_ms;
+            if elapsed_ms >= LOGIN_TIMEOUT_SECS * 1000 {
                 self.logging_in = false;
                 self.login_started_at = None;
-                self.login_frame_count = 0;
-                self.status = "Connection timed out. Check the server URL.".to_string();
+                self.status = LOGIN_TIMEOUT_MESSAGE.to_string();
                 self.show_toast(self.status.clone(), ToastKind::Error);
             } else {
                 ctx.request_repaint();
