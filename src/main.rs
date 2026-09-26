@@ -1,6 +1,7 @@
 // Hide console window on Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod call_bridge;
 mod client_map;
 
 // Global update status
@@ -197,7 +198,10 @@ enum UiToNet {
     ReplyToMessage { reply_to_id: i64, body: String },
     ReplyToDirect { to: String, reply_to_id: i64, body: String },
     SetAvatar { avatar_data: String },
-    StartVideoCall { to: String },
+    CallInvite { to: String },
+    CallAnswer { call_id: String, accept: bool },
+    CallSignal { call_id: String, data: String },
+    CallHangup { call_id: String },
     AdminListUsers,
     AdminResetPassword { username: String, new_password: String },
 }
@@ -241,7 +245,11 @@ enum NetToUi {
     Nudged { from: String },
     Winked { from: String, emoji: String },
     ProfileData { username: String, bio: String, status: Option<String>, joined: String, avatar_url: Option<String> },
-    IncomingVideoCall { from: String, room_url: String },
+    CallRinging { call_id: String, to: String, ice_servers: String },
+    IncomingCall { call_id: String, from: String, ice_servers: String },
+    CallAccepted { call_id: String },
+    CallSignal { call_id: String, data: String },
+    CallEnded { call_id: String, reason: String },
     AdminUserList(Vec<AdminUserEntry>),
     AdminActionResult { success: bool, message: String },
 }
@@ -256,6 +264,32 @@ enum Theme {
     MsnMessenger,
     YahooMessenger,
     Icq,
+}
+
+/// Where the current 1:1 video call is at. Media lives in the page (see `call_bridge`).
+enum CallPhase {
+    /// We rang someone. `call_id` arrives with the server's `CallRinging`;
+    /// `since` is the UI clock when the dial window first showed.
+    Dialing { peer: String, call_id: Option<String>, ice_servers: String, since: Option<f64> },
+    /// Someone is ringing us
+    Incoming { peer: String, call_id: String, ice_servers: String },
+    /// Picked up — the page is connecting or connected
+    Active { peer: String, call_id: String },
+}
+
+impl CallPhase {
+    fn peer(&self) -> &str {
+        match self {
+            CallPhase::Dialing { peer, .. } | CallPhase::Incoming { peer, .. } | CallPhase::Active { peer, .. } => peer,
+        }
+    }
+
+    fn call_id(&self) -> Option<&str> {
+        match self {
+            CallPhase::Dialing { call_id, .. } => call_id.as_deref(),
+            CallPhase::Incoming { call_id, .. } | CallPhase::Active { call_id, .. } => Some(call_id),
+        }
+    }
 }
 
 struct NetworkHandle {
@@ -275,6 +309,7 @@ struct AolApp {
     logged_in_user: Option<String>,
     is_admin: bool,
     show_admin_panel: bool,
+    call: Option<CallPhase>,
     admin_users: Vec<AdminUserEntry>,
     admin_reset_target: Option<String>,
     admin_reset_new_password: String,
@@ -524,6 +559,7 @@ impl AolApp {
             logged_in_user: None,
             is_admin: false,
             show_admin_panel: false,
+            call: None,
             admin_users: Vec::new(),
             admin_reset_target: None,
             admin_reset_new_password: String::new(),
@@ -745,26 +781,188 @@ impl AolApp {
         self.paint_buddy_avatar(ctx, ui, rect, &buddy);
     }
 
-    fn open_video_room(room_url: &str) -> Option<String> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Err(e) = open::that(room_url) {
-                Some(format!("Could not open browser: {e}"))
-            } else {
-                Some("Opening video call in your browser…".to_string())
+    fn start_call(&mut self, to: String) {
+        if !call_bridge::SUPPORTED {
+            self.show_toast("Video calls work in the web version for now".to_string(), ToastKind::Info);
+            return;
+        }
+        if let Some(phase) = &self.call {
+            self.show_toast(format!("Already in a call with {}", phase.peer()), ToastKind::Info);
+            return;
+        }
+        let _ = self.network.tx.send(UiToNet::CallInvite { to: to.clone() });
+        call_bridge::ring(Some(call_bridge::Ring::Outgoing));
+        self.call = Some(CallPhase::Dialing { peer: to, call_id: None, ice_servers: String::new(), since: None });
+    }
+
+    fn answer_call(&mut self, accept: bool) {
+        let Some(CallPhase::Incoming { peer, call_id, ice_servers }) = self.call.take() else { return };
+        call_bridge::ring(None);
+        let _ = self.network.tx.send(UiToNet::CallAnswer { call_id: call_id.clone(), accept });
+        if accept {
+            call_bridge::start(&call_id, false, &ice_servers, &peer);
+            self.call = Some(CallPhase::Active { peer, call_id });
+        }
+    }
+
+    /// Cancel, decline or hang up whatever call is in progress.
+    fn hang_up(&mut self) {
+        let Some(phase) = self.call.take() else { return };
+        // Dialing without an id yet: the CallRinging handler hangs up when it arrives
+        if let Some(call_id) = phase.call_id() {
+            let _ = self.network.tx.send(UiToNet::CallHangup { call_id: call_id.to_string() });
+        }
+        call_bridge::end();
+    }
+
+    fn on_call_ended(&mut self, phase: CallPhase, reason: &str) {
+        call_bridge::end();
+        let peer = phase.peer().to_string();
+        let was_ringing_us = matches!(phase, CallPhase::Incoming { .. });
+        let (text, kind) = match reason {
+            "declined" => (format!("{peer} declined the call"), ToastKind::Info),
+            "busy" => (format!("{peer} is on another call"), ToastKind::Info),
+            "offline" => (format!("{peer} is offline"), ToastKind::Info),
+            "unavailable" => (format!("{peer} can't take calls right now"), ToastKind::Info),
+            "rate_limited" => ("Slow down — try calling again in a few seconds".to_string(), ToastKind::Info),
+            "no_answer" | "hangup" if was_ringing_us => (format!("📹 Missed call from {peer}"), ToastKind::Info),
+            "no_answer" => (format!("No answer from {peer}"), ToastKind::Info),
+            "answered_elsewhere" => ("Call answered on another device".to_string(), ToastKind::Info),
+            "disconnected" => (format!("Call with {peer} dropped"), ToastKind::Error),
+            _ => (format!("Call with {peer} ended"), ToastKind::Info),
+        };
+        self.show_toast(text, kind);
+    }
+
+    /// Relay what the call page did since last frame (signaling, hang up, errors).
+    fn poll_call_bridge(&mut self) {
+        for event in call_bridge::take_events() {
+            let current = self.call.as_ref().and_then(|p| p.call_id()).map(str::to_string);
+            match event {
+                call_bridge::CallEvent::Signal { call_id, data } => {
+                    if current.as_deref() == Some(call_id.as_str()) {
+                        let _ = self.network.tx.send(UiToNet::CallSignal { call_id, data });
+                    }
+                }
+                call_bridge::CallEvent::Hangup { call_id } => {
+                    if current.as_deref() == Some(call_id.as_str()) {
+                        let peer = self.call.as_ref().map(|p| p.peer().to_string()).unwrap_or_default();
+                        self.hang_up();
+                        self.show_toast(format!("Call with {peer} ended"), ToastKind::Info);
+                    }
+                }
+                call_bridge::CallEvent::Error { call_id, message } => {
+                    if current.as_deref() == Some(call_id.as_str()) {
+                        self.hang_up();
+                        self.show_toast(message, ToastKind::Error);
+                    }
+                }
             }
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::prelude::*;
-            #[wasm_bindgen]
-            extern "C" {
-                #[wasm_bindgen(js_namespace = window)]
-                fn startVideoCall(room_url: &str);
+    }
+
+    /// Ringing / dialing windows. The live call itself is the page's overlay.
+    fn draw_call_ui(&mut self, ctx: &egui::Context) {
+        enum Action { Accept, Decline, Cancel }
+        let mut action = None;
+        let time = ctx.input(|i| i.time);
+        // Phone icon wobbles while ringing
+        let wobble = ((time * 18.0).sin() * 0.25) as f32;
+
+        // The server always answers an invite, so silence means it can't do calls
+        // (e.g. an older server build) — don't leave the user dialing forever.
+        if let Some(CallPhase::Dialing { call_id: None, since, .. }) = &mut self.call {
+            let started = *since.get_or_insert(time);
+            if time - started > 10.0 {
+                self.call = None;
+                call_bridge::end();
+                self.show_toast("Couldn't place the call — the server didn't respond".to_string(), ToastKind::Error);
+                return;
             }
-            startVideoCall(room_url);
-            None
         }
+
+        match &self.call {
+            Some(CallPhase::Incoming { peer, .. }) => {
+                let peer = peer.clone();
+                egui::Window::new("📞 Incoming Video Call")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(6.0);
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
+                            self.paint_call_icon(ui, rect, wobble);
+                            ui.add_space(6.0);
+                            ui.heading(&peer);
+                            ui.label("wants to video chat");
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                let answer = egui::Button::new(egui::RichText::new("✅ Answer").strong().color(egui::Color32::WHITE))
+                                    .fill(egui::Color32::from_rgb(40, 150, 70))
+                                    .min_size(egui::vec2(110.0, 36.0));
+                                let decline = egui::Button::new(egui::RichText::new("✖ Decline").strong().color(egui::Color32::WHITE))
+                                    .fill(egui::Color32::from_rgb(190, 50, 50))
+                                    .min_size(egui::vec2(110.0, 36.0));
+                                if ui.add(answer).clicked() {
+                                    action = Some(Action::Accept);
+                                }
+                                if ui.add(decline).clicked() {
+                                    action = Some(Action::Decline);
+                                }
+                            });
+                            ui.add_space(4.0);
+                        });
+                    });
+            }
+            Some(CallPhase::Dialing { peer, call_id, .. }) => {
+                let peer = peer.clone();
+                let status = if call_id.is_some() { "Ringing" } else { "Dialing" };
+                let dots = ".".repeat(1 + (time * 2.0) as usize % 3);
+                egui::Window::new("📞 Video Call")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(6.0);
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
+                            self.paint_call_icon(ui, rect, wobble * 0.4);
+                            ui.add_space(6.0);
+                            ui.heading(&peer);
+                            ui.label(format!("{status}{dots}"));
+                            ui.add_space(10.0);
+                            let cancel = egui::Button::new(egui::RichText::new("✖ Cancel").strong().color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(190, 50, 50))
+                                .min_size(egui::vec2(140.0, 36.0));
+                            if ui.add(cancel).clicked() {
+                                action = Some(Action::Cancel);
+                            }
+                            ui.add_space(4.0);
+                        });
+                    });
+            }
+            Some(CallPhase::Active { .. }) | None => {}
+        }
+
+        match action {
+            Some(Action::Accept) => self.answer_call(true),
+            Some(Action::Decline) => self.answer_call(false),
+            Some(Action::Cancel) => self.hang_up(),
+            None => {}
+        }
+    }
+
+    fn paint_call_icon(&self, ui: &egui::Ui, rect: egui::Rect, angle: f32) {
+        let painter = ui.painter();
+        painter.circle_filled(rect.center(), rect.width() / 2.0, egui::Color32::from_rgb(240, 168, 58));
+        let galley = painter.layout_no_wrap(
+            "📞".to_string(),
+            egui::FontId::proportional(30.0),
+            egui::Color32::BLACK,
+        );
+        let pos = rect.center() - galley.size() / 2.0;
+        painter.add(egui::epaint::TextShape::new(pos, galley, egui::Color32::BLACK).with_angle(angle));
     }
 
     fn save_credentials(&self) {
@@ -959,6 +1157,10 @@ impl AolApp {
                 }
                 NetToUi::Disconnected => {
                     self.connected = false;
+                    if self.call.take().is_some() {
+                        call_bridge::end();
+                        self.show_toast("Call dropped — lost connection".to_string(), ToastKind::Error);
+                    }
                     // Only auto-reconnect if we were previously logged in (not a manual logout)
                     if self.logged_in_user.is_some() && self.reconnect_credentials.is_some() {
                         self.status = "Disconnected. Reconnecting...".to_string();
@@ -1249,11 +1451,60 @@ impl AolApp {
                         // Profile modal is open, it will refresh automatically
                     }
                 }
-                NetToUi::IncomingVideoCall { from, room_url } => {
-                    self.show_toast(format!("📹 Video call from {}", from), ToastKind::Info);
-                    self.audio_manager.play(SoundEffect::MessageReceived);
-                    if let Some(msg) = Self::open_video_room(&room_url) {
-                        self.show_toast(msg, ToastKind::Info);
+                NetToUi::CallRinging { call_id, to, ice_servers: ice } => {
+                    match &mut self.call {
+                        Some(CallPhase::Dialing { peer, call_id: id @ None, ice_servers, .. }) if *peer == to => {
+                            *id = Some(call_id);
+                            *ice_servers = ice;
+                        }
+                        // We cancelled before the server got back to us
+                        _ => {
+                            let _ = self.network.tx.send(UiToNet::CallHangup { call_id });
+                        }
+                    }
+                }
+                NetToUi::IncomingCall { call_id, from, ice_servers } => {
+                    if !call_bridge::SUPPORTED {
+                        // Let a web session of ours pick it up; this one just says so
+                        self.audio_manager.play(SoundEffect::MessageReceived);
+                        self.show_toast(
+                            format!("📹 {from} is video calling you — answer from the web version"),
+                            ToastKind::Info,
+                        );
+                    } else if self.call.is_some() {
+                        let _ = self.network.tx.send(UiToNet::CallAnswer { call_id, accept: false });
+                    } else {
+                        call_bridge::ring(Some(call_bridge::Ring::Incoming));
+                        self.call = Some(CallPhase::Incoming { peer: from, call_id, ice_servers });
+                    }
+                }
+                NetToUi::CallAccepted { call_id } => {
+                    if let Some(CallPhase::Dialing { peer, call_id: Some(id), ice_servers, .. }) = &self.call {
+                        if *id == call_id {
+                            call_bridge::ring(None);
+                            call_bridge::start(&call_id, true, ice_servers, peer);
+                            self.call = Some(CallPhase::Active { peer: peer.clone(), call_id });
+                        }
+                    }
+                }
+                NetToUi::CallSignal { call_id, data } => {
+                    if let Some(CallPhase::Active { call_id: id, .. }) = &self.call {
+                        if *id == call_id {
+                            call_bridge::signal(&call_id, &data);
+                        }
+                    }
+                }
+                NetToUi::CallEnded { call_id, reason } => {
+                    // A refusal before the call existed carries an empty id
+                    let ours = match &self.call {
+                        Some(CallPhase::Dialing { call_id: None, .. }) => call_id.is_empty(),
+                        Some(phase) => phase.call_id() == Some(call_id.as_str()),
+                        None => false,
+                    };
+                    if ours {
+                        if let Some(phase) = self.call.take() {
+                            self.on_call_ended(phase, &reason);
+                        }
                     }
                 }
                 NetToUi::AdminUserList(users) => {
@@ -1639,6 +1890,14 @@ impl eframe::App for AolApp {
         }
         self.avatar_cache.poll(ctx);
         self.process_net_events();
+        self.poll_call_bridge();
+        // Network events don't wake the UI on their own; keep polling while signed in
+        // so messages and incoming calls show up without the user touching anything.
+        if self.call.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        } else if self.logged_in_user.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
 
         // Auto-reconnect timer (native + web)
         if self.reconnect_timer > 0.0 && !self.connected && self.screen != Screen::SignIn {
@@ -1702,6 +1961,7 @@ impl eframe::App for AolApp {
             self.draw_background(ctx);
         }
         self.draw_toast(ctx);
+        self.draw_call_ui(ctx);
 
         match self.screen {
             Screen::SignIn => {
@@ -3069,8 +3329,7 @@ impl eframe::App for AolApp {
                                             ui.close_menu();
                                         }
                                         if ui.button("📹 Video Call").clicked() {
-                                            let _ = self.network.tx.send(UiToNet::StartVideoCall { to: buddy.username.clone() });
-                                            self.show_toast(format!("Starting video call with {}...", buddy.username), ToastKind::Info);
+                                            self.start_call(buddy.username.clone());
                                             ui.close_menu();
                                         }
                                         if ui.button("👤 View Profile").clicked() {
@@ -3192,8 +3451,7 @@ impl eframe::App for AolApp {
                                             ui.close_menu();
                                         }
                                         if ui.button("📹 Video Call").clicked() {
-                                            let _ = self.network.tx.send(UiToNet::StartVideoCall { to: buddy.username.clone() });
-                                            self.show_toast(format!("Starting video call with {}...", buddy.username), ToastKind::Info);
+                                            self.start_call(buddy.username.clone());
                                             ui.close_menu();
                                         }
                                         if ui.button("👤 View Profile").clicked() {
@@ -3261,6 +3519,7 @@ impl eframe::App for AolApp {
                 // ── Floating DM Windows ───────────────────────────────────
                 let dm_usernames: Vec<String> = self.dm_windows.keys().cloned().collect();
                 let mut to_close: Vec<String> = Vec::new();
+                let mut call_request: Option<String> = None;
 
                 for peer in dm_usernames {
                     let messages = self.messages
@@ -3285,6 +3544,15 @@ impl eframe::App for AolApp {
                         .default_size([380.0, 320.0])
                         .min_size([280.0, 200.0])
                         .show(ctx, |ui| {
+                            if call_bridge::SUPPORTED {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("📹 Video Call").clicked() {
+                                        call_request = Some(peer.clone());
+                                    }
+                                });
+                                ui.separator();
+                            }
+
                             // Message history
                             let available = ui.available_height() - 40.0;
                             egui::ScrollArea::vertical()
@@ -3349,6 +3617,9 @@ impl eframe::App for AolApp {
                 }
                 for peer in to_close {
                     self.dm_windows.remove(&peer);
+                }
+                if let Some(peer) = call_request {
+                    self.start_call(peer);
                 }
 
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -4346,8 +4617,14 @@ where
                                 ServerToClient::ProfileData { username, bio, status, joined, avatar_url } => {
                                     let _ = net_tx.send(NetToUi::ProfileData { username, bio, status, joined, avatar_url });
                                 }
-                                ServerToClient::IncomingVideoCall { from, room_url } => {
-                                    let _ = net_tx.send(NetToUi::IncomingVideoCall { from, room_url });
+                                call_event @ (ServerToClient::CallRinging { .. }
+                                | ServerToClient::IncomingCall { .. }
+                                | ServerToClient::CallAccepted { .. }
+                                | ServerToClient::CallSignal { .. }
+                                | ServerToClient::CallEnded { .. }) => {
+                                    if let Some(ui_msg) = client_map::server_to_ui(call_event) {
+                                        let _ = net_tx.send(ui_msg);
+                                    }
                                 }
                                 ServerToClient::AdminUserList { users } => {
                                     let _ = net_tx.send(NetToUi::AdminUserList(users));
@@ -4484,8 +4761,13 @@ where
                     UiToNet::SetAvatar { avatar_data } => {
                         send_json(&mut ws_tx, ClientToServer::SetAvatar { avatar_data }).await?;
                     }
-                    UiToNet::StartVideoCall { to } => {
-                        send_json(&mut ws_tx, ClientToServer::StartVideoCall { to }).await?;
+                    call_msg @ (UiToNet::CallInvite { .. }
+                    | UiToNet::CallAnswer { .. }
+                    | UiToNet::CallSignal { .. }
+                    | UiToNet::CallHangup { .. }) => {
+                        if let Some(payload) = client_map::ui_to_server(call_msg) {
+                            send_json(&mut ws_tx, payload).await?;
+                        }
                     }
                     UiToNet::AdminListUsers => {
                         send_json(&mut ws_tx, ClientToServer::AdminListUsers).await?;

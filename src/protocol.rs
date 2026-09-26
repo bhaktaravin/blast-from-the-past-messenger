@@ -101,9 +101,15 @@ pub enum ClientToServer {
     ReplyToDirect { to: String, reply_to_id: i64, body: String },
     /// Set avatar (base64 encoded image data)
     SetAvatar { avatar_data: String },
-    /// Video calling
-    StartVideoCall { to: String },
-    VideoCallResponse { from: String, room_url: String },
+    /// Video calling (1:1 WebRTC; the server only relays signaling)
+    /// Ring a user. Server answers with `CallRinging` or `CallEnded`.
+    CallInvite { to: String },
+    /// Callee accepts or declines a ringing call
+    CallAnswer { call_id: String, accept: bool },
+    /// Opaque WebRTC signaling (SDP offer/answer, ICE candidate) for the other party
+    CallSignal { call_id: String, data: String },
+    /// Cancel a ringing call or hang up an active one
+    CallHangup { call_id: String },
     /// Admin: list all registered users (server rejects if requester isn't an admin)
     AdminListUsers,
     /// Admin: force-set another user's password (used for account recovery)
@@ -155,8 +161,18 @@ pub enum ServerToClient {
     Winked { from: String, emoji: String },
     /// A user's profile data
     ProfileData { username: String, bio: String, status: Option<String>, joined: String, avatar_url: Option<String> },
-    /// Video call invitation
-    IncomingVideoCall { from: String, room_url: String },
+    /// Our outgoing call is ringing on the other end
+    CallRinging { call_id: String, to: String, ice_servers: String },
+    /// Someone is calling us. `ice_servers` is a JSON array of RTCIceServer.
+    IncomingCall { call_id: String, from: String, ice_servers: String },
+    /// The callee picked up — caller should now send the offer
+    CallAccepted { call_id: String },
+    /// Signaling relayed from the other party
+    CallSignal { call_id: String, data: String },
+    /// Call is over (or never started). `reason` is one of: declined, busy,
+    /// offline, unavailable, rate_limited, no_answer, hangup, answered_elsewhere,
+    /// disconnected
+    CallEnded { call_id: String, reason: String },
     /// Admin: full list of registered users
     AdminUserList { users: Vec<AdminUserEntry> },
     /// Admin: result of an admin-only action (list/reset) — also used to report "not authorized"

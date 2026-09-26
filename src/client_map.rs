@@ -123,9 +123,15 @@ pub fn server_to_ui(event: ServerToClient) -> Option<NetToUi> {
             joined,
             avatar_url,
         },
-        ServerToClient::IncomingVideoCall { from, room_url } => {
-            NetToUi::IncomingVideoCall { from, room_url }
+        ServerToClient::CallRinging { call_id, to, ice_servers } => {
+            NetToUi::CallRinging { call_id, to, ice_servers }
         }
+        ServerToClient::IncomingCall { call_id, from, ice_servers } => {
+            NetToUi::IncomingCall { call_id, from, ice_servers }
+        }
+        ServerToClient::CallAccepted { call_id } => NetToUi::CallAccepted { call_id },
+        ServerToClient::CallSignal { call_id, data } => NetToUi::CallSignal { call_id, data },
+        ServerToClient::CallEnded { call_id, reason } => NetToUi::CallEnded { call_id, reason },
         ServerToClient::AdminUserList { users } => NetToUi::AdminUserList(users),
         ServerToClient::AdminActionResult { success, message } => {
             NetToUi::AdminActionResult { success, message }
@@ -204,7 +210,10 @@ pub fn ui_to_server(cmd: UiToNet) -> Option<ClientToServer> {
             })
         }
         UiToNet::SetAvatar { avatar_data } => Some(ClientToServer::SetAvatar { avatar_data }),
-        UiToNet::StartVideoCall { to } => Some(ClientToServer::StartVideoCall { to }),
+        UiToNet::CallInvite { to } => Some(ClientToServer::CallInvite { to }),
+        UiToNet::CallAnswer { call_id, accept } => Some(ClientToServer::CallAnswer { call_id, accept }),
+        UiToNet::CallSignal { call_id, data } => Some(ClientToServer::CallSignal { call_id, data }),
+        UiToNet::CallHangup { call_id } => Some(ClientToServer::CallHangup { call_id }),
         UiToNet::AdminListUsers => Some(ClientToServer::AdminListUsers),
         UiToNet::AdminResetPassword { username, new_password } => {
             Some(ClientToServer::AdminResetPassword { username, new_password })

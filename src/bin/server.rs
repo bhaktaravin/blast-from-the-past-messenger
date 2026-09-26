@@ -28,6 +28,10 @@ const MAX_CONNECTIONS_PER_IP: usize = 5;     // max concurrent connections per I
 const AUTH_TIMEOUT_SECS: u64 = 30;           // seconds before unauthenticated connection is dropped
 const LOGIN_MAX_ATTEMPTS: u32 = 5;           // max failed login attempts
 const LOGIN_LOCKOUT_SECS: u64 = 900;         // 15 minute lockout after too many failures
+const MAX_CALL_SIGNAL_BYTES: usize = 16384;  // WebRTC SDP offers routinely exceed 4KB
+const CALL_RING_TIMEOUT_SECS: u64 = 45;      // unanswered calls end as "no_answer"
+const DEFAULT_ICE_SERVERS: &str =
+    r#"[{"urls":["stun:stun.l.google.com:19302","stun:stun.cloudflare.com:3478"]}]"#;
 
 type RedisPool = Arc<redis::Client>;
 
@@ -40,6 +44,21 @@ struct Peer {
     tx: mpsc::UnboundedSender<Message>,
     current_room: Option<String>,
     last_activity: Instant,
+}
+
+/// A 1:1 video call. The server only relays signaling; media flows peer-to-peer.
+struct Call {
+    caller_peer: usize,
+    caller_user: i64,
+    callee_user: i64,
+    /// The callee session that picked up. Until then, every callee session rings.
+    callee_peer: Option<usize>,
+}
+
+struct CallHub {
+    calls: Mutex<HashMap<String, Call>>,
+    /// JSON array of RTCIceServer handed to both parties (STUN, and TURN if configured)
+    ice_servers: String,
 }
 
 #[derive(Clone, Copy)]
@@ -93,6 +112,21 @@ async fn main() {
         println!("Admin users: {}", admin_usernames.len());
     }
 
+    // Optional ICE_SERVERS env: JSON array of RTCIceServer, e.g. to add a TURN relay
+    // for callers behind strict NATs. Falls back to public STUN only.
+    let ice_servers = match std::env::var("ICE_SERVERS") {
+        Ok(raw) if serde_json::from_str::<Vec<serde_json::Value>>(&raw).is_ok() => raw,
+        Ok(_) => {
+            eprintln!("ICE_SERVERS is not a JSON array — using default STUN servers");
+            DEFAULT_ICE_SERVERS.to_string()
+        }
+        Err(_) => DEFAULT_ICE_SERVERS.to_string(),
+    };
+    let call_hub = Arc::new(CallHub {
+        calls: Mutex::new(HashMap::new()),
+        ice_servers,
+    });
+
     let peers: Arc<Mutex<HashMap<usize, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
     let rate_limits: Arc<Mutex<HashMap<i64, RateState>>> = Arc::new(Mutex::new(HashMap::new()));
     let ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -127,9 +161,10 @@ async fn main() {
         let ip_connections = Arc::clone(&ip_connections);
         let login_attempts = Arc::clone(&login_attempts);
         let admin_usernames = Arc::clone(&admin_usernames);
+        let call_hub = Arc::clone(&call_hub);
 
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, client_ip, peer_map, db, redis, rate_limits, login_attempts, admin_usernames).await {
+            if let Err(err) = handle_connection(stream, client_ip, peer_map, db, redis, rate_limits, login_attempts, admin_usernames, call_hub).await {
                 eprintln!("connection error: {err}");
             }
             // Decrement connection count when done
@@ -153,6 +188,7 @@ async fn handle_connection(
     rate_limits: Arc<Mutex<HashMap<i64, RateState>>>,
     login_attempts: Arc<Mutex<HashMap<IpAddr, LoginAttemptState>>>,
     admin_usernames: Arc<HashSet<String>>,
+    call_hub: Arc<CallHub>,
 ) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     
@@ -236,15 +272,20 @@ async fn handle_connection(
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        // Message size limit
-                        if text.len() > MAX_MESSAGE_BYTES {
+                        // Message size limit (call signaling gets more room for SDP)
+                        let event = serde_json::from_str::<ClientToServer>(&text);
+                        let limit = match event {
+                            Ok(ClientToServer::CallSignal { .. }) => MAX_CALL_SIGNAL_BYTES,
+                            _ => MAX_MESSAGE_BYTES,
+                        };
+                        if text.len() > limit {
                             send_to_peer(&peers, id, ServerToClient::System {
                                 message: "Message too large (max 4KB).".to_string(),
                             });
                             continue;
                         }
-                        if let Ok(event) = serde_json::from_str::<ClientToServer>(&text) {
-                            handle_client_event(id, client_ip, event, &peers, &db, &redis, &rate_limits, &login_attempts, &admin_usernames).await;
+                        if let Ok(event) = event {
+                            handle_client_event(id, client_ip, event, &peers, &db, &redis, &rate_limits, &login_attempts, &admin_usernames, &call_hub).await;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -269,6 +310,22 @@ async fn handle_connection(
         guard.remove(&id);
     }
 
+    // Tear down any call this session was part of so the other side isn't left hanging
+    let dropped_calls: Vec<String> = call_hub
+        .calls
+        .lock()
+        .map(|calls| {
+            calls
+                .iter()
+                .filter(|(_, call)| call.caller_peer == id || call.callee_peer == Some(id))
+                .map(|(call_id, _)| call_id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for call_id in dropped_calls {
+        finish_call(&peers, &call_hub, &call_id, "disconnected");
+    }
+
     broadcast_presence(&peers);
     writer.abort();
 
@@ -285,6 +342,7 @@ async fn handle_client_event(
     rate_limits: &Arc<Mutex<HashMap<i64, RateState>>>,
     login_attempts: &Arc<Mutex<HashMap<IpAddr, LoginAttemptState>>>,
     admin_usernames: &Arc<HashSet<String>>,
+    call_hub: &Arc<CallHub>,
 ) {
     match event {
         ClientToServer::Register { username, password } => {
@@ -1141,74 +1199,143 @@ async fn handle_client_event(
                 broadcast_presence(peers);
             }
         }
-        ClientToServer::StartVideoCall { to } => {
-            let (from, user_id) = match get_peer_identity(peers, id) {
-                Some(info) => info,
-                None => {
-                    send_to_peer(
-                        peers,
-                        id,
-                        ServerToClient::AuthError {
-                            message: "Please log in first.".to_string(),
-                        },
-                    );
-                    return;
+        ClientToServer::CallInvite { to } => {
+            let Some((from, user_id)) = get_peer_identity(peers, id) else { return };
+            update_peer_activity(peers, id);
+            // Until the call exists there is no id; the caller matches this by being mid-dial
+            let refuse = |reason: &str| {
+                send_to_peer(peers, id, ServerToClient::CallEnded {
+                    call_id: String::new(),
+                    reason: reason.to_string(),
+                });
+            };
+            if !allow_rate(rate_limits, user_id) {
+                return refuse("rate_limited");
+            }
+
+            let target_id = match get_user_id_by_name(db, &to).await {
+                Ok(Some(target_id)) if target_id != user_id => target_id,
+                _ => return refuse("unavailable"),
+            };
+            // Don't reveal a block — it looks the same as not being reachable
+            if is_blocked_or_muted(db, target_id, user_id).await {
+                return refuse("unavailable");
+            }
+            let callee_sessions = peers_for_user(peers, target_id);
+            if callee_sessions.is_empty() {
+                return refuse("offline");
+            }
+
+            let call_id = format!("{:032x}", rand::thread_rng().gen::<u128>());
+            {
+                let Ok(mut calls) = call_hub.calls.lock() else { return };
+                let in_call = |uid: i64| calls.values().any(|c| c.caller_user == uid || c.callee_user == uid);
+                if in_call(target_id) || in_call(user_id) {
+                    drop(calls);
+                    return refuse("busy");
+                }
+                calls.insert(call_id.clone(), Call {
+                    caller_peer: id,
+                    caller_user: user_id,
+                    callee_user: target_id,
+                    callee_peer: None,
+                });
+            }
+
+            send_to_peer(peers, id, ServerToClient::CallRinging {
+                call_id: call_id.clone(),
+                to: to.clone(),
+                ice_servers: call_hub.ice_servers.clone(),
+            });
+            for session in callee_sessions {
+                send_to_peer(peers, session, ServerToClient::IncomingCall {
+                    call_id: call_id.clone(),
+                    from: from.clone(),
+                    ice_servers: call_hub.ice_servers.clone(),
+                });
+            }
+
+            let peers = Arc::clone(peers);
+            let call_hub = Arc::clone(call_hub);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(CALL_RING_TIMEOUT_SECS)).await;
+                let unanswered = call_hub
+                    .calls
+                    .lock()
+                    .map(|calls| calls.get(&call_id).is_some_and(|c| c.callee_peer.is_none()))
+                    .unwrap_or(false);
+                if unanswered {
+                    finish_call(&peers, &call_hub, &call_id, "no_answer");
+                }
+            });
+        }
+        ClientToServer::CallAnswer { call_id, accept } => {
+            let Some((_, user_id)) = get_peer_identity(peers, id) else { return };
+            update_peer_activity(peers, id);
+            if !accept {
+                let ringing_us = call_hub
+                    .calls
+                    .lock()
+                    .map(|calls| calls.get(&call_id).is_some_and(|c| c.callee_user == user_id && c.callee_peer.is_none()))
+                    .unwrap_or(false);
+                if ringing_us {
+                    finish_call(peers, call_hub, &call_id, "declined");
+                }
+                return;
+            }
+
+            let caller_peer = {
+                let Ok(mut calls) = call_hub.calls.lock() else { return };
+                match calls.get_mut(&call_id) {
+                    Some(call) if call.callee_user == user_id && call.callee_peer.is_none() => {
+                        call.callee_peer = Some(id);
+                        call.caller_peer
+                    }
+                    _ => return,
                 }
             };
-            
-            update_peer_activity(peers, id);
-            
-            // Generate a unique Jitsi Meet room URL (Free!)
-            let random_id = {
-                let mut rng = rand::thread_rng();
-                rng.gen::<u32>()
-            };
-            let room_name = format!("BlastMessenger-{}-{}", 
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                random_id
-            );
-            // Using Jitsi's free public instance
-            let room_url = format!("https://meet.jit.si/{}", room_name);
-            
-            // Send room URL to target user
-            if let Ok(Some(target_id)) = get_user_id_by_name(db, &to).await {
-                let target_tx = {
-                    if let Ok(guard) = peers.lock() {
-                        guard
-                            .values()
-                            .find(|peer| peer.user_id == Some(target_id))
-                            .map(|peer| peer.tx.clone())
-                    } else {
-                        None
-                    }
-                };
-                
-                if let Some(tx) = target_tx {
-                    let _ = tx.send(Message::Text(
-                        serde_json::to_string(&ServerToClient::IncomingVideoCall {
-                            from: from.clone(),
-                            room_url: room_url.clone(),
-                        }).unwrap()
-                    ));
+            send_to_peer(peers, caller_peer, ServerToClient::CallAccepted { call_id: call_id.clone() });
+            // Stop the ringing on the callee's other logged-in sessions
+            for session in peers_for_user(peers, user_id) {
+                if session != id {
+                    send_to_peer(peers, session, ServerToClient::CallEnded {
+                        call_id: call_id.clone(),
+                        reason: "answered_elsewhere".to_string(),
+                    });
                 }
             }
-            
-            // Send confirmation to caller
-            send_to_peer(
-                peers,
-                id,
-                ServerToClient::IncomingVideoCall {
-                    from: to.clone(),
-                    room_url,
-                },
-            );
         }
-        ClientToServer::VideoCallResponse { from: _, room_url: _ } => {
-            // This is handled by the IncomingVideoCall message
-            // No additional server action needed
+        ClientToServer::CallSignal { call_id, data } => {
+            let other = call_hub.calls.lock().ok().and_then(|calls| {
+                let call = calls.get(&call_id)?;
+                if call.caller_peer == id {
+                    call.callee_peer
+                } else if call.callee_peer == Some(id) {
+                    Some(call.caller_peer)
+                } else {
+                    None
+                }
+            });
+            if let Some(other) = other {
+                send_to_peer(peers, other, ServerToClient::CallSignal { call_id, data });
+            }
+        }
+        ClientToServer::CallHangup { call_id } => {
+            let Some((_, user_id)) = get_peer_identity(peers, id) else { return };
+            // A ringing callee session hanging up is a decline
+            let reason = call_hub.calls.lock().ok().and_then(|calls| {
+                let call = calls.get(&call_id)?;
+                if call.caller_peer == id || call.callee_peer == Some(id) {
+                    Some("hangup")
+                } else if call.callee_user == user_id && call.callee_peer.is_none() {
+                    Some("declined")
+                } else {
+                    None
+                }
+            });
+            if let Some(reason) = reason {
+                finish_call(peers, call_hub, &call_id, reason);
+            }
         }
         ClientToServer::AdminListUsers => {
             let requester = match get_peer_identity(peers, id) {
@@ -1341,6 +1468,37 @@ fn get_peer_by_user_id(peers: &Arc<Mutex<HashMap<usize, Peer>>>, user_id: i64) -
         guard.iter().find(|(_, peer)| peer.user_id == Some(user_id))
             .map(|(id, peer)| (*id, peer.username.clone()))
     })
+}
+
+fn peers_for_user(peers: &Arc<Mutex<HashMap<usize, Peer>>>, user_id: i64) -> Vec<usize> {
+    peers
+        .lock()
+        .map(|guard| {
+            guard
+                .iter()
+                .filter(|(_, peer)| peer.user_id == Some(user_id))
+                .map(|(id, _)| *id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Remove a call and tell everyone involved (both parties, or every ringing callee session).
+fn finish_call(peers: &Arc<Mutex<HashMap<usize, Peer>>>, call_hub: &CallHub, call_id: &str, reason: &str) {
+    let Some(call) = call_hub.calls.lock().ok().and_then(|mut calls| calls.remove(call_id)) else {
+        return;
+    };
+    let mut notify = vec![call.caller_peer];
+    match call.callee_peer {
+        Some(peer) => notify.push(peer),
+        None => notify.extend(peers_for_user(peers, call.callee_user)),
+    }
+    for peer in notify {
+        send_to_peer(peers, peer, ServerToClient::CallEnded {
+            call_id: call_id.to_string(),
+            reason: reason.to_string(),
+        });
+    }
 }
 
 fn get_peer_away_message(peers: &Arc<Mutex<HashMap<usize, Peer>>>, user_id: i64) -> Option<String> {
