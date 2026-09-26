@@ -127,6 +127,16 @@ async fn main() {
         ice_servers,
     });
 
+    // Behind Railway's proxy every connection arrives from a proxy address, which would
+    // lump unrelated users into one per-IP connection limit and login lockout.
+    let trust_proxy = std::env::var("TRUST_PROXY_HEADERS").is_ok_and(|v| v == "1" || v == "true")
+        || ["RAILWAY_ENVIRONMENT_NAME", "RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID"]
+            .iter()
+            .any(|name| std::env::var(name).is_ok());
+    if trust_proxy {
+        println!("Using proxy headers (X-Real-IP / X-Forwarded-For) for client IPs");
+    }
+
     let peers: Arc<Mutex<HashMap<usize, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
     let rate_limits: Arc<Mutex<HashMap<i64, RateState>>> = Arc::new(Mutex::new(HashMap::new()));
     let ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -141,19 +151,6 @@ async fn main() {
             }
         };
 
-        let client_ip = addr.ip();
-
-        // Check connection limit per IP
-        {
-            let mut ip_map = ip_connections.lock().unwrap();
-            let count = ip_map.entry(client_ip).or_insert(0);
-            if *count >= MAX_CONNECTIONS_PER_IP {
-                eprintln!("Connection limit reached for IP {client_ip}, rejecting");
-                continue;
-            }
-            *count += 1;
-        }
-
         let peer_map = Arc::clone(&peers);
         let db = db.clone();
         let redis = Arc::clone(&redis);
@@ -164,6 +161,31 @@ async fn main() {
         let call_hub = Arc::clone(&call_hub);
 
         tokio::spawn(async move {
+            let mut stream = stream;
+            let client_ip = resolve_client_ip(&stream, addr.ip(), trust_proxy).await;
+
+            // Check connection limit per IP
+            let over_limit = {
+                let mut ip_map = ip_connections.lock().unwrap();
+                let count = ip_map.entry(client_ip).or_insert(0);
+                if *count >= MAX_CONNECTIONS_PER_IP {
+                    true
+                } else {
+                    *count += 1;
+                    false
+                }
+            };
+            if over_limit {
+                eprintln!("Connection limit reached for IP {client_ip}, rejecting");
+                // Answer instead of hanging up silently, so the client fails fast
+                // rather than sitting on its login timeout
+                use tokio::io::AsyncWriteExt;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                return;
+            }
+
             if let Err(err) = handle_connection(stream, client_ip, peer_map, db, redis, rate_limits, login_attempts, admin_usernames, call_hub).await {
                 eprintln!("connection error: {err}");
             }
@@ -177,6 +199,38 @@ async fn main() {
             }
         });
     }
+}
+
+/// The address to apply per-IP limits to. Without a trusted proxy that's the socket peer;
+/// behind one, it's the client address the proxy reports in the request headers.
+async fn resolve_client_ip(stream: &tokio::net::TcpStream, socket_ip: IpAddr, trust_proxy: bool) -> IpAddr {
+    if !trust_proxy {
+        return socket_ip;
+    }
+    let mut buf = [0u8; 8192];
+    let n = match tokio::time::timeout(Duration::from_secs(10), stream.peek(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        _ => return socket_ip,
+    };
+    forwarded_client_ip(&String::from_utf8_lossy(&buf[..n])).unwrap_or(socket_ip)
+}
+
+fn forwarded_client_ip(request: &str) -> Option<IpAddr> {
+    let header = |name: &str| {
+        request
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+            })
+    };
+    // X-Real-IP is written by the proxy itself. In X-Forwarded-For only the last entry is
+    // the proxy's own; anything before it came from the client and can be forged.
+    header("x-real-ip")
+        .and_then(|ip| ip.parse().ok())
+        .or_else(|| header("x-forwarded-for")?.rsplit(',').next()?.trim().parse().ok())
 }
 
 async fn handle_connection(
@@ -2449,5 +2503,29 @@ fn broadcast_to_room(peers: &Arc<Mutex<HashMap<usize, Peer>>>, room_id: &str, pa
 
     for tx in targets {
         let _ = tx.send(Message::Text(text.clone()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forwarded_client_ip;
+
+    #[test]
+    fn prefers_x_real_ip() {
+        let req = "GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 1.1.1.1, 2.2.2.2\r\nX-Real-IP: 3.3.3.3\r\n\r\n";
+        assert_eq!(forwarded_client_ip(req), Some("3.3.3.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn uses_last_forwarded_hop_so_clients_cant_spoof() {
+        let req = "GET / HTTP/1.1\r\nx-forwarded-for: 6.6.6.6, 203.0.113.9\r\n\r\n";
+        assert_eq!(forwarded_client_ip(req), Some("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn ignores_body_and_garbage() {
+        assert_eq!(forwarded_client_ip("GET / HTTP/1.1\r\nHost: x\r\n\r\nX-Real-IP: 9.9.9.9"), None);
+        assert_eq!(forwarded_client_ip("GET / HTTP/1.1\r\nX-Real-IP: not-an-ip\r\n\r\n"), None);
+        assert_eq!(forwarded_client_ip("GET / HTTP/1.1\r\nX-Real-IP: 2001:db8::1\r\n\r\n"), Some("2001:db8::1".parse().unwrap()));
     }
 }
