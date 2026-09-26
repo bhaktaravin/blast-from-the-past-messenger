@@ -3,7 +3,7 @@
 <head>
     <link data-trunk rel="rust" data-wasm-opt="z" data-bin="chatmessagediscordclone" />
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta http-equiv="X-UA-Compatible" content="ie=edge">
     <!-- Prevent extension interference -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'wasm-unsafe-eval' https://unpkg.com https://8x8.vc https://*.jitsi.net; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline' https://unpkg.com https://8x8.vc https://*.jitsi.net; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: https:; media-src 'self' blob:; frame-src https://8x8.vc https://*.jitsi.net;">
@@ -21,6 +21,9 @@
             width: 100%;
             height: 100%;
             overflow: hidden;
+            overscroll-behavior: none;
+            touch-action: none;
+            -webkit-text-size-adjust: 100%;
             font-family: monospace;
             background: linear-gradient(180deg, #1e1c1a 0%, #2e2a26 100%);
         }
@@ -53,6 +56,14 @@
         canvas {
             width: 100%;
             height: 100%;
+            touch-action: none;
+        }
+
+        /* eframe focuses a hidden <input> to raise the mobile keyboard. iOS
+           Safari auto-zooms the page when an input's font is under 16px and
+           never zooms back out, leaving the canvas magnified. */
+        input, textarea {
+            font-size: 16px !important;
         }
         
         /* Video call modal */
