@@ -248,17 +248,11 @@ async fn handle_connection(
         );
     }
 
-    send_to_all(
-        &peers,
-        ServerToClient::Welcome {
-            message: "Welcome to the Retro Chat Server".to_string(),
-        },
-    );
     send_to_peer(
         &peers,
         id,
-        ServerToClient::System {
-            message: "Please log in or register to continue.".to_string(),
+        ServerToClient::Welcome {
+            message: "Welcome to the Retro Chat Server".to_string(),
         },
     );
     broadcast_presence(&peers);

@@ -4487,9 +4487,8 @@ where
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(event) = serde_json::from_str::<ServerToClient>(&text) {
                             match event {
-                                ServerToClient::Welcome { message } => {
-                                    let _ = net_tx.send(NetToUi::Chat { from: "Server".to_string(), body: message });
-                                }
+                                // Connection greeting — not worth a chat log line on every (re)connect
+                                ServerToClient::Welcome { .. } => {}
                                 ServerToClient::AuthOk { username, is_admin } => {
                                     let _ = net_tx.send(NetToUi::AuthOk { username, is_admin });
                                 }

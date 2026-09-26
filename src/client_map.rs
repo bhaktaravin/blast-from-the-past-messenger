@@ -7,12 +7,8 @@ use chatmessagediscordclone::protocol::{ClientToServer, ServerToClient};
 
 pub fn server_to_ui(event: ServerToClient) -> Option<NetToUi> {
     Some(match event {
-        ServerToClient::Welcome { message } => {
-            NetToUi::Chat {
-                from: "Server".to_string(),
-                body: message,
-            }
-        }
+        // Connection greeting — not worth a chat log line on every (re)connect
+        ServerToClient::Welcome { .. } => return None,
         ServerToClient::AuthOk { username, is_admin } => NetToUi::AuthOk { username, is_admin },
         ServerToClient::AuthError { message } => NetToUi::AuthError(message),
         ServerToClient::Presence { users } => NetToUi::Presence(users),
