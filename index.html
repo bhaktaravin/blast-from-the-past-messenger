@@ -3,8 +3,8 @@
 <head>
     
 <script type="module">
-import init, * as bindings from '/blast-from-the-past-messenger/chatmessagediscordclone-2bd70e92bc8ec870.js';
-const wasm = await init({ module_or_path: '/blast-from-the-past-messenger/chatmessagediscordclone-2bd70e92bc8ec870_bg.wasm' });
+import init, * as bindings from '/blast-from-the-past-messenger/chatmessagediscordclone-b75453d3ceb159dd.js';
+const wasm = await init({ module_or_path: '/blast-from-the-past-messenger/chatmessagediscordclone-b75453d3ceb159dd_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -28,6 +28,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             padding: 0;
             width: 100%;
             height: 100%;
+            height: 100dvh; /* excludes the mobile browser address bar */
             overflow: hidden;
             overscroll-behavior: none;
             touch-action: none;
@@ -62,6 +63,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         }
 
         canvas {
+            display: block;
             width: 100%;
             height: 100%;
             touch-action: none;
@@ -239,8 +241,13 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             padding: 5px 10px;
             border-radius: 3px;
         }
+
+        /* the badge would cover the Send button on phones */
+        @media (max-width: 700px) {
+            .status { display: none; }
+        }
     </style>
-<link rel="modulepreload" href="/blast-from-the-past-messenger/chatmessagediscordclone-2bd70e92bc8ec870.js" crossorigin="anonymous" integrity="sha384-YMiS4g7MtfyFArYUNlawJzYRtjrbRwTttMr5Du/VMfF9zevvb5S/nBwtR/4K51ID"><link rel="preload" href="/blast-from-the-past-messenger/chatmessagediscordclone-2bd70e92bc8ec870_bg.wasm" crossorigin="anonymous" integrity="sha384-zd2xW1bYeh9AY0Ses6t68d0aINJ66JTSIu90a1jl2iVGU8Sz1NWxi5xyESf0DMLd" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/blast-from-the-past-messenger/chatmessagediscordclone-b75453d3ceb159dd.js" crossorigin="anonymous" integrity="sha384-VisPTXZXG67UHMR9GHL7w6FIfCO5M4VRdlh6Y1UJVMao4GZeWPN/Y5dId1JMZY5V"><link rel="preload" href="/blast-from-the-past-messenger/chatmessagediscordclone-b75453d3ceb159dd_bg.wasm" crossorigin="anonymous" integrity="sha384-zO9OB5dUEYSUMCFzEI41sHYnwmzfxiQzR1Tp4GbIVKgHxJZIRGlicd785B0jbKjU" as="fetch" type="application/wasm"></head>
 <body>
     <div id="loading">
         <div class="spinner"></div>
