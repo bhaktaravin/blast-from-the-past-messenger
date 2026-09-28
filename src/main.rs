@@ -358,6 +358,10 @@ struct AolApp {
     typing_sounds: bool,
     // Display settings
     font_size: f32,
+    /// UI zoom (egui zoom factor); adjustable with the A-/A+ buttons, handy on phones
+    ui_zoom: f32,
+    /// On narrow (phone) screens the buddy list and chat are shown one at a time
+    mobile_show_buddies: bool,
     show_settings_modal: bool,
     // Chat rooms
     chat_rooms: Vec<(String, String, i32)>, // (id, name, member_count)
@@ -552,6 +556,9 @@ impl AolApp {
         cc.egui_ctx.set_style(style);
         apply_theme(&cc.egui_ctx, Theme::MidnightAmber);
 
+        let ui_zoom = load_ui_zoom();
+        cc.egui_ctx.set_zoom_factor(ui_zoom);
+
         Self {
             screen: Screen::SignIn,
             network: spawn_network(),
@@ -602,6 +609,8 @@ impl AolApp {
             sound_volume: 0.8,
             typing_sounds: true,
             font_size: 14.0,
+            ui_zoom,
+            mobile_show_buddies: true,
             show_settings_modal: false,
             pending_friend_requests: Vec::new(),
             show_friend_requests_modal: false,
@@ -1767,7 +1776,33 @@ impl AolApp {
         let _ = self.network.tx.send(action);
     }
 
+    /// Narrow screens (phones) get a single-column layout.
+    fn is_compact(ctx: &egui::Context) -> bool {
+        ctx.screen_rect().width() < COMPACT_WIDTH
+    }
+
+    fn set_ui_zoom(&mut self, ctx: &egui::Context, zoom: f32) {
+        self.ui_zoom = (zoom * 10.0).round() / 10.0;
+        self.ui_zoom = self.ui_zoom.clamp(MIN_UI_ZOOM, MAX_UI_ZOOM);
+        ctx.set_zoom_factor(self.ui_zoom);
+        save_ui_zoom(self.ui_zoom);
+    }
+
+    /// Small "A- 100% A+" control for resizing the whole UI.
+    fn zoom_controls(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        if ui.small_button("A+").on_hover_text("Make everything bigger").clicked() {
+            self.set_ui_zoom(ctx, self.ui_zoom + 0.1);
+        }
+        if ui.small_button(format!("{:.0}%", self.ui_zoom * 100.0)).on_hover_text("Reset size").clicked() {
+            self.set_ui_zoom(ctx, default_ui_zoom());
+        }
+        if ui.small_button("A-").on_hover_text("Make everything smaller").clicked() {
+            self.set_ui_zoom(ctx, self.ui_zoom - 0.1);
+        }
+    }
+
     fn select_target(&mut self, target: ChatTarget) {
+        self.mobile_show_buddies = false;
         if self.selected_target == target {
             return;
         }
@@ -1844,6 +1879,11 @@ impl AolApp {
 impl eframe::App for AolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx, self.theme);
+        if (ctx.zoom_factor() - self.ui_zoom).abs() > f32::EPSILON {
+            self.ui_zoom = ctx.zoom_factor();
+            save_ui_zoom(self.ui_zoom);
+        }
+        let compact = Self::is_compact(ctx);
 
         // Nudge screen shake
         if self.nudge_time > 0.0 {
@@ -2025,8 +2065,10 @@ impl eframe::App for AolApp {
 
                 // ── top bar ──────────────────────────────────────────────
                 egui::TopBottomPanel::top("signin_top").show(ctx, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.colored_label(amber, "◈ AOL-Style Messenger");
+                        ui.separator();
+                        self.zoom_controls(ctx, ui);
                         ui.separator();
                         let bg_label = if self.show_background { "BG: On" } else { "BG: Off" };
                         if ui.button(bg_label).clicked() { self.show_background = !self.show_background; }
@@ -2156,8 +2198,9 @@ impl eframe::App for AolApp {
                                 .corner_radius(egui::CornerRadius::same(6.0 as u8))
                                 .inner_margin(egui::Margin::same(16.0 as i8))
                                 .show(ui, |ui| {
-                                    ui.set_min_width(480.0);
-                                    ui.set_max_width(480.0);
+                                    let w = 480.0_f32.min(ui.available_width() - 32.0);
+                                    ui.set_min_width(w);
+                                    ui.set_max_width(w);
                                     for (i, line) in boot_lines.iter().enumerate() {
                                         if i > self.boot_line { break; }
                                         let color = if i == self.boot_line {
@@ -2237,8 +2280,9 @@ impl eframe::App for AolApp {
                             .corner_radius(egui::CornerRadius::same(10.0 as u8))
                             .inner_margin(egui::Margin::same(20.0 as i8))
                             .show(ui, |ui| {
-                                ui.set_min_width(400.0);
-                                ui.set_max_width(450.0);
+                                let avail = ui.available_width() - 40.0;
+                                ui.set_min_width(400.0_f32.min(avail));
+                                ui.set_max_width(450.0_f32.min(avail));
 
                                 ui.horizontal(|ui| {
                                     if ui.selectable_label(self.auth_mode == AuthMode::Login, "Sign In").clicked() {
@@ -2346,7 +2390,7 @@ impl eframe::App for AolApp {
                                         .corner_radius(egui::CornerRadius::same(4.0 as u8))
                                         .inner_margin(egui::Margin::same(10.0 as i8))
                                         .show(ui, |ui| {
-                                            ui.set_min_width(320.0);
+                                            ui.set_min_width(320.0_f32.min(ui.available_width()));
                                             for (i, line) in modem_script.iter().enumerate() {
                                                 if i > self.modem_line { break; }
                                                 let text = if i == self.modem_line {
@@ -2398,7 +2442,7 @@ impl eframe::App for AolApp {
                                         .corner_radius(egui::CornerRadius::same(4.0 as u8))
                                         .inner_margin(egui::Margin::same(10.0 as i8))
                                         .show(ui, |ui| {
-                                            ui.set_min_width(320.0);
+                                            ui.set_min_width(320.0_f32.min(ui.available_width()));
                                             ui.label(egui::RichText::new("✓ AUTHENTICATION SUCCESSFUL").monospace().size(12.0).color(success_color).strong());
                                             ui.label(egui::RichText::new("Welcome back!").monospace().size(11.0).color(success_color));
                                             ui.add_space(4.0);
@@ -2442,7 +2486,7 @@ impl eframe::App for AolApp {
                                         .corner_radius(egui::CornerRadius::same(4.0 as u8))
                                         .inner_margin(egui::Margin::same(10.0 as i8))
                                         .show(ui, |ui| {
-                                            ui.set_min_width(320.0);
+                                            ui.set_min_width(320.0_f32.min(ui.available_width()));
                                             ui.label(egui::RichText::new("❌ AUTHENTICATION FAILED").monospace().size(12.0).color(error_color).strong());
                                             ui.label(egui::RichText::new(&self.status).monospace().size(11.0).color(error_color));
                                         });
@@ -2489,11 +2533,18 @@ impl eframe::App for AolApp {
 
                 egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
                     // First row: Title, status, user info, and main actions
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.heading("AOL Messenger");
-                        ui.add_space(8.0);
-                        ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        if compact {
+                            let label = if self.mobile_show_buddies { "💬 Chat" } else { "☰ Buddies" };
+                            if ui.button(label).clicked() {
+                                self.mobile_show_buddies = !self.mobile_show_buddies;
+                            }
+                        } else {
+                            ui.add_space(8.0);
+                            ui.heading("AOL Messenger");
+                            ui.add_space(8.0);
+                            ui.separator();
+                        }
                         
                         if let Some(name) = &self.logged_in_user {
                             ui.label(format!("👤 {name}"));
@@ -2551,10 +2602,16 @@ impl eframe::App for AolApp {
                             if ui.button("➕").on_hover_text("Add Friend").clicked() {
                                 self.show_add_friend_modal = true;
                             }
+
+                            if !compact {
+                                ui.separator();
+                                self.zoom_controls(ctx, ui);
+                            }
                         });
                     });
                     
-                    // Second row: Away message and custom status
+                    // Second row: Away message and custom status (tucked into Settings on phones)
+                    if !compact {
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
                         ui.label("Away:");
@@ -2581,6 +2638,7 @@ impl eframe::App for AolApp {
                             self.custom_status.clear();
                         }
                     });
+                    }
                     // Settings modal
                     if self.show_settings_modal {
                         let mut open = true;
@@ -2589,12 +2647,52 @@ impl eframe::App for AolApp {
                             .collapsible(false)
                             .resizable(false)
                             .default_size([380.0, 400.0])
+                            .max_width(ctx.screen_rect().width() - 24.0)
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                             .show(ctx, |ui| {
+                              egui::ScrollArea::vertical()
+                                .max_height(ctx.screen_rect().height() - 120.0)
+                                .show(ui, |ui| {
+                                // Display size
+                                ui.label("Display Size");
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    self.zoom_controls(ctx, ui);
+                                });
+                                ui.add_space(12.0);
+
+                                if compact {
+                                    ui.label("Away / Status");
+                                    ui.separator();
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::TextEdit::singleline(&mut self.away_text)
+                                            .hint_text("Away message")
+                                            .desired_width(ui.available_width() - 50.0));
+                                        if ui.small_button("Set").clicked() {
+                                            self.send_away();
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::TextEdit::singleline(&mut self.custom_status)
+                                            .hint_text("🎮 Playing Halo")
+                                            .desired_width(ui.available_width() - 50.0));
+                                        if ui.small_button("Set").clicked() {
+                                            let status = if self.custom_status.trim().is_empty() {
+                                                None
+                                            } else {
+                                                Some(Self::sanitize_input(&self.custom_status))
+                                            };
+                                            let _ = self.network.tx.send(UiToNet::SetStatus { status });
+                                            self.custom_status.clear();
+                                        }
+                                    });
+                                    ui.add_space(12.0);
+                                }
+
                                 // Theme
                                 ui.label("Theme");
                                 ui.separator();
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     let themes = [
                                         (Theme::MidnightAmber, "🟠 Midnight Amber"),
                                         (Theme::Dark,          "⚫ Dark"),
@@ -2662,7 +2760,7 @@ impl eframe::App for AolApp {
                                 if ui.input(|i| i.pointer.any_click()) {
                                     self.save_settings();
                                 }
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Test:");
                                     if ui.small_button("🔔 Sign On").clicked() {
                                         self.audio_manager.play(SoundEffect::BuddySignOn);
@@ -2742,6 +2840,7 @@ impl eframe::App for AolApp {
                                     self.save_settings();
                                     self.show_settings_modal = false;
                                 }
+                                });
                             });
                         if !open {
                             self.show_settings_modal = false;
@@ -2828,6 +2927,7 @@ impl eframe::App for AolApp {
                     // Modal for Add Friend
                     if self.show_add_friend_modal {
                         egui::Window::new("Add Friend")
+                            .max_width(ctx.screen_rect().width() - 24.0)
                             .collapsible(false)
                             .resizable(false)
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2865,6 +2965,7 @@ impl eframe::App for AolApp {
                     // Modal for Friend Requests
                     if self.show_friend_requests_modal {
                         egui::Window::new("Friend Requests")
+                            .max_width(ctx.screen_rect().width() - 24.0)
                             .collapsible(false)
                             .resizable(true)
                             .default_size([400.0, 300.0])
@@ -2901,6 +3002,7 @@ impl eframe::App for AolApp {
                     // Modal for Avatar Upload
                     if self.show_avatar_modal {
                         egui::Window::new("Change Avatar")
+                            .max_width(ctx.screen_rect().width() - 24.0)
                             .collapsible(false)
                             .resizable(false)
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2959,6 +3061,7 @@ impl eframe::App for AolApp {
                     // Modal for creating new buddy group
                     if self.show_group_modal {
                         egui::Window::new("Create Buddy Group")
+                            .max_width(ctx.screen_rect().width() - 24.0)
                             .collapsible(false)
                             .resizable(false)
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2998,6 +3101,7 @@ impl eframe::App for AolApp {
                     if let Some(ref username) = self.viewing_profile.clone() {
                         let mut close_modal = false;
                         egui::Window::new(format!("Profile: {}", username))
+                            .max_width(ctx.screen_rect().width() - 24.0)
                             .collapsible(false)
                             .resizable(false)
                             .default_size([400.0, 300.0])
@@ -3135,10 +3239,15 @@ impl eframe::App for AolApp {
                     }
                 }
 
-                egui::SidePanel::left("buddy_list")
+                let show_buddy_list = !compact || self.mobile_show_buddies;
+                let mut buddy_panel = egui::SidePanel::left("buddy_list")
                     .resizable(false)
-                    .min_width(200.0)
-                    .show(ctx, |ui| {
+                    .min_width(200.0);
+                if compact {
+                    buddy_panel = buddy_panel.exact_width(ctx.screen_rect().width());
+                }
+                buddy_panel
+                    .show_animated(ctx, show_buddy_list, |ui| {
                         ui.heading("Buddy List");
                         ui.separator();
                         // Lobby with unread badge
@@ -3232,6 +3341,7 @@ impl eframe::App for AolApp {
                         // Room creation modal
                         if self.show_room_creation_modal {
                             egui::Window::new("Create Chat Room")
+                            .max_width(ctx.screen_rect().width() - 24.0)
                                 .collapsible(false)
                                 .resizable(false)
                                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -3545,8 +3655,9 @@ impl eframe::App for AolApp {
                         .id(egui::Id::new(format!("dm_window_{}", peer)))
                         .open(&mut open)
                         .resizable(true)
-                        .default_size([380.0, 320.0])
-                        .min_size([280.0, 200.0])
+                        .default_size([380.0_f32.min(ctx.screen_rect().width() - 24.0), 320.0])
+                        .min_size([280.0_f32.min(ctx.screen_rect().width() - 24.0), 200.0])
+                        .max_width(ctx.screen_rect().width() - 16.0)
                         .show(ctx, |ui| {
                             if call_bridge::SUPPORTED {
                                 ui.horizontal(|ui| {
@@ -3626,6 +3737,7 @@ impl eframe::App for AolApp {
                     self.start_call(peer);
                 }
 
+                if !(compact && self.mobile_show_buddies) {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let heading = match &self.selected_target {
                         ChatTarget::Lobby => "Chat Log - Lobby".to_string(),
@@ -3640,7 +3752,7 @@ impl eframe::App for AolApp {
                     };
                     ui.heading(heading);
                     ui.separator();
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let direct_name = match &self.selected_target {
                             ChatTarget::Direct(name) => Some(name.clone()),
                             _ => None,
@@ -3689,7 +3801,7 @@ impl eframe::App for AolApp {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.report_reason)
                                     .hint_text("Report reason")
-                                    .desired_width(160.0),
+                                    .desired_width(160.0_f32.min(ui.available_width() - 70.0)),
                             );
                             if ui.button("Report").clicked() {
                                 if !self.report_reason.trim().is_empty() {
@@ -3702,12 +3814,12 @@ impl eframe::App for AolApp {
                             }
                         }
                     });
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Search:");
                         let search_response = ui.add(
                             egui::TextEdit::singleline(&mut self.search_query)
                                 .hint_text("Find messages")
-                                .desired_width(200.0),
+                                .desired_width(200.0_f32.min(ui.available_width() - 20.0)),
                         );
                         let search_clicked = ui.button("Search Server").clicked();
                         let search_enter = search_response.lost_focus()
@@ -3951,8 +4063,8 @@ impl eframe::App for AolApp {
                     ui.horizontal(|ui| {
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.chat_input)
-                                .hint_text("Type a message and press Enter to send")
-                                .desired_width(f32::INFINITY),
+                                .hint_text(if compact { "Type a message" } else { "Type a message and press Enter to send" })
+                                .desired_width((ui.available_width() - 60.0).max(80.0)),
                         );
 
                         // Send on Enter (no modifier needed), or clicking Send
@@ -4030,6 +4142,7 @@ impl eframe::App for AolApp {
                     }); // end horizontal input
                     } // end else (not editing)
                 }); // end CentralPanel
+                }
             }
         }
     }
@@ -4967,6 +5080,48 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+// ── UI zoom ────────────────────────────────────────────────────────────
+const COMPACT_WIDTH: f32 = 600.0;
+const MIN_UI_ZOOM: f32 = 0.5;
+const MAX_UI_ZOOM: f32 = 2.0;
+const UI_ZOOM_KEY: &str = "bftp_ui_zoom";
+
+/// Phones start slightly zoomed out so more fits on screen.
+fn default_ui_zoom() -> f32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let width = web_sys::window()
+            .and_then(|w| w.inner_width().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1024.0);
+        if width < 480.0 {
+            return 0.9;
+        }
+    }
+    1.0
+}
+
+fn load_ui_zoom() -> f32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let stored = web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .and_then(|s| s.get_item(UI_ZOOM_KEY).ok().flatten())
+            .and_then(|v| v.parse::<f32>().ok());
+        if let Some(zoom) = stored {
+            return zoom.clamp(MIN_UI_ZOOM, MAX_UI_ZOOM);
+        }
+    }
+    default_ui_zoom()
+}
+
+fn save_ui_zoom(_zoom: f32) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(UI_ZOOM_KEY, &_zoom.to_string());
+    }
 }
 
 // Web entry point
