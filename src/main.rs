@@ -429,6 +429,14 @@ struct AolApp {
     reconnect_attempts: u32,
     reconnect_timer: f32,
     avatar_cache: AvatarCache,
+    // Compact (phone) layout: one screen at a time instead of side-by-side panels
+    compact_style_applied: Option<bool>,
+    mobile_show_chat: bool, // chat view vs. buddy list
+    mobile_show_search: bool,
+    // Web: a `#chat` history entry is pushed while a chat is open on a phone, so
+    // the Android back gesture returns to the buddy list instead of leaving the app
+    #[cfg(target_arch = "wasm32")]
+    back_nav_pushed: bool,
 }
 
 struct SearchResult {
@@ -662,6 +670,11 @@ impl AolApp {
             reconnect_attempts: 0,
             reconnect_timer: 0.0,
             avatar_cache: AvatarCache::new(),
+            compact_style_applied: None,
+            mobile_show_chat: false,
+            mobile_show_search: false,
+            #[cfg(target_arch = "wasm32")]
+            back_nav_pushed: false,
         }
     }
 
@@ -1244,6 +1257,10 @@ impl AolApp {
                     self.audio_manager.play(SoundEffect::MessageReceived);
                     // Auto-open DM window when a message arrives
                     self.dm_windows.entry(from.clone()).or_default();
+                    // ...and list the thread, which is how phones (no floating windows) reach it
+                    if !self.recent_threads.contains(&from) {
+                        self.recent_threads.insert(0, from.clone());
+                    }
                     if self.selected_target != target {
                         *self.unread_counts.entry(target).or_default() += 1;
                     }
@@ -1779,6 +1796,691 @@ impl AolApp {
         let _ = self.network.tx.send(UiToNet::FetchHistory { target });
     }
 
+    /// Open a chat from the buddy list. On phones this also swaps the buddy
+    /// list out for the chat view.
+    fn open_target(&mut self, target: ChatTarget) {
+        self.mobile_show_chat = true;
+        self.select_target(target);
+    }
+
+    /// Open a DM with a buddy: a floating window on desktop, the full-screen
+    /// chat view on phones (floating windows don't fit there).
+    fn open_dm(&mut self, username: String, compact: bool) {
+        if compact {
+            self.open_target(ChatTarget::Direct(username));
+            return;
+        }
+        let target = ChatTarget::Direct(username.clone());
+        self.dm_windows.entry(username).or_default();
+        if !self.messages.contains_key(&target) {
+            let _ = self.network.tx.send(UiToNet::FetchHistory { target });
+        }
+    }
+
+    /// Keep browser history in step with the phone layout's chat view.
+    ///
+    /// Opening a chat sets `#chat`, which adds a history entry; the back gesture
+    /// (or browser back) removes it, and eframe repaints on `hashchange`, so we
+    /// notice here and return to the buddy list. Leaving the chat any other way
+    /// (◀, logout, widening the window) pops our entry so history doesn't pile up.
+    #[cfg(target_arch = "wasm32")]
+    fn sync_back_navigation(&mut self, compact: bool) {
+        const CHAT_HASH: &str = "#chat";
+        let Some(window) = web_sys::window() else { return };
+        let location = window.location();
+        let Ok(history) = window.history() else { return };
+        let hash = location.hash().unwrap_or_default();
+
+        if self.back_nav_pushed && hash != CHAT_HASH {
+            // Back was pressed
+            self.back_nav_pushed = false;
+            self.mobile_show_chat = false;
+        } else if !self.back_nav_pushed && hash == CHAT_HASH {
+            // Left over from a reload while a chat was open; setting the same hash
+            // again wouldn't add an entry, so drop it from the URL
+            let url = format!(
+                "{}{}",
+                location.pathname().unwrap_or_default(),
+                location.search().unwrap_or_default()
+            );
+            let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&url));
+        }
+
+        let want = compact && self.screen == Screen::Chat && self.mobile_show_chat;
+        if want && !self.back_nav_pushed {
+            if location.set_hash(CHAT_HASH).is_ok() {
+                self.back_nav_pushed = true;
+            }
+        } else if !want && self.back_nav_pushed {
+            self.back_nav_pushed = false;
+            let _ = history.back();
+        }
+    }
+
+    fn logout(&mut self) {
+        // Clear saved credentials and reconnect state
+        let _ = std::fs::remove_file(self.credentials_file());
+        self.reconnect_credentials = None;
+        self.reconnect_attempts = 0;
+        self.reconnect_timer = 0.0;
+
+        // Disconnect and return to login
+        let _ = self.network.tx.send(UiToNet::Disconnect);
+        self.screen = Screen::SignIn;
+        self.logged_in_user = None;
+        self.is_admin = false;
+        self.show_admin_panel = false;
+        self.selected_target = ChatTarget::Lobby;
+        self.mobile_show_chat = false;
+        self.username.clear();
+        self.password.clear();
+        self.remember_me = false;
+    }
+
+    /// (online, total) buddies, not counting ourselves
+    fn buddy_counts(&self) -> (usize, usize) {
+        let others = self.buddies.iter().filter(|b| Some(&b.username) != self.logged_in_user.as_ref());
+        let online = others.clone().filter(|b| b.away.is_none()).count();
+        (online, others.count())
+    }
+
+    fn send_custom_status(&mut self) {
+        let status = if self.custom_status.trim().is_empty() {
+            None
+        } else {
+            Some(Self::sanitize_input(&self.custom_status))
+        };
+        let _ = self.network.tx.send(UiToNet::SetStatus { status });
+        self.custom_status.clear();
+    }
+
+    /// Phone top bar: one row, with everything else tucked into a ☰ menu.
+    fn draw_compact_top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if let Some(name) = &self.logged_in_user {
+                ui.label(egui::RichText::new(format!("👤 {name}")).strong());
+            }
+            let (online_count, total_buddies) = self.buddy_counts();
+            ui.label(format!("👥 {}/{}", online_count, total_buddies));
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let pending_count = self.pending_friend_requests.len();
+                let menu_label = if pending_count > 0 {
+                    format!("☰ ({})", pending_count)
+                } else {
+                    "☰".to_string()
+                };
+                ui.menu_button(menu_label, |ui| {
+                    ui.set_min_width(240.0);
+                    if ui.button("➕ Add Friend").clicked() {
+                        self.show_add_friend_modal = true;
+                        ui.close_menu();
+                    }
+                    if ui.button(format!("📬 Friend Requests ({})", pending_count)).clicked() {
+                        self.show_friend_requests_modal = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("⚙ Settings").clicked() {
+                        self.show_settings_modal = true;
+                        ui.close_menu();
+                    }
+                    if self.is_admin && ui.button("🛡 Admin Panel").clicked() {
+                        self.show_admin_panel = true;
+                        let _ = self.network.tx.send(UiToNet::AdminListUsers);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.label("Away message");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.away_text)
+                            .hint_text("Be right back...")
+                            .desired_width(160.0));
+                        if ui.button("Set").clicked() {
+                            self.send_away();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.label("Status");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.custom_status)
+                            .hint_text("🎮 Playing Halo")
+                            .desired_width(160.0));
+                        if ui.button("Set").clicked() {
+                            self.send_custom_status();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Logout").clicked() {
+                        self.logout();
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+    }
+
+    /// Leave/members for rooms; moderation, nudge and report for DMs. Returns
+    /// true once an action is taken, so the phone layout can close its menu.
+    fn draw_target_actions(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut acted = false;
+        let direct_name = match &self.selected_target {
+            ChatTarget::Direct(name) => Some(name.clone()),
+            _ => None,
+        };
+        let room_id = match &self.selected_target {
+            ChatTarget::Room(id) => Some(id.clone()),
+            _ => None,
+        };
+        if let Some(room_id) = room_id {
+            if ui.button("🚪 Leave Room").clicked() {
+                let _ = self.network.tx.send(UiToNet::LeaveChatRoom { room_id: room_id.clone() });
+                let _ = self.network.tx.send(UiToNet::FetchChatRooms);
+                self.select_target(ChatTarget::Lobby);
+                acted = true;
+            }
+            if ui.button("👥 Members").clicked() {
+                let _ = self.network.tx.send(UiToNet::FetchRoomMembers { room_id });
+                acted = true;
+            }
+        }
+        if let Some(name) = direct_name {
+            if ui.button("Block").clicked() {
+                self.send_moderation(UiToNet::Block { username: name.clone() });
+                acted = true;
+            }
+            if ui.button("Unblock").clicked() {
+                self.send_moderation(UiToNet::Unblock { username: name.clone() });
+                acted = true;
+            }
+            if ui.button("Mute").clicked() {
+                self.send_moderation(UiToNet::Mute { username: name.clone() });
+                acted = true;
+            }
+            if ui.button("Unmute").clicked() {
+                self.send_moderation(UiToNet::Unmute { username: name.clone() });
+                acted = true;
+            }
+            // E2E encryption toggle (native only)
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let has_e2e = self.e2e_shared_secrets.contains_key(&name);
+                let e2e_label = if has_e2e { "🔒 E2E On" } else { "🔓 Enable E2E" };
+                if ui.button(e2e_label).clicked() && !has_e2e {
+                    self.initiate_e2e_static(&name.clone());
+                    acted = true;
+                }
+            }
+            // Nudge button
+            if ui.button("💥 Nudge").clicked() {
+                let _ = self.network.tx.send(UiToNet::Nudge { to: name.clone() });
+                self.show_toast(format!("Nudged {}!", name), ToastKind::Info);
+                acted = true;
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.report_reason)
+                    .hint_text("Report reason")
+                    .desired_width(160.0),
+            );
+            if ui.button("Report").clicked() {
+                if !self.report_reason.trim().is_empty() {
+                    self.send_moderation(UiToNet::Report {
+                        username: name.clone(),
+                        reason: self.report_reason.trim().to_string(),
+                    });
+                    self.report_reason.clear();
+                    acted = true;
+                }
+            }
+        }
+        acted
+    }
+
+    fn draw_search_bar(&mut self, ui: &mut egui::Ui) {
+        ui.label("Search:");
+        let search_response = ui.add(
+            egui::TextEdit::singleline(&mut self.search_query)
+                .hint_text("Find messages")
+                .desired_width(200.0),
+        );
+        let search_clicked = ui.button("Search Server").clicked();
+        let search_enter = search_response.lost_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if search_clicked || search_enter {
+            let query = self.search_query.trim();
+            if !query.is_empty() {
+                self.search_in_progress = true;
+                let _ = self.network.tx.send(UiToNet::Search {
+                    target: self.selected_target.clone(),
+                    query: query.to_string(),
+                });
+            }
+        }
+        if ui.button("Clear").clicked() {
+            self.search_query.clear();
+            self.search_in_progress = false;
+            self.search_results.remove(&self.selected_target);
+        }
+        if self.search_in_progress {
+            ui.label("Searching...");
+        }
+    }
+
+    /// Reaction picker plus edit/delete (own messages) and reply. Returns true
+    /// once one is used, so the phone layout can close its menu.
+    fn draw_message_actions(&mut self, ui: &mut egui::Ui, message: &ChatMessage) -> bool {
+        let Some(msg_id) = message.id else {
+            return false;
+        };
+        let mut acted = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for emoji in ["👍","❤️","😂","😮","😢","🔥"] {
+                if ui.small_button(emoji).clicked() {
+                    let _ = self.network.tx.send(UiToNet::ReactToMessage {
+                        message_id: msg_id,
+                        emoji: emoji.to_string(),
+                    });
+                    acted = true;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if Some(&message.from) == self.logged_in_user.as_ref() {
+                if ui.small_button("✏️").on_hover_text("Edit").clicked() {
+                    self.editing_message = Some((msg_id, message.body.trim_end_matches(" ✏️").to_string()));
+                    acted = true;
+                }
+                if ui.small_button("🗑").on_hover_text("Delete").clicked() {
+                    let _ = self.network.tx.send(UiToNet::DeleteMessage { message_id: msg_id });
+                    acted = true;
+                }
+            }
+            if ui.small_button("↩️").on_hover_text("Reply").clicked() {
+                let snippet = message.body.chars().take(50).collect::<String>();
+                self.replying_to = Some((msg_id, message.from.clone(), snippet));
+                acted = true;
+            }
+        });
+        acted
+    }
+
+    /// Buddy list contents: the left side panel on desktop, the whole screen on phones.
+    fn draw_buddy_list(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, compact: bool) {
+        ui.heading("Buddy List");
+        ui.separator();
+        // Lobby with unread badge
+        ui.horizontal(|ui| {
+            let selected = self.selected_target == ChatTarget::Lobby;
+            if ui.selectable_label(selected, "Lobby").clicked() {
+                self.open_target(ChatTarget::Lobby);
+            }
+            if let Some(&count) = self.unread_counts.get(&ChatTarget::Lobby) {
+                if count > 0 {
+                    ui.label(egui::RichText::new(format!("●{}", count))
+                        .small().color(egui::Color32::from_rgb(220, 60, 60)));
+                }
+            }
+        });
+        ui.add_space(8.0);
+        ui.label("Recent DMs");
+        let recent_threads = self.recent_threads.clone();
+        for name in recent_threads {
+            let target = ChatTarget::Direct(name.clone());
+            ui.horizontal(|ui| {
+                if ui.selectable_label(self.selected_target == target, &name).clicked() {
+                    self.open_target(ChatTarget::Direct(name));
+                }
+                if let Some(&count) = self.unread_counts.get(&target) {
+                    if count > 0 {
+                        ui.label(egui::RichText::new(format!("●{}", count))
+                            .small().color(egui::Color32::from_rgb(220, 60, 60)));
+                    }
+                }
+            });
+        }
+        if self.recent_threads.is_empty() {
+            ui.label("No recent threads.");
+        }
+        ui.add_space(8.0);
+        ui.label("Direct messages");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.dm_target)
+                    .hint_text("Screen name"),
+            );
+            if ui.button("Start DM").clicked() {
+                let target = self.dm_target.trim();
+                if !target.is_empty() {
+                    self.open_target(ChatTarget::Direct(target.to_string()));
+                    self.dm_target.clear();
+                }
+            }
+        });
+        ui.add_space(8.0);
+
+        // ── Chat Rooms section ────────────────────────────
+        ui.horizontal(|ui| {
+            ui.colored_label(egui::Color32::from_rgb(100, 180, 255), "💬 Chat Rooms");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("➕").on_hover_text("Create Room").clicked() {
+                    self.show_room_creation_modal = true;
+                }
+                if ui.small_button("↻").on_hover_text("Refresh Rooms").clicked() {
+                    let _ = self.network.tx.send(UiToNet::FetchChatRooms);
+                }
+            });
+        });
+        ui.separator();
+
+        let rooms = self.chat_rooms.clone();
+        if rooms.is_empty() {
+            ui.label(egui::RichText::new("No rooms yet.").small().italics()
+                .color(egui::Color32::GRAY));
+        } else {
+            for (room_id, name, member_count) in &rooms {
+                let target = ChatTarget::Room(room_id.clone());
+                ui.horizontal(|ui| {
+                    let label = format!("# {} ({})", name, member_count);
+                    if ui.selectable_label(self.selected_target == target, label).clicked() {
+                        // Join room if not already in it
+                        let _ = self.network.tx.send(UiToNet::JoinChatRoom { room_id: room_id.clone() });
+                        self.open_target(target.clone());
+                    }
+                    if let Some(&count) = self.unread_counts.get(&target) {
+                        if count > 0 {
+                            ui.label(egui::RichText::new(format!("●{}", count))
+                                .small().color(egui::Color32::from_rgb(220, 60, 60)));
+                        }
+                    }
+                });
+            }
+        }
+
+        // Room creation modal
+        if self.show_room_creation_modal {
+            egui::Window::new("Create Chat Room")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Room name:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.new_room_name)
+                            .hint_text("e.g. Gaming, Music...")
+                            .desired_width(200.0)
+                    );
+                    resp.request_focus();
+                    ui.horizontal(|ui| {
+                        let can_create = !self.new_room_name.trim().is_empty();
+                        if ui.add_enabled(can_create, egui::Button::new("Create")).clicked()
+                            || (can_create && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        {
+                            let name = Self::sanitize_input(&self.new_room_name);
+                            let _ = self.network.tx.send(UiToNet::CreateChatRoom { name });
+                            self.new_room_name.clear();
+                            self.show_room_creation_modal = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.new_room_name.clear();
+                            self.show_room_creation_modal = false;
+                        }
+                    });
+                });
+        }
+
+        ui.add_space(8.0);
+
+        // Separate buddies by status (exclude self)
+        let buddies = self.buddies.clone();
+        let (online, away): (Vec<_>, Vec<_>) = buddies
+            .iter()
+            .filter(|b| Some(&b.username) != self.logged_in_user.as_ref())
+            .partition(|b| b.away.is_none());
+
+        // Online buddies section
+        if !online.is_empty() {
+            ui.colored_label(
+                egui::Color32::from_rgb(0, 200, 0),
+                format!("🟢 Online ({})", online.len())
+            );
+            ui.separator();
+
+            for buddy in &online {
+                ui.horizontal(|ui| {
+                    // Small profile circle or avatar
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(24.0, 24.0),
+                        egui::Sense::click(),
+                    );
+
+                    self.paint_buddy_avatar(ctx, ui, rect, buddy);
+
+                    if response.clicked() {
+                        self.viewing_profile = Some(buddy.username.clone());
+                        let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
+                    }
+
+                    response.on_hover_ui(|ui| {
+                        ui.vertical(|ui| {
+                            ui.heading(&buddy.username);
+                            if let Some(ref status) = buddy.status {
+                                ui.label(egui::RichText::new(status).italics());
+                            }
+                            if let Some(ref away_msg) = buddy.away {
+                                ui.label(egui::RichText::new(format!("Away: {}", away_msg)).color(egui::Color32::YELLOW));
+                            }
+                            let idle_text = format_idle_time(buddy.last_activity);
+                            if !idle_text.is_empty() {
+                                ui.label(egui::RichText::new(&idle_text).small().color(egui::Color32::GRAY));
+                            }
+                            ui.separator();
+                            ui.label("Click to view profile");
+                            ui.label("Right-click for options");
+                        });
+                    });
+
+                    let username_response = ui.selectable_label(
+                        self.dm_windows.contains_key(&buddy.username),
+                        &buddy.username
+                    );
+
+                    // Click or double-click opens DM window
+                    if username_response.clicked() || username_response.double_clicked() {
+                        self.open_dm(buddy.username.clone(), compact);
+                    }
+
+                    // Right-click context menu
+                    username_response.context_menu(|ui| {
+                        if ui.button("💬 Send DM").clicked() {
+                            self.open_dm(buddy.username.clone(), compact);
+                            ui.close_menu();
+                        }
+                        if ui.button("📹 Video Call").clicked() {
+                            self.start_call(buddy.username.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("👤 View Profile").clicked() {
+                            self.viewing_profile = Some(buddy.username.clone());
+                            let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
+                            ui.close_menu();
+                        }
+                        if ui.button("?? Start E2E Encryption").clicked() {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            self.initiate_e2e_static(&buddy.username);
+                            ui.close_menu();
+                        }
+                        if ui.button("�💥 Nudge").clicked() {
+                            let _ = self.network.tx.send(UiToNet::Nudge { to: buddy.username.clone() });
+                            self.show_toast(format!("Nudged {}!", buddy.username), ToastKind::Info);
+                            ui.close_menu();
+                        }
+                        ui.menu_button("😉 Wink", |ui| {
+                            let emojis = ["😉", "😘", "👋", "💖", "✨", "🎉", "👍", "🔥"];
+                            for emoji in emojis {
+                                if ui.button(emoji).clicked() {
+                                    let _ = self.network.tx.send(UiToNet::Wink { 
+                                        to: buddy.username.clone(), 
+                                        emoji: emoji.to_string() 
+                                    });
+                                    self.show_toast(format!("Winked {} at {}!", emoji, buddy.username), ToastKind::Info);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.separator();
+                        ui.menu_button("📁 Add to Group", |ui| {
+                            let groups: Vec<String> = self.buddy_groups.keys().cloned().collect();
+                            for group_name in groups {
+                                if ui.button(&group_name).clicked() {
+                                    if let Some(group) = self.buddy_groups.get_mut(&group_name) {
+                                        if !group.contains(&buddy.username) {
+                                            group.push(buddy.username.clone());
+                                            self.save_buddy_groups();
+                                            self.show_toast(format!("Added {} to {}", buddy.username, group_name), ToastKind::Success);
+                                        }
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("➕ New Group...").clicked() {
+                                self.group_modal_username = Some(buddy.username.clone());
+                                self.show_group_modal = true;
+                                ui.close_menu();
+                            }
+                        });
+                    });
+
+                    // Show custom status if set
+                    if let Some(ref status) = buddy.status {
+                        ui.label(
+                            egui::RichText::new(status)
+                                .small()
+                                .color(egui::Color32::GRAY)
+                        );
+                    }
+
+                    // Show idle time
+                    let idle_text = format_idle_time(buddy.last_activity);
+                    if !idle_text.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&idle_text)
+                                .small()
+                                .italics()
+                                .color(egui::Color32::from_rgb(150, 150, 150))
+                        );
+                    }
+                });
+            }
+        }
+
+        ui.add_space(8.0);
+
+        // Away buddies section
+        if !away.is_empty() {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 200, 0),
+                format!("🟡 Away ({})", away.len())
+            );
+            ui.separator();
+
+            for buddy in &away {
+                ui.horizontal(|ui| {
+                    // Small profile circle or avatar
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(24.0, 24.0),
+                        egui::Sense::click(),
+                    );
+
+                    self.paint_buddy_avatar(ctx, ui, rect, buddy);
+
+                    if response.clicked() {
+                        self.viewing_profile = Some(buddy.username.clone());
+                        let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
+                    }
+
+                    let username_response = ui.selectable_label(
+                        self.dm_windows.contains_key(&buddy.username),
+                        &buddy.username
+                    );
+
+                    if username_response.clicked() || username_response.double_clicked() {
+                        self.open_dm(buddy.username.clone(), compact);
+                    }
+
+                    username_response.context_menu(|ui| {
+                        if ui.button("💬 Send DM").clicked() {
+                            self.open_dm(buddy.username.clone(), compact);
+                            ui.close_menu();
+                        }
+                        if ui.button("📹 Video Call").clicked() {
+                            self.start_call(buddy.username.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("👤 View Profile").clicked() {
+                            self.viewing_profile = Some(buddy.username.clone());
+                            let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
+                            ui.close_menu();
+                        }
+                        if ui.button("💥 Nudge").clicked() {
+                            let _ = self.network.tx.send(UiToNet::Nudge { to: buddy.username.clone() });
+                            self.show_toast(format!("Nudged {}!", buddy.username), ToastKind::Info);
+                            ui.close_menu();
+                        }
+                        ui.menu_button("😉 Wink", |ui| {
+                            let emojis = ["😉", "😘", "👋", "💖", "✨", "🎉", "👍", "🔥"];
+                            for emoji in emojis {
+                                if ui.button(emoji).clicked() {
+                                    let _ = self.network.tx.send(UiToNet::Wink { 
+                                        to: buddy.username.clone(), 
+                                        emoji: emoji.to_string() 
+                                    });
+                                    self.show_toast(format!("Winked {} at {}!", emoji, buddy.username), ToastKind::Info);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
+
+                    if let Some(ref away_msg) = buddy.away {
+                        ui.label(
+                            egui::RichText::new(format!("({})", away_msg))
+                                .italics()
+                                .small()
+                                .color(egui::Color32::GRAY)
+                        );
+                    }
+
+                    // Show custom status if set
+                    if let Some(ref status) = buddy.status {
+                        ui.label(
+                            egui::RichText::new(status)
+                                .small()
+                                .color(egui::Color32::GRAY)
+                        );
+                    }
+
+                    // Show idle time
+                    let idle_str = format_idle_time(buddy.last_activity);
+                    if !idle_str.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&idle_str)
+                                .small()
+                                .italics()
+                                .color(egui::Color32::from_rgb(150, 150, 150))
+                        );
+                    }
+                });
+            }
+        }
+
+        if online.is_empty() && away.is_empty() {
+            ui.label("No buddies online.");
+        }
+    }
+
     fn toggle_theme(&mut self, ctx: &egui::Context) {
         self.theme = match self.theme {
             Theme::Light => Theme::Dark,
@@ -1844,6 +2546,14 @@ impl AolApp {
 impl eframe::App for AolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx, self.theme);
+
+        let compact = is_compact(ctx);
+        if self.compact_style_applied != Some(compact) {
+            self.compact_style_applied = Some(compact);
+            apply_compact_spacing(ctx, compact);
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.sync_back_navigation(compact);
 
         // Nudge screen shake
         if self.nudge_time > 0.0 {
@@ -2025,7 +2735,7 @@ impl eframe::App for AolApp {
 
                 // ── top bar ──────────────────────────────────────────────
                 egui::TopBottomPanel::top("signin_top").show(ctx, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.colored_label(amber, "◈ AOL-Style Messenger");
                         ui.separator();
                         let bg_label = if self.show_background { "BG: On" } else { "BG: Off" };
@@ -2126,8 +2836,15 @@ impl eframe::App for AolApp {
                         }
                     }
 
+                    // Scrollable so the form stays reachable above a phone's keyboard
+                    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(12.0);
+                        // Fixed card widths, shrunk to fit narrow (phone) screens
+                        let avail_w = ui.available_width();
+                        let fit = move |w: f32| w.min(avail_w - 40.0).max(0.0);
+                        // Boxes nested inside the login card (card margins + their own)
+                        let fit_inner = move |w: f32| w.min(avail_w - 120.0).max(0.0);
 
                         // ── Boot sequence (shown until done) ─────────────
                         let boot_lines = [
@@ -2156,8 +2873,8 @@ impl eframe::App for AolApp {
                                 .corner_radius(egui::CornerRadius::same(6.0 as u8))
                                 .inner_margin(egui::Margin::same(16.0 as i8))
                                 .show(ui, |ui| {
-                                    ui.set_min_width(480.0);
-                                    ui.set_max_width(480.0);
+                                    ui.set_min_width(fit(480.0));
+                                    ui.set_max_width(fit(480.0));
                                     for (i, line) in boot_lines.iter().enumerate() {
                                         if i > self.boot_line { break; }
                                         let color = if i == self.boot_line {
@@ -2237,8 +2954,8 @@ impl eframe::App for AolApp {
                             .corner_radius(egui::CornerRadius::same(10.0 as u8))
                             .inner_margin(egui::Margin::same(20.0 as i8))
                             .show(ui, |ui| {
-                                ui.set_min_width(400.0);
-                                ui.set_max_width(450.0);
+                                ui.set_min_width(fit(400.0));
+                                ui.set_max_width(fit(450.0));
 
                                 ui.horizontal(|ui| {
                                     if ui.selectable_label(self.auth_mode == AuthMode::Login, "Sign In").clicked() {
@@ -2260,7 +2977,8 @@ impl eframe::App for AolApp {
                                     let pw_resp = ui.add(
                                         egui::TextEdit::singleline(&mut self.password)
                                             .password(!self.show_password)
-                                            .hint_text("Password"),
+                                            .hint_text("Password")
+                                            .desired_width((ui.available_width() - 90.0).min(280.0)),
                                     );
                                     ui.checkbox(&mut self.show_password, "Show");
                                     // Submit on Enter from password field
@@ -2276,7 +2994,8 @@ impl eframe::App for AolApp {
                                         ui.add(
                                             egui::TextEdit::singleline(&mut self.confirm_password)
                                                 .password(!self.show_confirm_password)
-                                                .hint_text("Confirm password"),
+                                                .hint_text("Confirm password")
+                                                .desired_width((ui.available_width() - 90.0).min(280.0)),
                                         );
                                         ui.checkbox(&mut self.show_confirm_password, "Show");
                                     });
@@ -2346,7 +3065,7 @@ impl eframe::App for AolApp {
                                         .corner_radius(egui::CornerRadius::same(4.0 as u8))
                                         .inner_margin(egui::Margin::same(10.0 as i8))
                                         .show(ui, |ui| {
-                                            ui.set_min_width(320.0);
+                                            ui.set_min_width(fit_inner(320.0));
                                             for (i, line) in modem_script.iter().enumerate() {
                                                 if i > self.modem_line { break; }
                                                 let text = if i == self.modem_line {
@@ -2398,7 +3117,7 @@ impl eframe::App for AolApp {
                                         .corner_radius(egui::CornerRadius::same(4.0 as u8))
                                         .inner_margin(egui::Margin::same(10.0 as i8))
                                         .show(ui, |ui| {
-                                            ui.set_min_width(320.0);
+                                            ui.set_min_width(fit_inner(320.0));
                                             ui.label(egui::RichText::new("✓ AUTHENTICATION SUCCESSFUL").monospace().size(12.0).color(success_color).strong());
                                             ui.label(egui::RichText::new("Welcome back!").monospace().size(11.0).color(success_color));
                                             ui.add_space(4.0);
@@ -2442,7 +3161,7 @@ impl eframe::App for AolApp {
                                         .corner_radius(egui::CornerRadius::same(4.0 as u8))
                                         .inner_margin(egui::Margin::same(10.0 as i8))
                                         .show(ui, |ui| {
-                                            ui.set_min_width(320.0);
+                                            ui.set_min_width(fit_inner(320.0));
                                             ui.label(egui::RichText::new("❌ AUTHENTICATION FAILED").monospace().size(12.0).color(error_color).strong());
                                             ui.label(egui::RichText::new(&self.status).monospace().size(11.0).color(error_color));
                                         });
@@ -2455,6 +3174,7 @@ impl eframe::App for AolApp {
                                     ui.colored_label(text_color, format!("Status: {}", self.status));
                                 }
                             });
+                    });
                     });
                 });
             }
@@ -2488,99 +3208,77 @@ impl eframe::App for AolApp {
                 });
 
                 egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-                    // First row: Title, status, user info, and main actions
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.heading("AOL Messenger");
-                        ui.add_space(8.0);
-                        ui.separator();
+                    if compact {
+                        self.draw_compact_top_bar(ui);
+                    } else {
+                        // First row: Title, status, user info, and main actions
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            ui.heading("AOL Messenger");
+                            ui.add_space(8.0);
+                            ui.separator();
                         
-                        if let Some(name) = &self.logged_in_user {
-                            ui.label(format!("👤 {name}"));
-                        }
+                            if let Some(name) = &self.logged_in_user {
+                                ui.label(format!("👤 {name}"));
+                            }
 
-                        ui.separator();
-                        let online_count = self.buddies.iter()
-                            .filter(|b| Some(&b.username) != self.logged_in_user.as_ref() && b.away.is_none())
-                            .count();
-                        let total_buddies = self.buddies.iter()
-                            .filter(|b| Some(&b.username) != self.logged_in_user.as_ref())
-                            .count();
-                        ui.label(format!("👥 {}/{}", online_count, total_buddies));
+                            ui.separator();
+                            let (online_count, total_buddies) = self.buddy_counts();
+                            ui.label(format!("👥 {}/{}", online_count, total_buddies));
                         
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Logout").clicked() {
-                                // Clear saved credentials and reconnect state
-                                let _ = std::fs::remove_file(self.credentials_file());
-                                self.reconnect_credentials = None;
-                                self.reconnect_attempts = 0;
-                                self.reconnect_timer = 0.0;
-                                
-                                // Disconnect and return to login
-                                let _ = self.network.tx.send(UiToNet::Disconnect);
-                                self.screen = Screen::SignIn;
-                                self.logged_in_user = None;
-                                self.is_admin = false;
-                                self.show_admin_panel = false;
-                                self.selected_target = ChatTarget::Lobby;
-                                self.username.clear();
-                                self.password.clear();
-                                self.remember_me = false;
-                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Logout").clicked() {
+                                    self.logout();
+                                }
 
-                            if ui.button("⚙").on_hover_text("Settings").clicked() {
-                                self.show_settings_modal = true;
-                            }
+                                if ui.button("⚙").on_hover_text("Settings").clicked() {
+                                    self.show_settings_modal = true;
+                                }
 
-                            if self.is_admin && ui.button("🛡").on_hover_text("Admin Panel").clicked() {
-                                self.show_admin_panel = true;
-                                let _ = self.network.tx.send(UiToNet::AdminListUsers);
-                            }
+                                if self.is_admin && ui.button("🛡").on_hover_text("Admin Panel").clicked() {
+                                    self.show_admin_panel = true;
+                                    let _ = self.network.tx.send(UiToNet::AdminListUsers);
+                                }
 
-                            // Show friend requests button with pending count
-                            let pending_count = self.pending_friend_requests.len();
-                            let fr_label = if pending_count > 0 {
-                                format!("📬 ({})", pending_count)
-                            } else {
-                                "📬".to_string()
-                            };
-                            if ui.button(fr_label).on_hover_text("Friend Requests").clicked() {
-                                self.show_friend_requests_modal = true;
-                            }
+                                // Show friend requests button with pending count
+                                let pending_count = self.pending_friend_requests.len();
+                                let fr_label = if pending_count > 0 {
+                                    format!("📬 ({})", pending_count)
+                                } else {
+                                    "📬".to_string()
+                                };
+                                if ui.button(fr_label).on_hover_text("Friend Requests").clicked() {
+                                    self.show_friend_requests_modal = true;
+                                }
 
-                            if ui.button("➕").on_hover_text("Add Friend").clicked() {
-                                self.show_add_friend_modal = true;
+                                if ui.button("➕").on_hover_text("Add Friend").clicked() {
+                                    self.show_add_friend_modal = true;
+                                }
+                            });
+                        });
+                    
+                        // Second row: Away message and custom status
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            ui.label("Away:");
+                            ui.add(egui::TextEdit::singleline(&mut self.away_text)
+                                .hint_text("Be right back...")
+                                .desired_width(140.0));
+                            if ui.small_button("Set").clicked() {
+                                self.send_away();
+                            }
+                        
+                            ui.separator();
+                        
+                            ui.label("Status:");
+                            ui.add(egui::TextEdit::singleline(&mut self.custom_status)
+                                .hint_text("🎮 Playing Halo")
+                                .desired_width(140.0));
+                            if ui.small_button("Set").clicked() {
+                                self.send_custom_status();
                             }
                         });
-                    });
-                    
-                    // Second row: Away message and custom status
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.label("Away:");
-                        ui.add(egui::TextEdit::singleline(&mut self.away_text)
-                            .hint_text("Be right back...")
-                            .desired_width(140.0));
-                        if ui.small_button("Set").clicked() {
-                            self.send_away();
-                        }
-                        
-                        ui.separator();
-                        
-                        ui.label("Status:");
-                        ui.add(egui::TextEdit::singleline(&mut self.custom_status)
-                            .hint_text("🎮 Playing Halo")
-                            .desired_width(140.0));
-                        if ui.small_button("Set").clicked() {
-                            let status = if self.custom_status.trim().is_empty() {
-                                None
-                            } else {
-                                Some(Self::sanitize_input(&self.custom_status))
-                            };
-                            let _ = self.network.tx.send(UiToNet::SetStatus { status });
-                            self.custom_status.clear();
-                        }
-                    });
+                    }
                     // Settings modal
                     if self.show_settings_modal {
                         let mut open = true;
@@ -2594,7 +3292,7 @@ impl eframe::App for AolApp {
                                 // Theme
                                 ui.label("Theme");
                                 ui.separator();
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     let themes = [
                                         (Theme::MidnightAmber, "🟠 Midnight Amber"),
                                         (Theme::Dark,          "⚫ Dark"),
@@ -3135,393 +3833,30 @@ impl eframe::App for AolApp {
                     }
                 }
 
-                egui::SidePanel::left("buddy_list")
-                    .resizable(false)
-                    .min_width(200.0)
-                    .show(ctx, |ui| {
-                        ui.heading("Buddy List");
-                        ui.separator();
-                        // Lobby with unread badge
-                        ui.horizontal(|ui| {
-                            let selected = self.selected_target == ChatTarget::Lobby;
-                            if ui.selectable_label(selected, "Lobby").clicked() {
-                                self.select_target(ChatTarget::Lobby);
-                            }
-                            if let Some(&count) = self.unread_counts.get(&ChatTarget::Lobby) {
-                                if count > 0 {
-                                    ui.label(egui::RichText::new(format!("●{}", count))
-                                        .small().color(egui::Color32::from_rgb(220, 60, 60)));
-                                }
-                            }
-                        });
-                        ui.add_space(8.0);
-                        ui.label("Recent DMs");
-                        let recent_threads = self.recent_threads.clone();
-                        for name in recent_threads {
-                            let target = ChatTarget::Direct(name.clone());
-                            ui.horizontal(|ui| {
-                                if ui.selectable_label(self.selected_target == target, &name).clicked() {
-                                    self.select_target(ChatTarget::Direct(name));
-                                }
-                                if let Some(&count) = self.unread_counts.get(&target) {
-                                    if count > 0 {
-                                        ui.label(egui::RichText::new(format!("●{}", count))
-                                            .small().color(egui::Color32::from_rgb(220, 60, 60)));
-                                    }
-                                }
-                            });
-                        }
-                        if self.recent_threads.is_empty() {
-                            ui.label("No recent threads.");
-                        }
-                        ui.add_space(8.0);
-                        ui.label("Direct messages");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.dm_target)
-                                    .hint_text("Screen name"),
-                            );
-                            if ui.button("Start DM").clicked() {
-                                let target = self.dm_target.trim();
-                                if !target.is_empty() {
-                                    self.select_target(ChatTarget::Direct(target.to_string()));
-                                    self.dm_target.clear();
-                                }
-                            }
-                        });
-                        ui.add_space(8.0);
-
-                        // ── Chat Rooms section ────────────────────────────
-                        ui.horizontal(|ui| {
-                            ui.colored_label(egui::Color32::from_rgb(100, 180, 255), "💬 Chat Rooms");
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("＋").on_hover_text("Create Room").clicked() {
-                                    self.show_room_creation_modal = true;
-                                }
-                                if ui.small_button("↻").on_hover_text("Refresh Rooms").clicked() {
-                                    let _ = self.network.tx.send(UiToNet::FetchChatRooms);
-                                }
+                if !compact {
+                    egui::SidePanel::left("buddy_list")
+                        .resizable(false)
+                        .min_width(200.0)
+                        .show(ctx, |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                self.draw_buddy_list(ctx, ui, false);
                             });
                         });
-                        ui.separator();
-
-                        let rooms = self.chat_rooms.clone();
-                        if rooms.is_empty() {
-                            ui.label(egui::RichText::new("No rooms yet.").small().italics()
-                                .color(egui::Color32::GRAY));
-                        } else {
-                            for (room_id, name, member_count) in &rooms {
-                                let target = ChatTarget::Room(room_id.clone());
-                                ui.horizontal(|ui| {
-                                    let label = format!("# {} ({})", name, member_count);
-                                    if ui.selectable_label(self.selected_target == target, label).clicked() {
-                                        // Join room if not already in it
-                                        let _ = self.network.tx.send(UiToNet::JoinChatRoom { room_id: room_id.clone() });
-                                        self.select_target(target.clone());
-                                    }
-                                    if let Some(&count) = self.unread_counts.get(&target) {
-                                        if count > 0 {
-                                            ui.label(egui::RichText::new(format!("●{}", count))
-                                                .small().color(egui::Color32::from_rgb(220, 60, 60)));
-                                        }
-                                    }
-                                });
-                            }
-                        }
-
-                        // Room creation modal
-                        if self.show_room_creation_modal {
-                            egui::Window::new("Create Chat Room")
-                                .collapsible(false)
-                                .resizable(false)
-                                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                                .show(ctx, |ui| {
-                                    ui.label("Room name:");
-                                    let resp = ui.add(
-                                        egui::TextEdit::singleline(&mut self.new_room_name)
-                                            .hint_text("e.g. Gaming, Music...")
-                                            .desired_width(200.0)
-                                    );
-                                    resp.request_focus();
-                                    ui.horizontal(|ui| {
-                                        let can_create = !self.new_room_name.trim().is_empty();
-                                        if ui.add_enabled(can_create, egui::Button::new("Create")).clicked()
-                                            || (can_create && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                                        {
-                                            let name = Self::sanitize_input(&self.new_room_name);
-                                            let _ = self.network.tx.send(UiToNet::CreateChatRoom { name });
-                                            self.new_room_name.clear();
-                                            self.show_room_creation_modal = false;
-                                        }
-                                        if ui.button("Cancel").clicked() {
-                                            self.new_room_name.clear();
-                                            self.show_room_creation_modal = false;
-                                        }
-                                    });
-                                });
-                        }
-
-                        ui.add_space(8.0);
-
-                        // Separate buddies by status (exclude self)
-                        let buddies = self.buddies.clone();
-                        let (online, away): (Vec<_>, Vec<_>) = buddies
-                            .iter()
-                            .filter(|b| Some(&b.username) != self.logged_in_user.as_ref())
-                            .partition(|b| b.away.is_none());
-
-                        // Online buddies section
-                        if !online.is_empty() {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(0, 200, 0),
-                                format!("🟢 Online ({})", online.len())
-                            );
-                            ui.separator();
-
-                            for buddy in &online {
-                                ui.horizontal(|ui| {
-                                    // Small profile circle or avatar
-                                    let (rect, response) = ui.allocate_exact_size(
-                                        egui::vec2(24.0, 24.0),
-                                        egui::Sense::click(),
-                                    );
-                                    
-                                    self.paint_buddy_avatar(ctx, ui, rect, buddy);
-
-                                    if response.clicked() {
-                                        self.viewing_profile = Some(buddy.username.clone());
-                                        let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
-                                    }
-
-                                    response.on_hover_ui(|ui| {
-                                        ui.vertical(|ui| {
-                                            ui.heading(&buddy.username);
-                                            if let Some(ref status) = buddy.status {
-                                                ui.label(egui::RichText::new(status).italics());
-                                            }
-                                            if let Some(ref away_msg) = buddy.away {
-                                                ui.label(egui::RichText::new(format!("Away: {}", away_msg)).color(egui::Color32::YELLOW));
-                                            }
-                                            let idle_text = format_idle_time(buddy.last_activity);
-                                            if !idle_text.is_empty() {
-                                                ui.label(egui::RichText::new(&idle_text).small().color(egui::Color32::GRAY));
-                                            }
-                                            ui.separator();
-                                            ui.label("Click to view profile");
-                                            ui.label("Right-click for options");
-                                        });
-                                    });
-
-                                    let target = ChatTarget::Direct(buddy.username.clone());
-                                    let username_response = ui.selectable_label(
-                                        self.dm_windows.contains_key(&buddy.username),
-                                        &buddy.username
-                                    );
-                                    
-                                    // Click or double-click opens DM window
-                                    if username_response.clicked() || username_response.double_clicked() {
-                                        self.dm_windows.entry(buddy.username.clone()).or_default();
-                                        if !self.messages.contains_key(&target) {
-                                            let _ = self.network.tx.send(UiToNet::FetchHistory { target: target.clone() });
-                                        }
-                                    }
-                                    
-                                    // Right-click context menu
-                                    username_response.context_menu(|ui| {
-                                        if ui.button("💬 Send DM").clicked() {
-                                            self.dm_windows.entry(buddy.username.clone()).or_default();
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("📹 Video Call").clicked() {
-                                            self.start_call(buddy.username.clone());
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("👤 View Profile").clicked() {
-                                            self.viewing_profile = Some(buddy.username.clone());
-                                            let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("?? Start E2E Encryption").clicked() {
-                                            #[cfg(not(target_arch = "wasm32"))]
-                                            self.initiate_e2e_static(&buddy.username);
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("�💥 Nudge").clicked() {
-                                            let _ = self.network.tx.send(UiToNet::Nudge { to: buddy.username.clone() });
-                                            self.show_toast(format!("Nudged {}!", buddy.username), ToastKind::Info);
-                                            ui.close_menu();
-                                        }
-                                        ui.menu_button("😉 Wink", |ui| {
-                                            let emojis = ["😉", "😘", "👋", "💖", "✨", "🎉", "👍", "🔥"];
-                                            for emoji in emojis {
-                                                if ui.button(emoji).clicked() {
-                                                    let _ = self.network.tx.send(UiToNet::Wink { 
-                                                        to: buddy.username.clone(), 
-                                                        emoji: emoji.to_string() 
-                                                    });
-                                                    self.show_toast(format!("Winked {} at {}!", emoji, buddy.username), ToastKind::Info);
-                                                    ui.close_menu();
-                                                }
-                                            }
-                                        });
-                                        ui.separator();
-                                        ui.menu_button("📁 Add to Group", |ui| {
-                                            let groups: Vec<String> = self.buddy_groups.keys().cloned().collect();
-                                            for group_name in groups {
-                                                if ui.button(&group_name).clicked() {
-                                                    if let Some(group) = self.buddy_groups.get_mut(&group_name) {
-                                                        if !group.contains(&buddy.username) {
-                                                            group.push(buddy.username.clone());
-                                                            self.save_buddy_groups();
-                                                            self.show_toast(format!("Added {} to {}", buddy.username, group_name), ToastKind::Success);
-                                                        }
-                                                    }
-                                                    ui.close_menu();
-                                                }
-                                            }
-                                            ui.separator();
-                                            if ui.button("➕ New Group...").clicked() {
-                                                self.group_modal_username = Some(buddy.username.clone());
-                                                self.show_group_modal = true;
-                                                ui.close_menu();
-                                            }
-                                        });
-                                    });
-
-                                    // Show custom status if set
-                                    if let Some(ref status) = buddy.status {
-                                        ui.label(
-                                            egui::RichText::new(status)
-                                                .small()
-                                                .color(egui::Color32::GRAY)
-                                        );
-                                    }
-                                    
-                                    // Show idle time
-                                    let idle_text = format_idle_time(buddy.last_activity);
-                                    if !idle_text.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(&idle_text)
-                                                .small()
-                                                .italics()
-                                                .color(egui::Color32::from_rgb(150, 150, 150))
-                                        );
-                                    }
-                                });
-                            }
-                        }
-
-                        ui.add_space(8.0);
-
-                        // Away buddies section
-                        if !away.is_empty() {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(255, 200, 0),
-                                format!("🟡 Away ({})", away.len())
-                            );
-                            ui.separator();
-
-                            for buddy in &away {
-                                ui.horizontal(|ui| {
-                                    // Small profile circle or avatar
-                                    let (rect, response) = ui.allocate_exact_size(
-                                        egui::vec2(24.0, 24.0),
-                                        egui::Sense::click(),
-                                    );
-                                    
-                                    self.paint_buddy_avatar(ctx, ui, rect, buddy);
-
-                                    if response.clicked() {
-                                        self.viewing_profile = Some(buddy.username.clone());
-                                        let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
-                                    }
-
-                                    let target = ChatTarget::Direct(buddy.username.clone());
-                                    let username_response = ui.selectable_label(
-                                        self.dm_windows.contains_key(&buddy.username),
-                                        &buddy.username
-                                    );
-                                    
-                                    if username_response.clicked() || username_response.double_clicked() {
-                                        self.dm_windows.entry(buddy.username.clone()).or_default();
-                                        if !self.messages.contains_key(&target) {
-                                            let _ = self.network.tx.send(UiToNet::FetchHistory { target: target.clone() });
-                                        }
-                                    }
-                                    
-                                    username_response.context_menu(|ui| {
-                                        if ui.button("💬 Send DM").clicked() {
-                                            self.dm_windows.entry(buddy.username.clone()).or_default();
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("📹 Video Call").clicked() {
-                                            self.start_call(buddy.username.clone());
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("👤 View Profile").clicked() {
-                                            self.viewing_profile = Some(buddy.username.clone());
-                                            let _ = self.network.tx.send(UiToNet::FetchProfile { username: buddy.username.clone() });
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("💥 Nudge").clicked() {
-                                            let _ = self.network.tx.send(UiToNet::Nudge { to: buddy.username.clone() });
-                                            self.show_toast(format!("Nudged {}!", buddy.username), ToastKind::Info);
-                                            ui.close_menu();
-                                        }
-                                        ui.menu_button("😉 Wink", |ui| {
-                                            let emojis = ["😉", "😘", "👋", "💖", "✨", "🎉", "👍", "🔥"];
-                                            for emoji in emojis {
-                                                if ui.button(emoji).clicked() {
-                                                    let _ = self.network.tx.send(UiToNet::Wink { 
-                                                        to: buddy.username.clone(), 
-                                                        emoji: emoji.to_string() 
-                                                    });
-                                                    self.show_toast(format!("Winked {} at {}!", emoji, buddy.username), ToastKind::Info);
-                                                    ui.close_menu();
-                                                }
-                                            }
-                                        });
-                                    });
-
-                                    if let Some(ref away_msg) = buddy.away {
-                                        ui.label(
-                                            egui::RichText::new(format!("({})", away_msg))
-                                                .italics()
-                                                .small()
-                                                .color(egui::Color32::GRAY)
-                                        );
-                                    }
-
-                                    // Show custom status if set
-                                    if let Some(ref status) = buddy.status {
-                                        ui.label(
-                                            egui::RichText::new(status)
-                                                .small()
-                                                .color(egui::Color32::GRAY)
-                                        );
-                                    }
-                                    
-                                    // Show idle time
-                                    let idle_str = format_idle_time(buddy.last_activity);
-                                    if !idle_str.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(&idle_str)
-                                                .small()
-                                                .italics()
-                                                .color(egui::Color32::from_rgb(150, 150, 150))
-                                        );
-                                    }
-                                });
-                            }
-                        }
-
-                        if online.is_empty() && away.is_empty() {
-                            ui.label("No buddies online.");
-                        }
+                } else if !self.mobile_show_chat {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                            self.draw_buddy_list(ctx, ui, true);
+                        });
                     });
+                }
 
                 // ── Floating DM Windows ───────────────────────────────────
-                let dm_usernames: Vec<String> = self.dm_windows.keys().cloned().collect();
+                // Floating windows don't fit on a phone; DMs open in the main chat view there
+                let dm_usernames: Vec<String> = if compact {
+                    Vec::new()
+                } else {
+                    self.dm_windows.keys().cloned().collect()
+                };
                 let mut to_close: Vec<String> = Vec::new();
                 let mut call_request: Option<String> = None;
 
@@ -3626,6 +3961,11 @@ impl eframe::App for AolApp {
                     self.start_call(peer);
                 }
 
+                // Phones show one view at a time; the buddy list was drawn above
+                if compact && !self.mobile_show_chat {
+                    return;
+                }
+
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let heading = match &self.selected_target {
                         ChatTarget::Lobby => "Chat Log - Lobby".to_string(),
@@ -3638,100 +3978,58 @@ impl eframe::App for AolApp {
                                 .unwrap_or_else(|| format!("# {}", room_id))
                         }
                     };
-                    ui.heading(heading);
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        let direct_name = match &self.selected_target {
-                            ChatTarget::Direct(name) => Some(name.clone()),
-                            _ => None,
-                        };
-                        let room_id = match &self.selected_target {
-                            ChatTarget::Room(id) => Some(id.clone()),
-                            _ => None,
-                        };
-                        if let Some(room_id) = room_id {
-                            if ui.button("🚪 Leave Room").clicked() {
-                                let _ = self.network.tx.send(UiToNet::LeaveChatRoom { room_id: room_id.clone() });
-                                let _ = self.network.tx.send(UiToNet::FetchChatRooms);
-                                self.select_target(ChatTarget::Lobby);
+                    if compact {
+                        // Back to the buddy list, title, and the actions tucked into buttons/menus
+                        ui.horizontal(|ui| {
+                            if ui.button("◀").on_hover_text("Buddy List").clicked() {
+                                self.mobile_show_chat = false;
                             }
-                            if ui.button("👥 Members").clicked() {
-                                let _ = self.network.tx.send(UiToNet::FetchRoomMembers { room_id });
-                            }
-                        }
-                        if let Some(name) = direct_name {
-                            if ui.button("Block").clicked() {
-                                self.send_moderation(UiToNet::Block { username: name.clone() });
-                            }
-                            if ui.button("Unblock").clicked() {
-                                self.send_moderation(UiToNet::Unblock { username: name.clone() });
-                            }
-                            if ui.button("Mute").clicked() {
-                                self.send_moderation(UiToNet::Mute { username: name.clone() });
-                            }
-                            if ui.button("Unmute").clicked() {
-                                self.send_moderation(UiToNet::Unmute { username: name.clone() });
-                            }
-                            // E2E encryption toggle (native only)
-                            #[cfg(not(target_arch = "wasm32"))]
-                            {
-                                let has_e2e = self.e2e_shared_secrets.contains_key(&name);
-                                let e2e_label = if has_e2e { "🔒 E2E On" } else { "🔓 Enable E2E" };
-                                if ui.button(e2e_label).clicked() && !has_e2e {
-                                    self.initiate_e2e_static(&name.clone());
-                                }
-                            }
-                            // Nudge button
-                            if ui.button("💥 Nudge").clicked() {
-                                let _ = self.network.tx.send(UiToNet::Nudge { to: name.clone() });
-                                self.show_toast(format!("Nudged {}!", name), ToastKind::Info);
-                            }
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.report_reason)
-                                    .hint_text("Report reason")
-                                    .desired_width(160.0),
-                            );
-                            if ui.button("Report").clicked() {
-                                if !self.report_reason.trim().is_empty() {
-                                    self.send_moderation(UiToNet::Report {
-                                        username: name.clone(),
-                                        reason: self.report_reason.trim().to_string(),
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if self.selected_target != ChatTarget::Lobby {
+                                    ui.menu_button("…", |ui| {
+                                        ui.set_min_width(200.0);
+                                        if self.draw_target_actions(ui) {
+                                            ui.close_menu();
+                                        }
                                     });
-                                    self.report_reason.clear();
                                 }
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Search:");
-                        let search_response = ui.add(
-                            egui::TextEdit::singleline(&mut self.search_query)
-                                .hint_text("Find messages")
-                                .desired_width(200.0),
-                        );
-                        let search_clicked = ui.button("Search Server").clicked();
-                        let search_enter = search_response.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if search_clicked || search_enter {
-                            let query = self.search_query.trim();
-                            if !query.is_empty() {
-                                self.search_in_progress = true;
-                                let _ = self.network.tx.send(UiToNet::Search {
-                                    target: self.selected_target.clone(),
-                                    query: query.to_string(),
+                                if ui.selectable_label(self.mobile_show_search, "🔍").clicked() {
+                                    self.mobile_show_search = !self.mobile_show_search;
+                                }
+                                if call_bridge::SUPPORTED {
+                                    if let ChatTarget::Direct(name) = &self.selected_target {
+                                        if ui.button("📹").on_hover_text("Video Call").clicked() {
+                                            self.start_call(name.clone());
+                                        }
+                                    }
+                                }
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.add(egui::Label::new(egui::RichText::new(heading).heading()).truncate());
                                 });
-                            }
+                            });
+                        });
+                        ui.separator();
+                        if self.mobile_show_search {
+                            ui.horizontal_wrapped(|ui| self.draw_search_bar(ui));
                         }
-                        if ui.button("Clear").clicked() {
-                            self.search_query.clear();
-                            self.search_in_progress = false;
-                            self.search_results.remove(&self.selected_target);
-                        }
-                        if self.search_in_progress {
-                            ui.label("Searching...");
-                        }
-                    });
-                    egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                    } else {
+                        ui.heading(heading);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            self.draw_target_actions(ui);
+                        });
+                        ui.horizontal(|ui| self.draw_search_bar(ui));
+                    }
+                    let mut messages_scroll = egui::ScrollArea::vertical().stick_to_bottom(true);
+                    if compact {
+                        // Fill the screen so the input sits at the bottom, within thumb reach.
+                        // Reserve room for the typing indicator, input row and reply/edit banner.
+                        let banner = if self.replying_to.is_some() { 30.0 } else { 0.0 };
+                        messages_scroll = messages_scroll
+                            .auto_shrink(false)
+                            .max_height((ui.available_height() - 72.0 - banner).max(0.0));
+                    }
+                    messages_scroll.show(ui, |ui| {
                         let query = self.search_query.trim();
                         let mut using_search = false;
                         let messages = if !query.is_empty() {
@@ -3794,6 +4092,13 @@ impl eframe::App for AolApp {
                                                     .color(egui::Color32::GRAY)
                                             ).on_hover_text(full_time);
                                         }
+                                        if compact && message.id.is_some() {
+                                            ui.menu_button("…", |ui| {
+                                                if self.draw_message_actions(ui, &message) {
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                        }
                                     });
                                     // Convert emoticons and display message
                                     let body_with_emoji = convert_emoticons(&message.body);
@@ -3814,44 +4119,10 @@ impl eframe::App for AolApp {
                                                 }
                                             });
                                         }
-                                        // Reaction picker on hover
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 2.0;
-                                            for emoji in ["👍","❤️","😂","😮","😢","🔥"] {
-                                                if ui.small_button(emoji).clicked() {
-                                                    let _ = self.network.tx.send(UiToNet::ReactToMessage {
-                                                        message_id: msg_id,
-                                                        emoji: emoji.to_string(),
-                                                    });
-                                                }
-                                            }
-                                        });
                                     }
-                                    // Edit/delete context menu for own messages
-                                    if Some(&message.from) == self.logged_in_user.as_ref() {
-                                        if let Some(msg_id) = message.id {
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing.x = 4.0;
-                                                if ui.small_button("✏️").on_hover_text("Edit").clicked() {
-                                                    self.editing_message = Some((msg_id, message.body.trim_end_matches(" ✏️").to_string()));
-                                                }
-                                                if ui.small_button("🗑").on_hover_text("Delete").clicked() {
-                                                    let _ = self.network.tx.send(UiToNet::DeleteMessage { message_id: msg_id });
-                                                }
-                                                if ui.small_button("↩️").on_hover_text("Reply").clicked() {
-                                                    let snippet = message.body.chars().take(50).collect::<String>();
-                                                    self.replying_to = Some((msg_id, message.from.clone(), snippet));
-                                                }
-                                            });
-                                        }
-                                    } else {
-                                        // Reply button for other users' messages
-                                        if let Some(msg_id) = message.id {
-                                            if ui.small_button("↩️").on_hover_text("Reply").clicked() {
-                                                let snippet = message.body.chars().take(50).collect::<String>();
-                                                self.replying_to = Some((msg_id, message.from.clone(), snippet));
-                                            }
-                                        }
+                                    // Reactions, edit/delete and reply: inline on desktop, behind … on phones
+                                    if !compact {
+                                        self.draw_message_actions(ui, &message);
                                     }
                                 });
                             });
@@ -3951,8 +4222,9 @@ impl eframe::App for AolApp {
                     ui.horizontal(|ui| {
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.chat_input)
-                                .hint_text("Type a message and press Enter to send")
-                                .desired_width(f32::INFINITY),
+                                .hint_text(if compact { "Message" } else { "Type a message and press Enter to send" })
+                                // Leave room for the Send button
+                                .desired_width(ui.available_width() - 70.0),
                         );
 
                         // Send on Enter (no modifier needed), or clicking Send
@@ -4016,8 +4288,9 @@ impl eframe::App for AolApp {
                             }
                             response.request_focus();
                         } else {
-                            // Keep focus on input so Enter always works, but not if a modal is open
-                            if !response.has_focus() && !self.show_add_friend_modal && !self.show_friend_requests_modal && self.viewing_profile.is_none() {
+                            // Keep focus on input so Enter always works, but not if a modal is open.
+                            // Not on phones: focusing raises the on-screen keyboard over the chat.
+                            if !compact && !response.has_focus() && !self.show_add_friend_modal && !self.show_friend_requests_modal && self.viewing_profile.is_none() {
                                 response.request_focus();
                             }
                         }
@@ -4033,6 +4306,32 @@ impl eframe::App for AolApp {
             }
         }
     }
+}
+
+/// Below this width (in points) the UI switches to the one-view-at-a-time phone
+/// layout. The native window can't get this narrow, so it's effectively web-only.
+const COMPACT_WIDTH: f32 = 700.0;
+
+fn is_compact(ctx: &egui::Context) -> bool {
+    ctx.screen_rect().width() < COMPACT_WIDTH
+}
+
+/// Bigger touch targets in the phone layout; the stock spacing is sized for a mouse.
+fn apply_compact_spacing(ctx: &egui::Context, compact: bool) {
+    ctx.style_mut(|style| {
+        let default = egui::Spacing::default();
+        if compact {
+            style.spacing.interact_size.y = 34.0;
+            style.spacing.button_padding = egui::vec2(10.0, 6.0);
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+            style.spacing.menu_margin = egui::Margin::same(10);
+        } else {
+            style.spacing.interact_size = default.interact_size;
+            style.spacing.button_padding = default.button_padding;
+            style.spacing.item_spacing = default.item_spacing;
+            style.spacing.menu_margin = default.menu_margin;
+        }
+    });
 }
 
 fn apply_theme(ctx: &egui::Context, theme: Theme) {
