@@ -3,8 +3,8 @@
 <head>
     
 <script type="module">
-import init, * as bindings from '/blast-from-the-past-messenger/chatmessagediscordclone-b75453d3ceb159dd.js';
-const wasm = await init({ module_or_path: '/blast-from-the-past-messenger/chatmessagediscordclone-b75453d3ceb159dd_bg.wasm' });
+import init, * as bindings from '/blast-from-the-past-messenger/chatmessagediscordclone-f8965160a705433.js';
+const wasm = await init({ module_or_path: '/blast-from-the-past-messenger/chatmessagediscordclone-f8965160a705433_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -21,6 +21,22 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     <meta name="description" content="Blast From The Past Messenger - Retro AOL Messenger">
     <meta name="referrer" content="strict-origin-when-cross-origin">
     <title>Blast From The Past Messenger</title>
+
+    <!-- Installable web app (PWA): manifest, service worker, home screen icons -->
+    
+    
+    
+    
+    
+    
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+    <meta name="theme-color" content="#1e1c1a">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Blast IM">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
     
     <style>
         html, body {
@@ -28,7 +44,6 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             padding: 0;
             width: 100%;
             height: 100%;
-            height: 100dvh; /* excludes the mobile browser address bar */
             overflow: hidden;
             overscroll-behavior: none;
             touch-action: none;
@@ -62,10 +77,16 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             100% { transform: rotate(360deg); }
         }
 
+        /* Keep the app clear of notches, rounded corners and the home indicator
+           (viewport-fit=cover lets the page extend under them). eframe sizes its
+           drawing buffer from the canvas's CSS box, so insetting it is enough.
+           (A canvas doesn't stretch between top/bottom like a div, hence calc.) */
         canvas {
-            display: block;
-            width: 100%;
-            height: 100%;
+            position: fixed;
+            top: env(safe-area-inset-top, 0px);
+            left: env(safe-area-inset-left, 0px);
+            width: calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
+            height: calc(100% - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
             touch-action: none;
         }
 
@@ -242,12 +263,14 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             border-radius: 3px;
         }
 
-        /* the badge would cover the Send button on phones */
-        @media (max-width: 700px) {
-            .status { display: none; }
+        /* The badge would cover the chat input on phones and installed apps */
+        @media (max-width: 700px), (display-mode: standalone) {
+            .status {
+                display: none;
+            }
         }
     </style>
-<link rel="modulepreload" href="/blast-from-the-past-messenger/chatmessagediscordclone-b75453d3ceb159dd.js" crossorigin="anonymous" integrity="sha384-VisPTXZXG67UHMR9GHL7w6FIfCO5M4VRdlh6Y1UJVMao4GZeWPN/Y5dId1JMZY5V"><link rel="preload" href="/blast-from-the-past-messenger/chatmessagediscordclone-b75453d3ceb159dd_bg.wasm" crossorigin="anonymous" integrity="sha384-zO9OB5dUEYSUMCFzEI41sHYnwmzfxiQzR1Tp4GbIVKgHxJZIRGlicd785B0jbKjU" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/blast-from-the-past-messenger/chatmessagediscordclone-f8965160a705433.js" crossorigin="anonymous" integrity="sha384-Xro/Xb+9VkAIZ1QtZVlZ8pddr8lGGkJnlByX0wr5IFYgiYbC9tYoGWIO9pqMmJPr"><link rel="preload" href="/blast-from-the-past-messenger/chatmessagediscordclone-f8965160a705433_bg.wasm" crossorigin="anonymous" integrity="sha384-DzYtefIfjfOSw1lOIDIGTAhRAvmOIJLx48CCopS7Dw+qIV8OqY9eD0YXGWyY5Bdn" as="fetch" type="application/wasm"></head>
 <body>
     <div id="loading">
         <div class="spinner"></div>
@@ -570,6 +593,15 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
             return { start, signal, end, ring, takeEvents };
         })();
+
+        // Installable web app support (needs https, or localhost for development)
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function () {
+                navigator.serviceWorker.register('/sw.js').catch(function (err) {
+                    console.warn('Service worker registration failed:', err);
+                });
+            });
+        }
 
         // Prevent extension interference with input handling
         const originalAddEventListener = Element.prototype.addEventListener;
