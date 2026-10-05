@@ -18,9 +18,10 @@
     <link data-trunk rel="copy-file" href="assets/icons/icon-512.png" data-target-path="icons" />
     <link data-trunk rel="copy-file" href="assets/icons/icon-maskable-512.png" data-target-path="icons" />
     <link data-trunk rel="copy-file" href="assets/icons/apple-touch-icon.png" data-target-path="icons" />
-    <link rel="manifest" href="/manifest.webmanifest">
-    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
-    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+    <!-- Relative paths: the site is served from / (Amplify) and from a subpath (GitHub Pages) -->
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
     <meta name="theme-color" content="#1e1c1a">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -586,7 +587,7 @@
         // Installable web app support (needs https, or localhost for development)
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', function () {
-                navigator.serviceWorker.register('/sw.js').catch(function (err) {
+                navigator.serviceWorker.register('sw.js').catch(function (err) {
                     console.warn('Service worker registration failed:', err);
                 });
             });
