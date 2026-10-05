@@ -11,7 +11,9 @@
 //    chat server bypass the worker entirely.
 
 const CACHE = 'bftp-v1';
-const BUILD_PREFIX = '/chatmessagediscordclone-';
+// The app may live under a subpath (GitHub Pages), so work relative to our scope
+const BASE = new URL(self.registration.scope).pathname;
+const BUILD_PREFIX = BASE + 'chatmessagediscordclone-';
 
 self.addEventListener('install', () => self.skipWaiting());
 
@@ -43,10 +45,10 @@ async function networkFirst(req) {
     const cache = await caches.open(CACHE);
     try {
         const res = await fetch(req);
-        if (res.ok) await cache.put('/', res.clone());
+        if (res.ok) await cache.put(BASE, res.clone());
         return res;
     } catch (err) {
-        const cached = await cache.match('/');
+        const cached = await cache.match(BASE);
         if (cached) return cached;
         throw err;
     }

@@ -3,8 +3,8 @@
 <head>
     
 <script type="module">
-import init, * as bindings from '/blast-from-the-past-messenger/chatmessagediscordclone-f8965160a705433.js';
-const wasm = await init({ module_or_path: '/blast-from-the-past-messenger/chatmessagediscordclone-f8965160a705433_bg.wasm' });
+import init, * as bindings from '/blast-from-the-past-messenger/chatmessagediscordclone-ecfb3e5345ea65f7.js';
+const wasm = await init({ module_or_path: '/blast-from-the-past-messenger/chatmessagediscordclone-ecfb3e5345ea65f7_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -29,9 +29,10 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     
     
     
-    <link rel="manifest" href="/manifest.webmanifest">
-    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
-    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+    <!-- Relative paths: the site is served from / (Amplify) and from a subpath (GitHub Pages) -->
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
     <meta name="theme-color" content="#1e1c1a">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -270,7 +271,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             }
         }
     </style>
-<link rel="modulepreload" href="/blast-from-the-past-messenger/chatmessagediscordclone-f8965160a705433.js" crossorigin="anonymous" integrity="sha384-Xro/Xb+9VkAIZ1QtZVlZ8pddr8lGGkJnlByX0wr5IFYgiYbC9tYoGWIO9pqMmJPr"><link rel="preload" href="/blast-from-the-past-messenger/chatmessagediscordclone-f8965160a705433_bg.wasm" crossorigin="anonymous" integrity="sha384-DzYtefIfjfOSw1lOIDIGTAhRAvmOIJLx48CCopS7Dw+qIV8OqY9eD0YXGWyY5Bdn" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/blast-from-the-past-messenger/chatmessagediscordclone-ecfb3e5345ea65f7.js" crossorigin="anonymous" integrity="sha384-Xro/Xb+9VkAIZ1QtZVlZ8pddr8lGGkJnlByX0wr5IFYgiYbC9tYoGWIO9pqMmJPr"><link rel="preload" href="/blast-from-the-past-messenger/chatmessagediscordclone-ecfb3e5345ea65f7_bg.wasm" crossorigin="anonymous" integrity="sha384-hPSTfaAES8hsnS8U+MGvppBJdIoQUEXifv+7pyXYunPBY90zU079KYWVY6Rzy38u" as="fetch" type="application/wasm"></head>
 <body>
     <div id="loading">
         <div class="spinner"></div>
@@ -597,7 +598,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         // Installable web app support (needs https, or localhost for development)
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', function () {
-                navigator.serviceWorker.register('/sw.js').catch(function (err) {
+                navigator.serviceWorker.register('sw.js').catch(function (err) {
                     console.warn('Service worker registration failed:', err);
                 });
             });
