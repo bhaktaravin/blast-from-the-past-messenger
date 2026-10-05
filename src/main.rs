@@ -579,7 +579,9 @@ impl AolApp {
             admin_reset_new_password: String::new(),
             show_forgot_password_info: false,
             server_url: "wss://blast-from-the-past-messenger-production.up.railway.app".to_string(),
-            username: "RetroUser".to_string(),
+            // Empty, not a sample name: people type straight into the field and end up
+            // with "RetroUserjane". The "Screen name" hint shows what goes there.
+            username: String::new(),
             password: String::new(),
             confirm_password: String::new(),
             show_password: false,

@@ -15,7 +15,10 @@ license-file = ["packaging/linux/COPYRIGHT", "0"]
 extended-description = "Blast From The Past Messenger: a retro AOL-style instant messenger with buddy lists, chat rooms, end-to-end encrypted DMs and more."
 section = "net"
 priority = "optional"
-depends = "$auto"
+# $auto only sees libraries linked at build time. The window system (winit/glutin)
+# loads its display, keyboard and OpenGL libraries at runtime, so name them here:
+# without them the app crashes on launch ("libxkbcommon-x11.so could not be loaded").
+depends = "$auto, libxkbcommon-x11-0, libx11-xcb1, libxcursor1, libxi6, libgl1, libegl1, libwayland-client0, libwayland-cursor0, libwayland-egl1"
 assets = [
     ["target/release/chatmessagediscordclone", "usr/bin/blast-from-the-past", "755"],
     ["packaging/linux/blast-from-the-past.desktop", "usr/share/applications/", "644"],
@@ -25,6 +28,10 @@ assets = [
 
 [package.metadata.generate-rpm]
 name = "blast-from-the-past"
+# Use rpm's own dependency scanner (needs the `rpm` package on the build machine).
+# The built-in fallback emits glibc "[WEAK]" requirements that no distro provides,
+# so dnf refuses to install the package.
+auto-req = "find-requires"
 summary = "Retro AOL-style instant messenger"
 license = "All rights reserved"
 assets = [
@@ -33,6 +40,18 @@ assets = [
     { source = "assets/icons/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/blast-from-the-past.png", mode = "644" },
     { source = "assets/icons/icon.svg", dest = "/usr/share/icons/hicolor/scalable/apps/blast-from-the-past.svg", mode = "644" },
 ]
+
+# Same runtime-loaded libraries as the .deb, by soname so any RPM distro resolves them
+[package.metadata.generate-rpm.requires]
+"libxkbcommon-x11.so.0()(64bit)" = "*"
+"libX11-xcb.so.1()(64bit)" = "*"
+"libXcursor.so.1()(64bit)" = "*"
+"libXi.so.6()(64bit)" = "*"
+"libGL.so.1()(64bit)" = "*"
+"libEGL.so.1()(64bit)" = "*"
+"libwayland-client.so.0()(64bit)" = "*"
+"libwayland-cursor.so.0()(64bit)" = "*"
+"libwayland-egl.so.1()(64bit)" = "*"
 
 # Define binaries explicitly
 [[bin]]

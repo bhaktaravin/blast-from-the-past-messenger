@@ -1,0 +1,5 @@
+# Link the C runtime into the Windows exe. Otherwise it needs VCRUNTIME140.dll,
+# which a fresh Windows install doesn't always have, and the app fails to start
+# with a "DLL was not found" error.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

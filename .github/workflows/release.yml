@@ -64,6 +64,14 @@ jobs:
       - name: Set version
         run: .github/scripts/set-version.sh
 
+      # An unsigned app is "damaged and can't be opened" on other people's Macs,
+      # so never publish one; test builds (Run workflow) may still be unsigned
+      - name: Require signing for releases
+        if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING != 'true'
+        run: |
+          echo "::error::The MACOS_CERTIFICATE secret isn't set, so this DMG would be unsigned and macOS would refuse to open it. Add the signing secrets, or use Run workflow for a test build."
+          exit 1
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -163,7 +171,8 @@ jobs:
             libxkbcommon-dev \
             libwayland-dev \
             libgl1-mesa-dev \
-            libglib2.0-dev
+            libglib2.0-dev \
+            rpm  # cargo-generate-rpm's dependency scan (see auto-req in Cargo.toml)
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
