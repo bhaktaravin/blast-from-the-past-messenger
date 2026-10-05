@@ -9,6 +9,8 @@ pub fn server_to_ui(event: ServerToClient) -> Option<NetToUi> {
     Some(match event {
         // Connection greeting — not worth a chat log line on every (re)connect
         ServerToClient::Welcome { .. } => return None,
+        // Liveness is tracked by the connection code, which sees every message
+        ServerToClient::Heartbeat => return None,
         ServerToClient::AuthOk { username, is_admin } => NetToUi::AuthOk { username, is_admin },
         ServerToClient::AuthError { message } => NetToUi::AuthError(message),
         ServerToClient::Presence { users } => NetToUi::Presence(users),

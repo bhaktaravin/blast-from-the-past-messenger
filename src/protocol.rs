@@ -48,9 +48,20 @@ pub struct AdminUserEntry {
     pub is_admin: bool,
 }
 
+/// The server sends `ServerToClient::Heartbeat` this often on every connection.
+/// A connection can die without either side being told (laptop sleep, Wi-Fi
+/// change, a proxy dropping it); the heartbeat is how both ends notice.
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 20;
+/// Hearing nothing for this long means the connection is dead. Each side only
+/// enforces it once the other has shown it speaks heartbeat, so old clients
+/// and old servers keep working.
+pub const HEARTBEAT_TIMEOUT_SECS: u64 = 50;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientToServer {
+    /// Reply to the server's heartbeat, so it can drop clients that went away
+    Heartbeat,
     Register { username: String, password: String },
     Login { username: String, password: String },
     /// E2E key exchange: send our public key to a peer via the server
@@ -119,6 +130,8 @@ pub enum ClientToServer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToClient {
+    /// Keep-alive, see `HEARTBEAT_INTERVAL_SECS`
+    Heartbeat,
     Welcome { message: String },
     AuthOk { username: String, is_admin: bool },
     AuthError { message: String },

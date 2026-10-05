@@ -116,6 +116,7 @@ use chatmessagediscordclone::buddy_icon::{
 };
 use chatmessagediscordclone::protocol::{
     AdminUserEntry, ClientToServer, HistoryTarget, ServerToClient, UserStatus,
+    HEARTBEAT_TIMEOUT_SECS,
 };
 
 #[derive(Debug, Clone)]
@@ -1855,6 +1856,16 @@ impl AolApp {
             self.back_nav_pushed = false;
             let _ = history.back();
         }
+    }
+
+    /// Whether a message can go out right now. While disconnected (or reconnecting)
+    /// it would be dropped, so say so and leave the text where it is.
+    fn online_or_warn(&mut self) -> bool {
+        let online = self.connected && self.logged_in_user.is_some();
+        if !online {
+            self.show_toast("Not connected — message not sent. Reconnecting…".to_string(), ToastKind::Error);
+        }
+        online
     }
 
     fn logout(&mut self) {
@@ -3859,6 +3870,8 @@ impl eframe::App for AolApp {
                 };
                 let mut to_close: Vec<String> = Vec::new();
                 let mut call_request: Option<String> = None;
+                let online = self.connected && self.logged_in_user.is_some();
+                let mut offline_send = false;
 
                 for peer in dm_usernames {
                     let messages = self.messages
@@ -3924,7 +3937,9 @@ impl eframe::App for AolApp {
                                 );
                                 let send = ui.button("Send").clicked()
                                     || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                                if send && !input.trim().is_empty() {
+                                if send && !input.trim().is_empty() && !online {
+                                    offline_send = true;
+                                } else if send && !input.trim().is_empty() {
                                     let body = input.trim().to_string();
                                     input.clear();
                                     let _ = self.network.tx.send(UiToNet::SendDirect {
@@ -3959,6 +3974,9 @@ impl eframe::App for AolApp {
                 }
                 if let Some(peer) = call_request {
                     self.start_call(peer);
+                }
+                if offline_send {
+                    self.online_or_warn();
                 }
 
                 // Phones show one view at a time; the buddy list was drawn above
@@ -4253,7 +4271,9 @@ impl eframe::App for AolApp {
                             }
                         }
 
-                        if should_send {
+                        if should_send && !self.online_or_warn() {
+                            // Keep the text so it can be sent once reconnected
+                        } else if should_send {
                             // Stop typing indicator when message is sent
                             if let ChatTarget::Room(room_id) = &self.selected_target.clone() {
                                 let _ = self.network.tx.send(UiToNet::StopTyping { room_id: room_id.clone() });
@@ -4771,8 +4791,37 @@ async fn run_connection(
     }
 }
 
+/// No heartbeat for `HEARTBEAT_TIMEOUT_SECS` means the connection is dead.
+/// Wall clock on purpose: a monotonic clock stops while the computer sleeps,
+/// and waking from sleep is exactly when the connection has usually died.
+fn connection_stale(last_heard_ms: i64) -> bool {
+    Utc::now().timestamp_millis() - last_heard_ms > HEARTBEAT_TIMEOUT_SECS as i64 * 1000
+}
+
+const CONNECTION_LOST_MESSAGE: &str = "Connection lost — reconnecting…";
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn run_ws<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    username: String,
+    password: String,
+    mode: AuthMode,
+    ui_rx: &mut mpsc::UnboundedReceiver<UiToNet>,
+    net_tx: &std_mpsc::Sender<NetToUi>,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let result = run_ws_session(ws, username, password, mode, ui_rx, net_tx).await;
+    // However the session ended (server closed it, the network dropped, a send
+    // failed), the UI has to hear about it, or it stays "online" and every
+    // message after this goes nowhere
+    let _ = net_tx.send(NetToUi::Disconnected);
+    result
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_ws_session<S>(
     ws: tokio_tungstenite::WebSocketStream<S>,
     username: String,
     password: String,
@@ -4795,15 +4844,25 @@ where
     }
     let _ = net_tx.send(NetToUi::Connected);
 
+    // Dead-connection detection, armed once the server shows it sends heartbeats
+    let mut heartbeat_seen = false;
+    let mut last_heard_ms = Utc::now().timestamp_millis();
+    let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(2));
+
     loop {
         tokio::select! {
             incoming = ws_rx.next() => {
+                last_heard_ms = Utc::now().timestamp_millis();
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(event) = serde_json::from_str::<ServerToClient>(&text) {
                             match event {
                                 // Connection greeting — not worth a chat log line on every (re)connect
                                 ServerToClient::Welcome { .. } => {}
+                                ServerToClient::Heartbeat => {
+                                    heartbeat_seen = true;
+                                    send_json(&mut ws_tx, ClientToServer::Heartbeat).await?;
+                                }
                                 ServerToClient::AuthOk { username, is_admin } => {
                                     let _ = net_tx.send(NetToUi::AuthOk { username, is_admin });
                                 }
@@ -4955,7 +5014,18 @@ where
                     None => break,
                 }
             }
+            _ = watchdog.tick() => {
+                if heartbeat_seen && connection_stale(last_heard_ms) {
+                    return Err(CONNECTION_LOST_MESSAGE.to_string());
+                }
+            }
             Some(command) = ui_rx.recv() => {
+                // Writing to a dead socket "succeeds" and the message is silently lost,
+                // so check first (this catches typing right after waking from sleep,
+                // before the watchdog has ticked)
+                if heartbeat_seen && connection_stale(last_heard_ms) && !matches!(command, UiToNet::Disconnect) {
+                    return Err("Connection lost — your message wasn't sent. Reconnecting…".to_string());
+                }
                 match command {
                     UiToNet::SendChat { body } => {
                         send_json(&mut ws_tx, ClientToServer::Chat { body }).await?;
@@ -5099,7 +5169,6 @@ where
         }
     }
 
-    let _ = net_tx.send(NetToUi::Disconnected);
     Ok(())
 }
 
@@ -5128,15 +5197,41 @@ fn spawn_network() -> NetworkHandle {
         use wasm_bindgen::JsCast;
         use web_sys::{WebSocket, MessageEvent, CloseEvent, ErrorEvent};
         
+        use std::cell::Cell;
+        use std::rc::Rc;
+
         let mut ws: Option<WebSocket> = None;
-        
+        // Dead-connection detection (see HEARTBEAT_TIMEOUT_SECS): when we last heard
+        // from the server, and whether it sends heartbeats at all
+        let last_heard_ms = Rc::new(Cell::new(0i64));
+        let heartbeat_seen = Rc::new(Cell::new(false));
+        let heartbeat_json = serde_json::to_string(&ClientToServer::Heartbeat).unwrap_or_default();
+
+        // Close a socket without its handlers firing: its close/error would
+        // otherwise be reported after we've already moved on
+        fn retire(socket: &WebSocket) {
+            socket.set_onopen(None);
+            socket.set_onmessage(None);
+            socket.set_onclose(None);
+            socket.set_onerror(None);
+            let _ = socket.close();
+        }
+        // A dead socket can sit in OPEN indefinitely, so give up on it ourselves
+        let drop_dead = |socket: &WebSocket, net_tx: &std_mpsc::Sender<NetToUi>, message: &str| {
+            retire(socket);
+            let _ = net_tx.send(NetToUi::Error(message.to_string()));
+            let _ = net_tx.send(NetToUi::Disconnected);
+        };
+
         while let Some(msg) = ui_rx.recv().await {
             match msg {
                 UiToNet::Connect { url, username, password, mode } => {
                     // Close existing connection if any
                     if let Some(old_ws) = ws.take() {
-                        let _ = old_ws.close();
+                        retire(&old_ws);
                     }
+                    last_heard_ms.set(Utc::now().timestamp_millis());
+                    heartbeat_seen.set(false);
 
                     // Wake a sleeping host (e.g. Railway's free-tier idle sleep) with a
                     // plain HTTP request before the WebSocket handshake, so the upgrade
@@ -5180,10 +5275,17 @@ fn spawn_network() -> NetworkHandle {
                             
                             // Handle messages
                             let net_tx_clone = net_tx.clone();
+                            let (last_heard, seen) = (last_heard_ms.clone(), heartbeat_seen.clone());
+                            let (ws_for_reply, reply) = (new_ws.clone(), heartbeat_json.clone());
                             let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
+                                last_heard.set(Utc::now().timestamp_millis());
                                 if let Ok(txt) = e.data().dyn_into::<wasm_bindgen::JsValue>() {
                                     if let Some(msg_str) = txt.as_string() {
                                         if let Ok(server_msg) = serde_json::from_str::<ServerToClient>(&msg_str) {
+                                            if let ServerToClient::Heartbeat = server_msg {
+                                                seen.set(true);
+                                                let _ = ws_for_reply.send_with_str(&reply);
+                                            }
                                             if let Some(ui_msg) = client_map::server_to_ui(server_msg) {
                                                 let _ = net_tx_clone.send(ui_msg);
                                             }
@@ -5210,6 +5312,30 @@ fn spawn_network() -> NetworkHandle {
                             new_ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
                             onerror.forget();
                             
+                            // Watchdog: check every couple of seconds while this socket is
+                            // the current one. Wall-clock based, so a phone waking up with a
+                            // long-dead connection is noticed on the first check.
+                            {
+                                let socket = new_ws.clone();
+                                let (last_heard, seen) = (last_heard_ms.clone(), heartbeat_seen.clone());
+                                let net_tx = net_tx.clone();
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    loop {
+                                        gloo_timers::future::sleep(std::time::Duration::from_secs(2)).await;
+                                        // Retired (replaced or logged out) or closed normally
+                                        if socket.ready_state() == WebSocket::CLOSED
+                                            || socket.ready_state() == WebSocket::CLOSING
+                                        {
+                                            break;
+                                        }
+                                        if seen.get() && connection_stale(last_heard.get()) {
+                                            drop_dead(&socket, &net_tx, CONNECTION_LOST_MESSAGE);
+                                            break;
+                                        }
+                                    }
+                                });
+                            }
+
                             ws = Some(new_ws.clone());
                         },
                         Err(_) => {
@@ -5219,13 +5345,20 @@ fn spawn_network() -> NetworkHandle {
                 },
                 UiToNet::Disconnect => {
                     if let Some(old_ws) = ws.take() {
-                        let _ = old_ws.close();
+                        retire(&old_ws);
                     }
                     let _ = net_tx.send(NetToUi::Disconnected);
                 },
                 other => {
                     if let Some(ref active_ws) = ws {
-                        if active_ws.ready_state() == WebSocket::OPEN {
+                        // Sending on a dead socket "works" and the message is silently
+                        // lost; catch it here in case the watchdog hasn't run yet
+                        if active_ws.ready_state() == WebSocket::OPEN
+                            && heartbeat_seen.get()
+                            && connection_stale(last_heard_ms.get())
+                        {
+                            drop_dead(active_ws, &net_tx, "Connection lost — your message wasn't sent. Reconnecting…");
+                        } else if active_ws.ready_state() == WebSocket::OPEN {
                             if let Some(client_msg) = client_map::ui_to_server(other) {
                                 if let Ok(json) = serde_json::to_string(&client_msg) {
                                     let _ = active_ws.send_with_str(&json);

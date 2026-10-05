@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use chatmessagediscordclone::protocol::{
     AdminUserEntry, ClientToServer, HistoryTarget, MessageRecord, ServerToClient, UserStatus,
+    HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS,
 };
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -282,9 +283,30 @@ async fn handle_connection(
         }
     });
 
+    // Keep-alive so clients notice a dead connection (see HEARTBEAT_INTERVAL_SECS)
+    let heartbeat = {
+        let out_tx = out_tx.clone();
+        let text = serde_json::to_string(&ServerToClient::Heartbeat).unwrap_or_default();
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+            ticks.tick().await; // the first tick is immediate
+            loop {
+                ticks.tick().await;
+                if out_tx.send(Message::Text(text.clone())).is_err() {
+                    break;
+                }
+            }
+        })
+    };
+
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let guest_name = format!("Guest{id}");
     let connected_at = Instant::now();
+    // Clients that answer heartbeats get dropped once they stop (they're gone,
+    // and would otherwise count against the per-IP connection limit). Older
+    // clients never answer, so they're exempt.
+    let mut answers_heartbeats = false;
+    let mut last_heard = Instant::now();
 
     {
         let mut guard = peers.lock().map_err(|_| "peer lock poisoned")?;
@@ -318,6 +340,7 @@ async fn handle_connection(
 
         tokio::select! {
             msg = ws_rx.next() => {
+                last_heard = Instant::now();
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         // Message size limit (call signaling gets more room for SDP)
@@ -332,7 +355,9 @@ async fn handle_connection(
                             });
                             continue;
                         }
-                        if let Ok(event) = event {
+                        if let Ok(ClientToServer::Heartbeat) = event {
+                            answers_heartbeats = true;
+                        } else if let Ok(event) = event {
                             handle_client_event(id, client_ip, event, &peers, &db, &redis, &rate_limits, &login_attempts, &admin_usernames, &call_hub).await;
                         }
                     }
@@ -349,9 +374,13 @@ async fn handle_connection(
                     });
                     break;
                 }
+                if answers_heartbeats && last_heard.elapsed() > Duration::from_secs(HEARTBEAT_TIMEOUT_SECS) {
+                    break;
+                }
             }
         }
     }
+    heartbeat.abort();
 
     {
         let mut guard = peers.lock().map_err(|_| "peer lock poisoned")?;
@@ -393,6 +422,8 @@ async fn handle_client_event(
     call_hub: &Arc<CallHub>,
 ) {
     match event {
+        // Handled in the connection loop
+        ClientToServer::Heartbeat => {}
         ClientToServer::Register { username, password } => {
             // Validate username
             if username.len() < 3 || username.len() > 32 {
