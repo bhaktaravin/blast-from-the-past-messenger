@@ -2749,7 +2749,7 @@ impl eframe::App for AolApp {
                 // ── top bar ──────────────────────────────────────────────
                 egui::TopBottomPanel::top("signin_top").show(ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(amber, "◈ AOL-Style Messenger");
+                        ui.colored_label(amber, "💬 AOL-Style Messenger");
                         ui.separator();
                         let bg_label = if self.show_background { "BG: On" } else { "BG: Off" };
                         if ui.button(bg_label).clicked() { self.show_background = !self.show_background; }
@@ -2768,7 +2768,14 @@ impl eframe::App for AolApp {
                     });
                 });
 
-                egui::CentralPanel::default().show(ctx, |ui| {
+                // The backdrop is a CRT terminal (green rain, amber logo, scanlines),
+                // so keep it dark in light themes too; only the login card follows
+                // the theme. On a light panel the rain and logo all but vanished.
+                let mut signin_frame = egui::Frame::central_panel(&ctx.style());
+                if !ctx.style().visuals.dark_mode {
+                    signin_frame = signin_frame.fill(egui::Color32::from_rgb(18, 20, 18));
+                }
+                egui::CentralPanel::default().frame(signin_frame).show(ctx, |ui| {
                     let panel_rect = ui.max_rect();
 
                     // ── Matrix rain background ────────────────────────────
@@ -4411,9 +4418,10 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
             visuals.widgets.active.bg_fill = egui::Color32::from_rgb(49, 106, 197);
             visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
             visuals.widgets.active.corner_radius = egui::CornerRadius::same(3);
-            // Selection: XP blue highlight
-            visuals.selection.bg_fill = egui::Color32::from_rgb(49, 106, 197);
-            visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+            // Text is forced black (override_text_color), so the highlight behind selected
+            // tabs/labels must be light; the stroke is the accent (also the focused-field outline)
+            visuals.selection.bg_fill = egui::Color32::from_rgb(166, 194, 238);
+            visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(49, 106, 197));
             // Text: classic black on silver
             visuals.override_text_color = Some(egui::Color32::from_rgb(0, 0, 0));
             // Hyperlinks: XP blue
@@ -4431,7 +4439,10 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
             visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
             visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(255, 255, 102);
             visuals.widgets.active.bg_fill = egui::Color32::from_rgb(255, 204, 0);
-            visuals.selection.bg_fill = egui::Color32::from_rgb(0, 0, 255); // AOL blue
+            // Text is forced black (override_text_color), so the highlight behind selected
+            // tabs/labels must be light; the stroke is the accent (also the focused-field outline)
+            visuals.selection.bg_fill = egui::Color32::from_rgb(160, 185, 255);
+            visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 0, 255)); // AOL blue
             visuals.override_text_color = Some(egui::Color32::from_rgb(0, 0, 0));
             visuals.hyperlink_color = egui::Color32::from_rgb(0, 0, 255);
             visuals
@@ -4448,7 +4459,10 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
             visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(135, 206, 250);
             visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0, 120, 215);
             visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-            visuals.selection.bg_fill = egui::Color32::from_rgb(0, 120, 215);
+            // Text is forced black (override_text_color), so the highlight behind selected
+            // tabs/labels must be light; the stroke is the accent (also the focused-field outline)
+            visuals.selection.bg_fill = egui::Color32::from_rgb(160, 205, 242);
+            visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 120, 215));
             visuals.override_text_color = Some(egui::Color32::from_rgb(0, 0, 0));
             visuals.hyperlink_color = egui::Color32::from_rgb(0, 102, 204);
             visuals
@@ -4465,7 +4479,10 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
             visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(186, 85, 211);
             visuals.widgets.active.bg_fill = egui::Color32::from_rgb(138, 43, 226);
             visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-            visuals.selection.bg_fill = egui::Color32::from_rgb(138, 43, 226);
+            // Text is forced black (override_text_color), so the highlight behind selected
+            // tabs/labels must be light; the stroke is the accent (also the focused-field outline)
+            visuals.selection.bg_fill = egui::Color32::from_rgb(214, 190, 245);
+            visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(138, 43, 226));
             visuals.override_text_color = Some(egui::Color32::from_rgb(0, 0, 0));
             visuals.hyperlink_color = egui::Color32::from_rgb(102, 0, 153);
             visuals
@@ -4482,13 +4499,22 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
             visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(50, 205, 50);
             visuals.widgets.active.bg_fill = egui::Color32::from_rgb(34, 139, 34);
             visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-            visuals.selection.bg_fill = egui::Color32::from_rgb(34, 139, 34);
+            // Text is forced black (override_text_color), so the highlight behind selected
+            // tabs/labels must be light; the stroke is the accent (also the focused-field outline)
+            visuals.selection.bg_fill = egui::Color32::from_rgb(170, 225, 170);
+            visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(34, 139, 34));
             visuals.override_text_color = Some(egui::Color32::from_rgb(0, 0, 0));
             visuals.hyperlink_color = egui::Color32::from_rgb(0, 128, 0);
             visuals
         }
     };
     visuals.window_corner_radius = egui::CornerRadius::same(6);
+    if !visuals.dark_mode {
+        // An unfocused TextEdit is outlined with the inactive widget stroke, which
+        // egui's light visuals leave empty: a white field on a white card or window
+        // was invisible. A thin border fixes that (and gives buttons an edge).
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(150));
+    }
     ctx.set_visuals(visuals);
 }
 
