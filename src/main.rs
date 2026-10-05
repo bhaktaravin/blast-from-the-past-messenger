@@ -432,6 +432,8 @@ struct AolApp {
     avatar_cache: AvatarCache,
     // Compact (phone) layout: one screen at a time instead of side-by-side panels
     compact_style_applied: Option<bool>,
+    /// UI size (egui zoom factor), adjustable with the A+/A- buttons
+    ui_zoom: f32,
     mobile_show_chat: bool, // chat view vs. buddy list
     mobile_show_search: bool,
     // Web: a `#chat` history entry is pushed while a chat is open on a phone, so
@@ -559,6 +561,8 @@ impl AolApp {
             .text_styles
             .insert(egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Monospace));
         cc.egui_ctx.set_style(style);
+        let ui_zoom = load_ui_zoom();
+        cc.egui_ctx.set_zoom_factor(ui_zoom);
         apply_theme(&cc.egui_ctx, Theme::MidnightAmber);
 
         Self {
@@ -674,6 +678,7 @@ impl AolApp {
             reconnect_timer: 0.0,
             avatar_cache: AvatarCache::new(),
             compact_style_applied: None,
+            ui_zoom,
             mobile_show_chat: false,
             mobile_show_search: false,
             #[cfg(target_arch = "wasm32")]
@@ -1870,6 +1875,25 @@ impl AolApp {
         online
     }
 
+    fn set_ui_zoom(&mut self, ctx: &egui::Context, zoom: f32) {
+        self.ui_zoom = ((zoom * 10.0).round() / 10.0).clamp(MIN_UI_ZOOM, MAX_UI_ZOOM);
+        ctx.set_zoom_factor(self.ui_zoom);
+        save_ui_zoom(self.ui_zoom);
+    }
+
+    /// Small "A+ 100% A-" control for resizing the whole UI.
+    fn zoom_controls(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        if ui.small_button("A+").on_hover_text("Make everything bigger").clicked() {
+            self.set_ui_zoom(ctx, self.ui_zoom + 0.1);
+        }
+        if ui.small_button(format!("{:.0}%", self.ui_zoom * 100.0)).on_hover_text("Reset size").clicked() {
+            self.set_ui_zoom(ctx, 1.0);
+        }
+        if ui.small_button("A-").on_hover_text("Make everything smaller").clicked() {
+            self.set_ui_zoom(ctx, self.ui_zoom - 0.1);
+        }
+    }
+
     fn logout(&mut self) {
         // Clear saved credentials and reconnect state
         let _ = std::fs::remove_file(self.credentials_file());
@@ -2560,6 +2584,12 @@ impl eframe::App for AolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx, self.theme);
 
+        // Keep the A+/A- display in step with Ctrl +/- (egui's built-in zoom keys)
+        if (ctx.zoom_factor() - self.ui_zoom).abs() > f32::EPSILON {
+            self.ui_zoom = ctx.zoom_factor();
+            save_ui_zoom(self.ui_zoom);
+        }
+
         let compact = is_compact(ctx);
         if self.compact_style_applied != Some(compact) {
             self.compact_style_applied = Some(compact);
@@ -2750,6 +2780,8 @@ impl eframe::App for AolApp {
                 egui::TopBottomPanel::top("signin_top").show(ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(amber, "💬 AOL-Style Messenger");
+                        ui.separator();
+                        self.zoom_controls(ctx, ui);
                         ui.separator();
                         let bg_label = if self.show_background { "BG: On" } else { "BG: Off" };
                         if ui.button(bg_label).clicked() { self.show_background = !self.show_background; }
@@ -3274,6 +3306,9 @@ impl eframe::App for AolApp {
                                 if ui.button("➕").on_hover_text("Add Friend").clicked() {
                                     self.show_add_friend_modal = true;
                                 }
+
+                                ui.separator();
+                                self.zoom_controls(ctx, ui);
                             });
                         });
                     
@@ -3310,6 +3345,14 @@ impl eframe::App for AolApp {
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                             .show(ctx, |ui| {
                                 // Theme
+                                // Display size (also how phones reach it: ☰ → Settings)
+                                ui.label("Display Size");
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    self.zoom_controls(ctx, ui);
+                                });
+                                ui.add_space(12.0);
+
                                 ui.label("Theme");
                                 ui.separator();
                                 ui.horizontal_wrapped(|ui| {
@@ -5402,6 +5445,33 @@ fn spawn_network() -> NetworkHandle {
     NetworkHandle { tx: ui_tx, rx: net_rx }
 }
 
+
+// ── UI zoom ────────────────────────────────────────────────────────────
+const MIN_UI_ZOOM: f32 = 0.5;
+const MAX_UI_ZOOM: f32 = 2.0;
+const UI_ZOOM_KEY: &str = "bftp_ui_zoom";
+
+/// The saved UI size (web only; the desktop app starts at 100%).
+fn load_ui_zoom() -> f32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let stored = web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .and_then(|s| s.get_item(UI_ZOOM_KEY).ok().flatten())
+            .and_then(|v| v.parse::<f32>().ok());
+        if let Some(zoom) = stored {
+            return zoom.clamp(MIN_UI_ZOOM, MAX_UI_ZOOM);
+        }
+    }
+    1.0
+}
+
+fn save_ui_zoom(_zoom: f32) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(UI_ZOOM_KEY, &_zoom.to_string());
+    }
+}
 
 // Native entry point
 #[cfg(not(target_arch = "wasm32"))]
