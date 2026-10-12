@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws://localhost:* ws://127.0.0.1:*; media-src 'self' blob:;">
+    <meta name="referrer" content="no-referrer">
+    <title>Video Call · Blast From The Past</title>
+    <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+    <link rel="stylesheet" href="call.css">
+    <style>
+        html, body {
+            margin: 0;
+            height: 100%;
+            background: linear-gradient(180deg, #1e1c1a 0%, #2e2a26 100%);
+            color: #f0a83a;
+            font-family: monospace;
+        }
+
+        /* This tab is only for the call, so let it have the whole window */
+        #call-overlay {
+            inset: 0 !important;
+            border: none !important;
+            border-radius: 0 !important;
+        }
+
+        #lobby {
+            min-height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 14px;
+            padding: 24px 16px;
+            box-sizing: border-box;
+            text-align: center;
+        }
+
+        #lobby .icon {
+            width: 84px;
+            height: 84px;
+            border-radius: 50%;
+            background: #f0a83a;
+            font-size: 42px;
+            line-height: 84px;
+        }
+
+        #lobby.ringing .icon {
+            animation: wobble 0.35s ease-in-out infinite alternate;
+        }
+
+        @keyframes wobble {
+            from { transform: rotate(-12deg); }
+            to { transform: rotate(12deg); }
+        }
+
+        #lobby-peer {
+            font-size: 24px;
+            font-weight: bold;
+            color: #ffd27a;
+            min-height: 1.2em;
+        }
+
+        #lobby-status {
+            color: #ccc;
+            max-width: 32em;
+            line-height: 1.5;
+        }
+
+        #lobby-cancel {
+            margin-top: 8px;
+            padding: 10px 28px;
+            font: inherit;
+            font-size: 16px;
+            font-weight: bold;
+            color: #fff;
+            background: #c83232;
+            border: 2px solid #ff6b6b;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        #lobby .brand {
+            margin-top: 20px;
+            font-size: 12px;
+            color: #8a8178;
+        }
+    </style>
+</head>
+<body>
+    <div id="lobby">
+        <div class="icon" aria-hidden="true">📞</div>
+        <div id="lobby-peer"></div>
+        <div id="lobby-status">Connecting…</div>
+        <button id="lobby-cancel" hidden>✖ Hang up</button>
+        <div class="brand">Blast From The Past Messenger</div>
+    </div>
+
+    <script src="call.js"></script>
+    <script>
+        // The desktop apps have no WebRTC, so for a call they open this page with
+        // a single-use ticket (see ClientToServer::CallHandoff in src/protocol.rs):
+        //   call.html#ticket=<ticket>&server=<wss://chat server>
+        // The page makes its own connection to the chat server, claims the ticket,
+        // and from then on carries that side of the call.
+        (function () {
+            const $ = (id) => document.getElementById(id);
+            const lobby = $('lobby');
+            const cancelBtn = $('lobby-cancel');
+
+            const params = new URLSearchParams(location.hash.slice(1));
+            const ticket = params.get('ticket') || '';
+            const server = params.get('server') || '';
+            // Don't leave the ticket in the address bar or history
+            history.replaceState(null, '', location.pathname);
+
+            let ws = null;
+            let callId = null;
+            let peer = '';
+            let iceServers = '[]';
+            let role = null;
+            let started = false;
+            let over = false;
+
+            function show(status, opts) {
+                opts = opts || {};
+                $('lobby-status').textContent = status;
+                if (opts.peer !== undefined) $('lobby-peer').textContent = opts.peer;
+                lobby.classList.toggle('ringing', !!opts.ringing);
+                cancelBtn.hidden = !opts.cancel;
+            }
+
+            function send(msg) {
+                if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+            }
+
+            function finish(text) {
+                if (over) return;
+                over = true;
+                window.bfCall.end();
+                show(text + ' You can close this tab.', {});
+                document.title = 'Call ended · Blast From The Past';
+                if (ws) ws.close();
+            }
+
+            function hangUp() {
+                if (callId) send({ type: 'call_hangup', call_id: callId });
+                finish('Call ended.');
+            }
+
+            function startMedia() {
+                if (started || over) return;
+                started = true;
+                show('In a call.', { peer });
+                window.bfCall.ring('');
+                window.bfCall.start(callId, role, iceServers, peer);
+            }
+
+            const reasons = {
+                declined: (p) => p + ' declined the call.',
+                busy: (p) => p + ' is on another call.',
+                no_answer: (p) => 'No answer from ' + p + '.',
+                hangup: () => 'Call ended.',
+                disconnected: (p) => 'The call with ' + p + ' dropped.',
+                handoff_failed: () => 'This call took too long to open.',
+            };
+
+            function onMessage(msg) {
+                switch (msg.type) {
+                    case 'heartbeat':
+                        send({ type: 'heartbeat' });
+                        break;
+                    case 'call_claimed':
+                        callId = msg.call_id;
+                        role = msg.role;
+                        peer = msg.peer;
+                        iceServers = msg.ice_servers;
+                        document.title = '📹 ' + peer + ' · Blast From The Past';
+                        if (role === 'caller' && !msg.accepted) {
+                            show('Ringing…', { peer, ringing: true, cancel: true });
+                            window.bfCall.ring('outgoing');
+                        } else {
+                            show('Connecting…', { peer, cancel: true });
+                            startMedia();
+                        }
+                        break;
+                    case 'call_accepted':
+                        if (msg.call_id === callId) startMedia();
+                        break;
+                    case 'call_signal':
+                        if (msg.call_id === callId) window.bfCall.signal(msg.call_id, msg.data);
+                        break;
+                    case 'call_ended':
+                        if (!callId && msg.reason === 'expired') {
+                            finish('This call link has already been used or has expired.');
+                        } else if (msg.call_id === callId) {
+                            const reason = reasons[msg.reason];
+                            finish(reason ? reason(peer) : 'Call ended.');
+                        }
+                        break;
+                }
+            }
+
+            // Relay what the call overlay did (signaling, hang up, errors)
+            setInterval(function () {
+                for (const e of JSON.parse(window.bfCall.takeEvents())) {
+                    if (e.kind === 'signal') {
+                        send({ type: 'call_signal', call_id: e.call_id, data: e.data });
+                    } else if (e.kind === 'hangup') {
+                        hangUp();
+                    } else if (e.kind === 'error') {
+                        send({ type: 'call_hangup', call_id: e.call_id });
+                        finish(e.message);
+                    }
+                }
+            }, 50);
+
+            cancelBtn.addEventListener('click', hangUp);
+
+            if (!ticket || !/^wss?:\/\//.test(server)) {
+                show('Video calls open here from the Blast From The Past app. Start or answer a call there.', {});
+                return;
+            }
+
+            try {
+                ws = new WebSocket(server);
+            } catch (_) {
+                show("Couldn't reach the chat server.", {});
+                return;
+            }
+            ws.onopen = () => send({ type: 'call_claim', ticket });
+            ws.onmessage = (e) => {
+                let msg;
+                try { msg = JSON.parse(e.data); } catch (_) { return; }
+                onMessage(msg);
+            };
+            ws.onclose = () => finish('Lost the connection to the chat server.');
+        })();
+    </script>
+</body>
+</html>

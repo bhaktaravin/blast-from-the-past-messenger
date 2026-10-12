@@ -43,12 +43,16 @@ self.addEventListener('fetch', (event) => {
 
 async function networkFirst(req) {
     const cache = await caches.open(CACHE);
+    // One entry per page: "/", "/?source=pwa" and "/index.html" are all the app,
+    // while call.html (the desktop apps' call page) must not replace it
+    const path = new URL(req.url).pathname;
+    const key = path === BASE + 'index.html' ? BASE : path;
     try {
         const res = await fetch(req);
-        if (res.ok) await cache.put(BASE, res.clone());
+        if (res.ok) await cache.put(key, res.clone());
         return res;
     } catch (err) {
-        const cached = await cache.match(BASE);
+        const cached = await cache.match(key);
         if (cached) return cached;
         throw err;
     }
