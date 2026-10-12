@@ -43,21 +43,13 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Build macOS (${{ matrix.name }})
+    name: Build macOS (Universal)
     runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Intel
-            target: x86_64-apple-darwin
-            dmg: blast-from-the-past-macos-intel.dmg
-          - name: Apple Silicon
-            target: aarch64-apple-darwin
-            dmg: blast-from-the-past-macos-silicon.dmg
     env:
       HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE != '' }}
       SIGN_IDENTITY: "Developer ID Application: Ravin Bhakta (VLJG47KK4K)"
+      # One download for every Mac: Intel and Apple Silicon builds glued together
+      DMG: blast-from-the-past-macos.dmg
     steps:
       - uses: actions/checkout@v4
 
@@ -75,17 +67,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
 
       - name: Build
         run: |
-          cargo build --release --bin chatmessagediscordclone --features client --target ${{ matrix.target }}
+          for target in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --release --bin chatmessagediscordclone --features client --target $target
+          done
           mkdir -p target/release
-          cp target/${{ matrix.target }}/release/chatmessagediscordclone target/release/
+          lipo -create -output target/release/chatmessagediscordclone \
+            target/x86_64-apple-darwin/release/chatmessagediscordclone \
+            target/aarch64-apple-darwin/release/chatmessagediscordclone
+          lipo -info target/release/chatmessagediscordclone
 
       - name: Create app bundle
         run: .github/scripts/create-macos-app.sh
@@ -135,7 +130,7 @@ jobs:
           xcrun stapler staple "$APP"
 
       - name: Create DMG
-        run: .github/scripts/create-macos-dmg.sh "${{ matrix.dmg }}"
+        run: .github/scripts/create-macos-dmg.sh "$DMG"
 
       - name: Sign and notarize DMG
         if: env.HAS_SIGNING == 'true'
@@ -144,20 +139,20 @@ jobs:
           NOTARIZATION_PWD: ${{ secrets.NOTARIZATION_PWD }}
         run: |
           security unlock-keychain -p actions build.keychain
-          codesign --force --timestamp --keychain build.keychain --sign "$SIGN_IDENTITY" "${{ matrix.dmg }}"
-          xcrun notarytool submit "${{ matrix.dmg }}" \
+          codesign --force --timestamp --keychain build.keychain --sign "$SIGN_IDENTITY" "$DMG"
+          xcrun notarytool submit "$DMG" \
             --apple-id "$NOTARIZATION_APPLE_ID" --password "$NOTARIZATION_PWD" \
             --team-id "VLJG47KK4K" --wait
-          xcrun stapler staple "${{ matrix.dmg }}"
+          xcrun stapler staple "$DMG"
           # Final check: what a user's Mac will decide about the app inside
-          MNT=$(hdiutil attach -nobrowse -readonly "${{ matrix.dmg }}" | tail -1 | cut -f3-)
+          MNT=$(hdiutil attach -nobrowse -readonly "$DMG" | tail -1 | cut -f3-)
           spctl --assess --type execute --verbose=2 "$MNT/Blast From The Past.app"
           hdiutil detach "$MNT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: installer-macos-${{ matrix.target }}
-          path: ${{ matrix.dmg }}
+          name: installer-macos
+          path: ${{ env.DMG }}
           if-no-files-found: error
 
   build-linux:
@@ -225,8 +220,7 @@ jobs:
     permissions:
       contents: write
     outputs:
-      intel_sha: ${{ steps.sums.outputs.intel_sha }}
-      silicon_sha: ${{ steps.sums.outputs.silicon_sha }}
+      mac_sha: ${{ steps.sums.outputs.mac_sha }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -241,11 +235,8 @@ jobs:
           ls -la
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
-          for arch in intel silicon; do
-            f="blast-from-the-past-macos-$arch.dmg"
-            [ -f "$f" ] && echo "${arch}_sha=$(sha256sum "$f" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          done
-          true
+          f=blast-from-the-past-macos.dmg
+          if [ -f "$f" ]; then echo "mac_sha=$(sha256sum "$f" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"; fi
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -257,7 +248,7 @@ jobs:
   update-homebrew:
     name: Update Homebrew Tap
     needs: publish
-    if: needs.publish.outputs.intel_sha != '' || needs.publish.outputs.silicon_sha != ''
+    if: needs.publish.outputs.mac_sha != ''
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tap repo
@@ -269,27 +260,17 @@ jobs:
 
       - name: Update cask formula
         env:
-          INTEL_SHA: ${{ needs.publish.outputs.intel_sha }}
-          SILICON_SHA: ${{ needs.publish.outputs.silicon_sha }}
+          MAC_SHA: ${{ needs.publish.outputs.mac_sha }}
         run: |
           VERSION_NUM=${GITHUB_REF_NAME#v}
           CASK_FILE="homebrew-tap/Casks/blast-from-the-past.rb"
-          # A missing build can't be checksummed; Homebrew spells "skip the check" :no_check
-          sha() { if [ -n "$1" ]; then echo "\"$1\""; else echo ":no_check"; fi; }
 
           cat > "$CASK_FILE" << CASK
           cask "blast-from-the-past" do
             version "${VERSION_NUM}"
+            sha256 "${MAC_SHA}"
 
-            on_intel do
-              url "https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/download/v#{version}/blast-from-the-past-macos-intel.dmg"
-              sha256 $(sha "$INTEL_SHA")
-            end
-
-            on_arm do
-              url "https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/download/v#{version}/blast-from-the-past-macos-silicon.dmg"
-              sha256 $(sha "$SILICON_SHA")
-            end
+            url "https://github.com/bhaktaravin/blast-from-the-past-messenger/releases/download/v#{version}/blast-from-the-past-macos.dmg"
 
             name "Blast From The Past"
             desc "Retro AOL-style instant messenger"

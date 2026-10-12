@@ -1,5 +1,5 @@
 #!/bin/bash
-# Packs the (already signed + stapled) app into $1, e.g. blast-from-the-past-macos-silicon.dmg
+# Packs the (already signed + stapled) app into $1, e.g. blast-from-the-past-macos.dmg
 set -e
 
 DMG="$1"
