@@ -31,6 +31,8 @@ const LOGIN_MAX_ATTEMPTS: u32 = 5;           // max failed login attempts
 const LOGIN_LOCKOUT_SECS: u64 = 900;         // 15 minute lockout after too many failures
 const MAX_CALL_SIGNAL_BYTES: usize = 16384;  // WebRTC SDP offers routinely exceed 4KB
 const CALL_RING_TIMEOUT_SECS: u64 = 45;      // unanswered calls end as "no_answer"
+const CALL_HANDOFF_TIMEOUT_SECS: u64 = 60;   // a browser that never claims the call ends it
+const MAX_QUEUED_CALL_SIGNALS: usize = 200;  // held for a handoff page that hasn't connected yet
 const DEFAULT_ICE_SERVERS: &str =
     r#"[{"urls":["stun:stun.l.google.com:19302","stun:stun.cloudflare.com:3478"]}]"#;
 
@@ -51,9 +53,94 @@ struct Peer {
 struct Call {
     caller_peer: usize,
     caller_user: i64,
+    caller_name: String,
     callee_user: i64,
+    callee_name: String,
     /// The callee session that picked up. Until then, every callee session rings.
     callee_peer: Option<usize>,
+    caller_media: CallMedia,
+    callee_media: CallMedia,
+}
+
+/// Where one side's media (and so its signaling) lives. Apps without WebRTC
+/// (the desktop builds) hand their side to a browser page; see `CallHandoff`.
+enum CallMedia {
+    /// The logged-in session that placed or answered the call
+    Session,
+    /// Handed off: signaling waits here until a page claims the ticket
+    Pending { ticket: String, queued: Vec<String> },
+    /// The call page's own connection
+    Browser(usize),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CallSide {
+    Caller,
+    Callee,
+}
+
+impl CallSide {
+    fn other(self) -> CallSide {
+        match self {
+            CallSide::Caller => CallSide::Callee,
+            CallSide::Callee => CallSide::Caller,
+        }
+    }
+}
+
+impl Call {
+    /// The logged-in session on this side (none for a callee that hasn't answered)
+    fn session(&self, side: CallSide) -> Option<usize> {
+        match side {
+            CallSide::Caller => Some(self.caller_peer),
+            CallSide::Callee => self.callee_peer,
+        }
+    }
+
+    fn media(&self, side: CallSide) -> &CallMedia {
+        match side {
+            CallSide::Caller => &self.caller_media,
+            CallSide::Callee => &self.callee_media,
+        }
+    }
+
+    fn media_mut(&mut self, side: CallSide) -> &mut CallMedia {
+        match side {
+            CallSide::Caller => &mut self.caller_media,
+            CallSide::Callee => &mut self.callee_media,
+        }
+    }
+
+    fn browser(&self, side: CallSide) -> Option<usize> {
+        match self.media(side) {
+            CallMedia::Browser(peer) => Some(*peer),
+            _ => None,
+        }
+    }
+
+    /// The side whose signaling `peer` speaks for: its session, unless a page took over
+    fn signaling_side(&self, peer: usize) -> Option<CallSide> {
+        [CallSide::Caller, CallSide::Callee].into_iter().find(|&side| match self.media(side) {
+            CallMedia::Session => self.session(side) == Some(peer),
+            CallMedia::Pending { .. } => false,
+            CallMedia::Browser(browser) => *browser == peer,
+        })
+    }
+
+    /// The side `peer` belongs to, as its session or its call page
+    fn side_of(&self, peer: usize) -> Option<CallSide> {
+        [CallSide::Caller, CallSide::Callee]
+            .into_iter()
+            .find(|&side| self.session(side) == Some(peer) || self.browser(side) == Some(peer))
+    }
+
+    /// Losing `peer` loses the call's media: its page, or a session that kept the media
+    fn depends_on(&self, peer: usize) -> bool {
+        [CallSide::Caller, CallSide::Callee].into_iter().any(|side| match self.media(side) {
+            CallMedia::Browser(browser) => *browser == peer,
+            _ => self.session(side) == Some(peer),
+        })
+    }
 }
 
 struct CallHub {
@@ -368,7 +455,7 @@ async fn handle_connection(
             }
             _ = auth_deadline => {
                 // Check auth timeout for unauthenticated connections
-                if !is_authed && connected_at.elapsed().as_secs() > AUTH_TIMEOUT_SECS {
+                if !is_authed && connected_at.elapsed().as_secs() > AUTH_TIMEOUT_SECS && !hosts_call_page(&call_hub, id) {
                     send_to_peer(&peers, id, ServerToClient::System {
                         message: "Authentication timeout. Please reconnect and log in.".to_string(),
                     });
@@ -394,7 +481,7 @@ async fn handle_connection(
         .map(|calls| {
             calls
                 .iter()
-                .filter(|(_, call)| call.caller_peer == id || call.callee_peer == Some(id))
+                .filter(|(_, call)| call.depends_on(id))
                 .map(|(call_id, _)| call_id.clone())
                 .collect()
         })
@@ -1316,8 +1403,12 @@ async fn handle_client_event(
                 calls.insert(call_id.clone(), Call {
                     caller_peer: id,
                     caller_user: user_id,
+                    caller_name: from.clone(),
                     callee_user: target_id,
+                    callee_name: to.clone(),
                     callee_peer: None,
+                    caller_media: CallMedia::Session,
+                    callee_media: CallMedia::Session,
                 });
             }
 
@@ -1363,17 +1454,20 @@ async fn handle_client_event(
                 return;
             }
 
-            let caller_peer = {
+            let notify = {
                 let Ok(mut calls) = call_hub.calls.lock() else { return };
                 match calls.get_mut(&call_id) {
                     Some(call) if call.callee_user == user_id && call.callee_peer.is_none() => {
                         call.callee_peer = Some(id);
-                        call.caller_peer
+                        // A caller page still on its way learns this from `CallClaimed`
+                        [Some(call.caller_peer), call.browser(CallSide::Caller)]
                     }
                     _ => return,
                 }
             };
-            send_to_peer(peers, caller_peer, ServerToClient::CallAccepted { call_id: call_id.clone() });
+            for peer in notify.into_iter().flatten() {
+                send_to_peer(peers, peer, ServerToClient::CallAccepted { call_id: call_id.clone() });
+            }
             // Stop the ringing on the callee's other logged-in sessions
             for session in peers_for_user(peers, user_id) {
                 if session != id {
@@ -1385,14 +1479,19 @@ async fn handle_client_event(
             }
         }
         ClientToServer::CallSignal { call_id, data } => {
-            let other = call_hub.calls.lock().ok().and_then(|calls| {
-                let call = calls.get(&call_id)?;
-                if call.caller_peer == id {
-                    call.callee_peer
-                } else if call.callee_peer == Some(id) {
-                    Some(call.caller_peer)
-                } else {
-                    None
+            let other = call_hub.calls.lock().ok().and_then(|mut calls| {
+                let call = calls.get_mut(&call_id)?;
+                let to = call.signaling_side(id)?.other();
+                let session = call.session(to);
+                match call.media_mut(to) {
+                    CallMedia::Session => session,
+                    CallMedia::Browser(browser) => Some(*browser),
+                    CallMedia::Pending { queued, .. } => {
+                        if queued.len() < MAX_QUEUED_CALL_SIGNALS {
+                            queued.push(data.clone());
+                        }
+                        None
+                    }
                 }
             });
             if let Some(other) = other {
@@ -1400,13 +1499,13 @@ async fn handle_client_event(
             }
         }
         ClientToServer::CallHangup { call_id } => {
-            let Some((_, user_id)) = get_peer_identity(peers, id) else { return };
+            let user_id = get_peer_identity(peers, id).map(|(_, user_id)| user_id);
             // A ringing callee session hanging up is a decline
             let reason = call_hub.calls.lock().ok().and_then(|calls| {
                 let call = calls.get(&call_id)?;
-                if call.caller_peer == id || call.callee_peer == Some(id) {
+                if call.side_of(id).is_some() {
                     Some("hangup")
-                } else if call.callee_user == user_id && call.callee_peer.is_none() {
+                } else if user_id == Some(call.callee_user) && call.callee_peer.is_none() {
                     Some("declined")
                 } else {
                     None
@@ -1414,6 +1513,78 @@ async fn handle_client_event(
             });
             if let Some(reason) = reason {
                 finish_call(peers, call_hub, &call_id, reason);
+            }
+        }
+        ClientToServer::CallHandoff { call_id } => {
+            let ticket = format!("{:032x}", rand::thread_rng().gen::<u128>());
+            let issued = call_hub.calls.lock().ok().is_some_and(|mut calls| {
+                let Some(call) = calls.get_mut(&call_id) else { return false };
+                let Some(side) = call.signaling_side(id) else { return false };
+                if call.session(side) != Some(id) {
+                    return false; // already a page
+                }
+                *call.media_mut(side) = CallMedia::Pending { ticket: ticket.clone(), queued: Vec::new() };
+                true
+            });
+            if !issued {
+                return;
+            }
+            send_to_peer(peers, id, ServerToClient::CallHandoffTicket { call_id: call_id.clone(), ticket: ticket.clone() });
+
+            let peers = Arc::clone(peers);
+            let call_hub = Arc::clone(call_hub);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(CALL_HANDOFF_TIMEOUT_SECS)).await;
+                let unclaimed = call_hub.calls.lock().ok().is_some_and(|calls| {
+                    calls.get(&call_id).is_some_and(|call| {
+                        [CallSide::Caller, CallSide::Callee].into_iter().any(|side| {
+                            matches!(call.media(side), CallMedia::Pending { ticket: t, .. } if *t == ticket)
+                        })
+                    })
+                });
+                if unclaimed {
+                    finish_call(&peers, &call_hub, &call_id, "handoff_failed");
+                }
+            });
+        }
+        ClientToServer::CallClaim { ticket } => {
+            let claimed = call_hub.calls.lock().ok().and_then(|mut calls| {
+                let (call_id, call, side) = calls.iter_mut().find_map(|(call_id, call)| {
+                    // Both sides can be waiting for a page when two desktop apps talk
+                    let side = [CallSide::Caller, CallSide::Callee].into_iter().find(|&side| {
+                        matches!(call.media(side), CallMedia::Pending { ticket: t, .. } if *t == ticket)
+                    })?;
+                    Some((call_id, call, side))
+                })?;
+                let CallMedia::Pending { queued, .. } = std::mem::replace(call.media_mut(side), CallMedia::Browser(id)) else {
+                    return None;
+                };
+                let (role, peer) = match side {
+                    CallSide::Caller => ("caller", call.callee_name.clone()),
+                    CallSide::Callee => ("callee", call.caller_name.clone()),
+                };
+                let claimed = ServerToClient::CallClaimed {
+                    call_id: call_id.clone(),
+                    role: role.to_string(),
+                    peer,
+                    ice_servers: call_hub.ice_servers.clone(),
+                    accepted: call.callee_peer.is_some(),
+                };
+                Some((call_id.clone(), call.session(side), claimed, queued))
+            });
+            let Some((call_id, session, claimed, queued)) = claimed else {
+                send_to_peer(peers, id, ServerToClient::CallEnded {
+                    call_id: String::new(),
+                    reason: "expired".to_string(),
+                });
+                return;
+            };
+            send_to_peer(peers, id, claimed);
+            for data in queued {
+                send_to_peer(peers, id, ServerToClient::CallSignal { call_id: call_id.clone(), data });
+            }
+            if let Some(session) = session {
+                send_to_peer(peers, session, ServerToClient::CallHandedOff { call_id });
             }
         }
         ClientToServer::AdminListUsers => {
@@ -1524,6 +1695,15 @@ async fn delete_session(redis: &RedisPool, user_id: i64) {
     }
 }
 
+/// Whether connection `id` is a call page carrying a call's media
+fn hosts_call_page(call_hub: &CallHub, id: usize) -> bool {
+    call_hub.calls.lock().is_ok_and(|calls| {
+        calls
+            .values()
+            .any(|call| call.browser(CallSide::Caller) == Some(id) || call.browser(CallSide::Callee) == Some(id))
+    })
+}
+
 fn is_authed(peers: &Arc<Mutex<HashMap<usize, Peer>>>, id: usize) -> bool {
     peers
         .lock()
@@ -1572,6 +1752,8 @@ fn finish_call(peers: &Arc<Mutex<HashMap<usize, Peer>>>, call_hub: &CallHub, cal
         Some(peer) => notify.push(peer),
         None => notify.extend(peers_for_user(peers, call.callee_user)),
     }
+    notify.extend(call.browser(CallSide::Caller));
+    notify.extend(call.browser(CallSide::Callee));
     for peer in notify {
         send_to_peer(peers, peer, ServerToClient::CallEnded {
             call_id: call_id.to_string(),

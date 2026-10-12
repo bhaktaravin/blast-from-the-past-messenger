@@ -130,6 +130,10 @@ pub fn server_to_ui(event: ServerToClient) -> Option<NetToUi> {
         ServerToClient::CallAccepted { call_id } => NetToUi::CallAccepted { call_id },
         ServerToClient::CallSignal { call_id, data } => NetToUi::CallSignal { call_id, data },
         ServerToClient::CallEnded { call_id, reason } => NetToUi::CallEnded { call_id, reason },
+        ServerToClient::CallHandoffTicket { call_id, ticket } => NetToUi::CallHandoffTicket { call_id, ticket },
+        ServerToClient::CallHandedOff { call_id } => NetToUi::CallHandedOff { call_id },
+        // Only call pages claim tickets
+        ServerToClient::CallClaimed { .. } => return None,
         ServerToClient::AdminUserList { users } => NetToUi::AdminUserList(users),
         ServerToClient::AdminActionResult { success, message } => {
             NetToUi::AdminActionResult { success, message }
@@ -212,6 +216,7 @@ pub fn ui_to_server(cmd: UiToNet) -> Option<ClientToServer> {
         UiToNet::CallAnswer { call_id, accept } => Some(ClientToServer::CallAnswer { call_id, accept }),
         UiToNet::CallSignal { call_id, data } => Some(ClientToServer::CallSignal { call_id, data }),
         UiToNet::CallHangup { call_id } => Some(ClientToServer::CallHangup { call_id }),
+        UiToNet::CallHandoff { call_id } => Some(ClientToServer::CallHandoff { call_id }),
         UiToNet::AdminListUsers => Some(ClientToServer::AdminListUsers),
         UiToNet::AdminResetPassword { username, new_password } => {
             Some(ClientToServer::AdminResetPassword { username, new_password })

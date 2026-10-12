@@ -121,6 +121,15 @@ pub enum ClientToServer {
     CallSignal { call_id: String, data: String },
     /// Cancel a ringing call or hang up an active one
     CallHangup { call_id: String },
+    /// Hand our side of a call to a browser page (apps without a WebRTC stack).
+    /// Callers send it once ringing, callees right after accepting. The server
+    /// answers with `CallHandoffTicket` and holds the call's signaling until a
+    /// page claims the ticket.
+    CallHandoff { call_id: String },
+    /// Sent by the call page, on a connection of its own that never logs in:
+    /// take over the media side of the call that `ticket` was issued for.
+    /// Answered with `CallClaimed`, or `CallEnded` with reason "expired".
+    CallClaim { ticket: String },
     /// Admin: list all registered users (server rejects if requester isn't an admin)
     AdminListUsers,
     /// Admin: force-set another user's password (used for account recovery)
@@ -184,8 +193,17 @@ pub enum ServerToClient {
     CallSignal { call_id: String, data: String },
     /// Call is over (or never started). `reason` is one of: declined, busy,
     /// offline, unavailable, rate_limited, no_answer, hangup, answered_elsewhere,
-    /// disconnected
+    /// disconnected, handoff_failed (the browser never picked the call up),
+    /// expired (a `CallClaim` for an unknown or used ticket)
     CallEnded { call_id: String, reason: String },
+    /// Single-use ticket for the call page to claim (see `CallHandoff`)
+    CallHandoffTicket { call_id: String, ticket: String },
+    /// The browser page claimed the ticket; the call's media now lives there.
+    /// Sent to the session that asked for the handoff.
+    CallHandedOff { call_id: String },
+    /// Tells the call page what it's joining. `role` is "caller" or "callee";
+    /// a caller waits for `CallAccepted` unless `accepted` is already true.
+    CallClaimed { call_id: String, role: String, peer: String, ice_servers: String, accepted: bool },
     /// Admin: full list of registered users
     AdminUserList { users: Vec<AdminUserEntry> },
     /// Admin: result of an admin-only action (list/reset) — also used to report "not authorized"

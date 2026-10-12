@@ -2,11 +2,31 @@
 //!
 //! Media never touches Rust: the page owns the camera, the RTCPeerConnection and the
 //! call overlay, and we relay its signaling to and from the server. Native builds
-//! have no WebRTC stack, so every call here is a no-op there and `SUPPORTED` is false.
+//! have no WebRTC stack, so every call here is a no-op there; they hand their side
+//! of a call to call.html in the user's browser instead (see `CALL_PAGE_URL`).
 
 use serde::Deserialize;
 
-pub const SUPPORTED: bool = cfg!(target_arch = "wasm32");
+/// Whether this build carries calls itself (the web app) or hands them to a browser
+pub const IN_APP: bool = cfg!(target_arch = "wasm32");
+
+/// The page desktop builds open for a call. It reaches the chat server on its own,
+/// so this one deployment serves any server the app is signed in to.
+pub const CALL_PAGE_URL: &str = "https://bhaktaravin.github.io/blast-from-the-past-messenger/call.html";
+
+/// `CALL_PAGE_URL` set up to claim `ticket` on `server` (a ws:// or wss:// URL)
+pub fn handoff_url(ticket: &str, server: &str) -> String {
+    // Only these would change the meaning of a URLSearchParams value
+    let encode = |value: &str| {
+        value
+            .replace('%', "%25")
+            .replace('&', "%26")
+            .replace('=', "%3D")
+            .replace('+', "%2B")
+            .replace('#', "%23")
+    };
+    format!("{CALL_PAGE_URL}#ticket={}&server={}", encode(ticket), encode(server))
+}
 
 /// Something the page wants the app to act on.
 #[derive(Debug, Deserialize)]

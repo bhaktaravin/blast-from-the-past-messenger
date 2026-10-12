@@ -1,0 +1,156 @@
+/* Shared by the web app (index.html) and the desktop apps' call page (call.html) */
+
+/* Video call overlay, driven by window.bfCall in call.js */
+#call-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: #000;
+    color: #f0a83a;
+    font-family: monospace;
+    display: flex;
+    flex-direction: column;
+    touch-action: manipulation;
+}
+
+#call-overlay[hidden] {
+    display: none;
+}
+
+/* On big screens, float as a retro window instead of taking over */
+@media (min-width: 900px) and (min-height: 600px) {
+    #call-overlay {
+        inset: 6vh 8vw;
+        border: 2px solid #f0a83a;
+        border-radius: 8px;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+        overflow: hidden;
+    }
+}
+
+#call-remote {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: radial-gradient(circle, #2e2a26 0%, #0c0b0a 100%);
+}
+
+#call-top {
+    position: relative;
+    padding: calc(env(safe-area-inset-top, 0px) + 12px) 16px 24px;
+    background: linear-gradient(rgba(0, 0, 0, 0.7), transparent);
+    text-align: center;
+}
+
+#call-peer {
+    font-size: 20px;
+    font-weight: bold;
+    color: #ffd27a;
+}
+
+#call-status {
+    font-size: 14px;
+    color: #ccc;
+    margin-top: 4px;
+    min-height: 1.2em;
+}
+
+#call-local {
+    position: absolute;
+    right: 12px;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 96px);
+    width: 28vw;
+    max-width: 180px;
+    aspect-ratio: 3 / 4;
+    object-fit: cover;
+    border: 2px solid #f0a83a;
+    border-radius: 6px;
+    background: #1e1c1a;
+}
+
+#call-local.mirror {
+    transform: scaleX(-1);
+}
+
+#call-local.off {
+    visibility: hidden;
+}
+
+#call-controls {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    justify-content: center;
+    gap: 18px;
+    padding: 20px 16px calc(env(safe-area-inset-bottom, 0px) + 20px);
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.75));
+}
+
+#call-controls button {
+    width: 58px;
+    height: 58px;
+    border-radius: 50%;
+    border: 2px solid #f0a83a;
+    background: rgba(30, 28, 26, 0.85);
+    padding: 0;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+
+#call-controls svg {
+    width: 26px;
+    height: 26px;
+    fill: #f0a83a;
+    stroke: #f0a83a;
+    stroke-width: 2;
+    stroke-linecap: round;
+    vertical-align: middle;
+}
+
+#call-controls path {
+    stroke: none;
+}
+
+#call-controls .slash {
+    display: none;
+}
+
+#call-controls button.toggled {
+    background: #f0a83a;
+}
+
+#call-controls button.toggled svg {
+    fill: #1e1c1a;
+    stroke: #1e1c1a;
+}
+
+#call-controls button.toggled .slash {
+    display: inline;
+}
+
+#call-controls button.hangup {
+    background: #c83232;
+    border-color: #ff6b6b;
+}
+
+#call-controls button.hangup svg {
+    fill: #fff;
+}
+
+#call-tap-audio {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    padding: 12px 20px;
+    font: inherit;
+    font-size: 16px;
+    color: #000;
+    background: #f0a83a;
+    border: none;
+    border-radius: 6px;
+}

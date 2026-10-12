@@ -208,6 +208,7 @@ enum UiToNet {
     CallAnswer { call_id: String, accept: bool },
     CallSignal { call_id: String, data: String },
     CallHangup { call_id: String },
+    CallHandoff { call_id: String },
     AdminListUsers,
     AdminResetPassword { username: String, new_password: String },
 }
@@ -256,6 +257,8 @@ enum NetToUi {
     CallAccepted { call_id: String },
     CallSignal { call_id: String, data: String },
     CallEnded { call_id: String, reason: String },
+    CallHandoffTicket { call_id: String, ticket: String },
+    CallHandedOff { call_id: String },
     AdminUserList(Vec<AdminUserEntry>),
     AdminActionResult { success: bool, message: String },
 }
@@ -281,6 +284,17 @@ enum CallPhase {
     Incoming { peer: String, call_id: String, ice_servers: String },
     /// Picked up — the page is connecting or connected
     Active { peer: String, call_id: String },
+}
+
+/// A desktop call's media lives in a browser tab (see `call_bridge::CALL_PAGE_URL`).
+struct CallHandoff {
+    call_id: String,
+    /// The page to open, once the server issues a ticket
+    url: Option<String>,
+    /// The page connected and took over the call
+    claimed: bool,
+    /// UI clock when we asked the server, for giving up on servers without handoff
+    since: Option<f64>,
 }
 
 impl CallPhase {
@@ -316,6 +330,9 @@ struct AolApp {
     is_admin: bool,
     show_admin_panel: bool,
     call: Option<CallPhase>,
+    call_handoff: Option<CallHandoff>,
+    /// UI clock of the last ring sound for an incoming call (desktop has no page to ring)
+    last_ring_sound: f64,
     admin_users: Vec<AdminUserEntry>,
     admin_reset_target: Option<String>,
     admin_reset_new_password: String,
@@ -578,6 +595,8 @@ impl AolApp {
             is_admin: false,
             show_admin_panel: false,
             call: None,
+            call_handoff: None,
+            last_ring_sound: 0.0,
             admin_users: Vec::new(),
             admin_reset_target: None,
             admin_reset_new_password: String::new(),
@@ -808,10 +827,6 @@ impl AolApp {
     }
 
     fn start_call(&mut self, to: String) {
-        if !call_bridge::SUPPORTED {
-            self.show_toast("Video calls work in the web version for now".to_string(), ToastKind::Info);
-            return;
-        }
         if let Some(phase) = &self.call {
             self.show_toast(format!("Already in a call with {}", phase.peer()), ToastKind::Info);
             return;
@@ -827,8 +842,29 @@ impl AolApp {
         let _ = self.network.tx.send(UiToNet::CallAnswer { call_id: call_id.clone(), accept });
         if accept {
             call_bridge::start(&call_id, false, &ice_servers, &peer);
+            self.request_handoff(&call_id);
             self.call = Some(CallPhase::Active { peer, call_id });
         }
+    }
+
+    /// Desktop builds carry calls in a browser tab: ask the server for a ticket
+    /// the page can claim (answered by `CallHandoffTicket`).
+    fn request_handoff(&mut self, call_id: &str) {
+        if call_bridge::IN_APP {
+            return;
+        }
+        let _ = self.network.tx.send(UiToNet::CallHandoff { call_id: call_id.to_string() });
+        self.call_handoff = Some(CallHandoff { call_id: call_id.to_string(), url: None, claimed: false, since: None });
+    }
+
+    fn open_call_page(&mut self) {
+        let Some(url) = self.call_handoff.as_ref().and_then(|h| h.url.clone()) else { return };
+        #[cfg(not(target_arch = "wasm32"))]
+        if open::that(&url).is_err() {
+            self.show_toast("Couldn't open your web browser for the call".to_string(), ToastKind::Error);
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = url;
     }
 
     /// Cancel, decline or hang up whatever call is in progress.
@@ -855,6 +891,7 @@ impl AolApp {
             "no_answer" => (format!("No answer from {peer}"), ToastKind::Info),
             "answered_elsewhere" => ("Call answered on another device".to_string(), ToastKind::Info),
             "disconnected" => (format!("Call with {peer} dropped"), ToastKind::Error),
+            "handoff_failed" => ("The call didn't open in your browser in time".to_string(), ToastKind::Error),
             _ => (format!("Call with {peer} ended"), ToastKind::Info),
         };
         self.show_toast(text, kind);
@@ -887,13 +924,34 @@ impl AolApp {
         }
     }
 
-    /// Ringing / dialing windows. The live call itself is the page's overlay.
+    /// Ringing / dialing windows. The live call itself is the page's overlay, or on
+    /// desktop a browser tab, which gets a small window here to manage it.
     fn draw_call_ui(&mut self, ctx: &egui::Context) {
-        enum Action { Accept, Decline, Cancel }
+        enum Action { Accept, Decline, Cancel, Reopen }
         let mut action = None;
         let time = ctx.input(|i| i.time);
         // Phone icon wobbles while ringing
         let wobble = ((time * 18.0).sin() * 0.25) as f32;
+
+        // However the call ended, its browser handoff ended with it
+        let current_id = self.call.as_ref().and_then(|p| p.call_id());
+        if self.call_handoff.as_ref().is_some_and(|h| Some(h.call_id.as_str()) != current_id) {
+            self.call_handoff = None;
+        }
+        // An older server ignores the handoff request, which would leave the call stuck
+        if let Some(handoff) = &mut self.call_handoff {
+            let asked = *handoff.since.get_or_insert(time);
+            if handoff.url.is_none() && time - asked > 10.0 {
+                self.hang_up();
+                self.show_toast("This chat server can't take video calls from the desktop app yet".to_string(), ToastKind::Error);
+                return;
+            }
+        }
+        // The web app rings through the page; desktop rings with a sound effect
+        if !call_bridge::IN_APP && matches!(self.call, Some(CallPhase::Incoming { .. })) && time - self.last_ring_sound > 3.0 {
+            self.last_ring_sound = time;
+            self.audio_manager.play(SoundEffect::MessageReceived);
+        }
 
         // The server always answers an invite, so silence means it can't do calls
         // (e.g. an older server build) — don't leave the user dialing forever.
@@ -957,6 +1015,9 @@ impl AolApp {
                             ui.add_space(6.0);
                             ui.heading(&peer);
                             ui.label(format!("{status}{dots}"));
+                            if self.call_handoff.is_some() {
+                                ui.label(egui::RichText::new("The call will open in your web browser").small().weak());
+                            }
                             ui.add_space(10.0);
                             let cancel = egui::Button::new(egui::RichText::new("✖ Cancel").strong().color(egui::Color32::WHITE))
                                 .fill(egui::Color32::from_rgb(190, 50, 50))
@@ -968,13 +1029,45 @@ impl AolApp {
                         });
                     });
             }
-            Some(CallPhase::Active { .. }) | None => {}
+            Some(CallPhase::Active { peer, .. }) => {
+                let Some(handoff) = &self.call_handoff else { return };
+                let peer = peer.clone();
+                let (status, opened) = match (&handoff.url, handoff.claimed) {
+                    (_, true) => ("The call is open in your web browser.", true),
+                    (Some(_), false) => ("Opening the call in your web browser…", true),
+                    (None, false) => ("Getting the call ready…", false),
+                };
+                egui::Window::new("📹 Video Call")
+                    .collapsible(true)
+                    .resizable(false)
+                    .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -16.0])
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.heading(&peer);
+                            ui.label(status);
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                // Until the page claims it, the link still works for another try
+                                if opened && !handoff.claimed && ui.button("🌐 Open again").clicked() {
+                                    action = Some(Action::Reopen);
+                                }
+                                let hang_up = egui::Button::new(egui::RichText::new("✖ Hang up").strong().color(egui::Color32::WHITE))
+                                    .fill(egui::Color32::from_rgb(190, 50, 50));
+                                if ui.add(hang_up).clicked() {
+                                    action = Some(Action::Cancel);
+                                }
+                            });
+                        });
+                    });
+            }
+            None => {}
         }
 
         match action {
             Some(Action::Accept) => self.answer_call(true),
             Some(Action::Decline) => self.answer_call(false),
             Some(Action::Cancel) => self.hang_up(),
+            Some(Action::Reopen) => self.open_call_page(),
             None => {}
         }
     }
@@ -1484,8 +1577,9 @@ impl AolApp {
                 NetToUi::CallRinging { call_id, to, ice_servers: ice } => {
                     match &mut self.call {
                         Some(CallPhase::Dialing { peer, call_id: id @ None, ice_servers, .. }) if *peer == to => {
-                            *id = Some(call_id);
+                            *id = Some(call_id.clone());
                             *ice_servers = ice;
+                            self.request_handoff(&call_id);
                         }
                         // We cancelled before the server got back to us
                         _ => {
@@ -1494,14 +1588,7 @@ impl AolApp {
                     }
                 }
                 NetToUi::IncomingCall { call_id, from, ice_servers } => {
-                    if !call_bridge::SUPPORTED {
-                        // Let a web session of ours pick it up; this one just says so
-                        self.audio_manager.play(SoundEffect::MessageReceived);
-                        self.show_toast(
-                            format!("📹 {from} is video calling you — answer from the web version"),
-                            ToastKind::Info,
-                        );
-                    } else if self.call.is_some() {
+                    if self.call.is_some() {
                         let _ = self.network.tx.send(UiToNet::CallAnswer { call_id, accept: false });
                     } else {
                         call_bridge::ring(Some(call_bridge::Ring::Incoming));
@@ -1522,6 +1609,18 @@ impl AolApp {
                         if *id == call_id {
                             call_bridge::signal(&call_id, &data);
                         }
+                    }
+                }
+                NetToUi::CallHandoffTicket { call_id, ticket } => {
+                    let server = self.server_url.clone();
+                    if let Some(handoff) = self.call_handoff.as_mut().filter(|h| h.call_id == call_id) {
+                        handoff.url = Some(call_bridge::handoff_url(&ticket, &server));
+                        self.open_call_page();
+                    }
+                }
+                NetToUi::CallHandedOff { call_id } => {
+                    if let Some(handoff) = self.call_handoff.as_mut().filter(|h| h.call_id == call_id) {
+                        handoff.claimed = true;
                     }
                 }
                 NetToUi::CallEnded { call_id, reason } => {
@@ -3948,14 +4047,12 @@ impl eframe::App for AolApp {
                         .default_size([380.0, 320.0])
                         .min_size([280.0, 200.0])
                         .show(ctx, |ui| {
-                            if call_bridge::SUPPORTED {
-                                ui.horizontal(|ui| {
-                                    if ui.small_button("📹 Video Call").clicked() {
-                                        call_request = Some(peer.clone());
-                                    }
-                                });
-                                ui.separator();
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button("📹 Video Call").clicked() {
+                                    call_request = Some(peer.clone());
+                                }
+                            });
+                            ui.separator();
 
                             // Message history
                             let available = ui.available_height() - 40.0;
@@ -4066,11 +4163,9 @@ impl eframe::App for AolApp {
                                 if ui.selectable_label(self.mobile_show_search, "🔍").clicked() {
                                     self.mobile_show_search = !self.mobile_show_search;
                                 }
-                                if call_bridge::SUPPORTED {
-                                    if let ChatTarget::Direct(name) = &self.selected_target {
-                                        if ui.button("📹").on_hover_text("Video Call").clicked() {
-                                            self.start_call(name.clone());
-                                        }
+                                if let ChatTarget::Direct(name) = &self.selected_target {
+                                    if ui.button("📹").on_hover_text("Video Call").clicked() {
+                                        self.start_call(name.clone());
                                     }
                                 }
                                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -4596,13 +4691,39 @@ fn convert_emoticons(text: &str) -> String {
         (":100:", "💯"),
     ];
 
-    let mut result = text.to_string();
-    // Sort by length descending so longer patterns match first (e.g. O:-) before :-)
-    let mut sorted = emoticons.to_vec();
-    sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-    for (pattern, emoji) in &sorted {
-        result = result.replace(pattern, emoji);
+    let lookup = |word: &str| emoticons.iter().find(|(pattern, _)| *pattern == word).map(|(_, emoji)| *emoji);
+    let convert_word = |word: &str, out: &mut String| {
+        // "(plan B)" closes a bracket rather than wearing sunglasses
+        let before = &out[..];
+        let in_brackets = before.matches('(').count() > before.matches(')').count();
+        if in_brackets && word.starts_with('B') && word.ends_with(')') {
+            out.push_str(word);
+            return;
+        }
+        // "nice :)!" — trailing punctuation after an emoticon is kept
+        let core = word.trim_end_matches(['.', ',', '!', '?']);
+        if let Some(emoji) = lookup(word) {
+            out.push_str(emoji);
+        } else if let Some(emoji) = lookup(core) {
+            out.push_str(emoji);
+            out.push_str(&word[core.len()..]);
+        } else {
+            out.push_str(word);
+        }
+    };
+
+    // Only whole words are converted, like AIM did: replacing substrings turned
+    // the ":/" in "https://" into 😕 and the "B)" in "(plan B)" into 😎
+    let mut result = String::with_capacity(text.len());
+    let mut word_start = 0;
+    for (i, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            convert_word(&text[word_start..i], &mut result);
+            result.push(ch);
+            word_start = i + ch.len_utf8();
+        }
     }
+    convert_word(&text[word_start..], &mut result);
     result
 }
 
@@ -5065,7 +5186,10 @@ where
                                 | ServerToClient::IncomingCall { .. }
                                 | ServerToClient::CallAccepted { .. }
                                 | ServerToClient::CallSignal { .. }
-                                | ServerToClient::CallEnded { .. }) => {
+                                | ServerToClient::CallEnded { .. }
+                                | ServerToClient::CallHandoffTicket { .. }
+                                | ServerToClient::CallHandedOff { .. }
+                                | ServerToClient::CallClaimed { .. }) => {
                                     if let Some(ui_msg) = client_map::server_to_ui(call_event) {
                                         let _ = net_tx.send(ui_msg);
                                     }
@@ -5219,7 +5343,8 @@ where
                     call_msg @ (UiToNet::CallInvite { .. }
                     | UiToNet::CallAnswer { .. }
                     | UiToNet::CallSignal { .. }
-                    | UiToNet::CallHangup { .. }) => {
+                    | UiToNet::CallHangup { .. }
+                    | UiToNet::CallHandoff { .. }) => {
                         if let Some(payload) = client_map::ui_to_server(call_msg) {
                             send_json(&mut ws_tx, payload).await?;
                         }
@@ -5540,7 +5665,18 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_newer_version;
+    use super::{convert_emoticons, is_newer_version};
+
+    #[test]
+    fn converts_only_whole_word_emoticons() {
+        assert_eq!(convert_emoticons("hi :) bye :-("), "hi 😊 bye 😢");
+        assert_eq!(convert_emoticons("nice :D!"), "nice 😄!");
+        assert_eq!(convert_emoticons(":/"), "😕");
+        assert_eq!(convert_emoticons("see https://example.com"), "see https://example.com");
+        assert_eq!(convert_emoticons("(plan B) or (B)"), "(plan B) or (B)");
+        assert_eq!(convert_emoticons("at 8:30 :P"), "at 8:30 😛");
+        assert_eq!(convert_emoticons("line one\n:)"), "line one\n😊");
+    }
 
     #[test]
     fn compares_versions_numerically() {
